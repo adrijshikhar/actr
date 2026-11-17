@@ -1,0 +1,280 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/adrijshikhar/actr/internal/config"
+	"github.com/adrijshikhar/actr/internal/protocol"
+	"github.com/adrijshikhar/actr/internal/registration"
+	"github.com/adrijshikhar/actr/internal/service"
+	"github.com/spf13/cobra"
+)
+
+var (
+	isTerminalFunc   = registration.IsTerminal
+	detectRemoteFunc = func(ctx context.Context, dir string) (*registration.TargetInfo, error) {
+		return registration.DetectGitRemote(ctx, dir, nil)
+	}
+	fetchGHTokenFunc = func(ctx context.Context, target *registration.TargetInfo) (string, error) {
+		return registration.FetchRegistrationTokenGH(ctx, target, nil)
+	}
+	openBrowserFunc = func(url string) error {
+		return registration.OpenBrowser(url, nil)
+	}
+	serviceInstallFunc = func(binPath string, configDirs ...string) error {
+		return service.Install(binPath, configDirs...)
+	}
+	serviceStartFunc = service.Start
+)
+
+func newRegisterCmd() *cobra.Command {
+	var (
+		url           string
+		token         string
+		name          string
+		configDir     string
+		workFolder    string
+		force         bool
+		promptService bool
+		labels        []string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "register",
+		Short: "Register this runner with a GitHub repository or organization",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if ctx == nil {
+				ctx = context.Background()
+			}
+
+			// Resolve config directory precedence (matches run.go resolveConfigDir)
+			configDir = resolveConfigDir(configDir, cmd.Flags().Changed("config-dir"))
+
+			// Resolve environment variables (Tier 2 precedence: RUNNER_URL, RUNNER_TOKEN)
+			if url == "" {
+				if envURL := os.Getenv("RUNNER_URL"); envURL != "" {
+					url = strings.TrimSpace(envURL)
+				}
+			}
+			if token == "" {
+				if envToken := os.Getenv("RUNNER_TOKEN"); envToken != "" {
+					token = strings.TrimSpace(envToken)
+				}
+			}
+
+			// Interactive detection:
+			// If --url and --token are provided, run headless (100% backward compatible).
+			// Otherwise, if attached to a terminal, run interactive wizard.
+			isInteractive := isTerminalFunc(os.Stdin.Fd())
+			if url != "" && token != "" {
+				isInteractive = false
+			}
+
+			if !isInteractive && (url == "" || token == "") {
+				return fmt.Errorf("--url and --token are required")
+			}
+
+			reader := bufio.NewReader(cmd.InOrStdin())
+
+			// Overwrite guard: check if .runner exists
+			runnerPath := filepath.Join(configDir, ".runner")
+			if _, err := os.Stat(runnerPath); err == nil {
+				if !force {
+					if isInteractive {
+						overwrite, err := registration.PromptConfirm(
+							reader,
+							cmd.OutOrStdout(),
+							fmt.Sprintf("Runner is already registered in %s. Overwrite?", configDir),
+							false,
+						)
+						if err != nil {
+							return err
+						}
+						if !overwrite {
+							return nil
+						}
+					} else {
+						return fmt.Errorf("runner is already registered in %s; use --force to overwrite", configDir)
+					}
+				}
+			}
+
+			var target *registration.TargetInfo
+
+			// Resolve URL
+			if isInteractive && url == "" {
+				detectedTarget, err := detectRemoteFunc(ctx, ".")
+				if err == nil && detectedTarget != nil && detectedTarget.WebURL != "" {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Detected repository: %s\n", detectedTarget.WebURL)
+					promptedURL, err := registration.Prompt(
+						reader,
+						cmd.OutOrStdout(),
+						"Enter repository or organization URL",
+						detectedTarget.WebURL,
+					)
+					if err != nil {
+						return err
+					}
+					url = strings.TrimSpace(promptedURL)
+					if url == "" {
+						url = detectedTarget.WebURL
+					}
+				} else {
+					promptedURL, err := registration.Prompt(
+						reader,
+						cmd.OutOrStdout(),
+						"Enter repository or organization URL",
+						"",
+					)
+					if err != nil {
+						return err
+					}
+					url = strings.TrimSpace(promptedURL)
+					if url == "" {
+						return fmt.Errorf("repository or organization URL is required")
+					}
+				}
+			}
+
+			// Parse target for token fetching and browser settings
+			if url != "" {
+				parsedTarget, err := registration.ParseTargetURL(url)
+				if err == nil {
+					target = parsedTarget
+					if strings.HasPrefix(url, "git@") || strings.HasPrefix(url, "ssh://") {
+						url = target.WebURL
+					}
+				}
+			}
+
+			// Resolve Token
+			if isInteractive && token == "" {
+				// 1. gh CLI token retrieval
+				if target != nil {
+					ghToken, err := fetchGHTokenFunc(ctx, target)
+					if err == nil && strings.TrimSpace(ghToken) != "" {
+						token = strings.TrimSpace(ghToken)
+						_, _ = fmt.Fprintln(cmd.OutOrStdout(), "✓ Successfully retrieved runner registration token via gh CLI")
+					}
+				}
+
+				// 2. Browser fallback
+				if token == "" {
+					settingsURL := ""
+					if target != nil {
+						settingsURL = registration.GetRunnerSettingsURL(target)
+					}
+					if settingsURL != "" {
+						browserErr := openBrowserFunc(settingsURL)
+						if browserErr == nil {
+							_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Opening browser to GitHub runner settings... Paste registration token below:")
+						} else {
+							_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Please open in your browser: %s\nPaste registration token below:\n", settingsURL)
+						}
+					}
+					promptedToken, err := registration.PromptPassword(
+						reader,
+						cmd.OutOrStdout(),
+						"Enter runner registration token",
+					)
+					if err != nil {
+						return err
+					}
+					token = strings.TrimSpace(promptedToken)
+					if token == "" {
+						return fmt.Errorf("runner registration token is required")
+					}
+				}
+			}
+
+			if url == "" || token == "" {
+				return fmt.Errorf("--url and --token are required")
+			}
+
+			httpClient := HTTPClientFromContext(ctx)
+			if httpClient == nil {
+				httpClient = http.DefaultClient
+			}
+
+			cfg, creds, rsaParams, err := protocol.RegisterRunner(ctx, httpClient, url, token, name, workFolder, labels...)
+			if err != nil {
+				return fmt.Errorf("register runner: %w", err)
+			}
+
+			if err := os.MkdirAll(configDir, 0700); err != nil {
+				return fmt.Errorf("create config dir: %w", err)
+			}
+
+			if err := config.SaveRunnerConfig(configDir, cfg); err != nil {
+				return fmt.Errorf("save runner config: %w", err)
+			}
+			if err := os.Chmod(filepath.Join(configDir, ".runner"), 0600); err != nil {
+				return fmt.Errorf("chmod runner config: %w", err)
+			}
+
+			if err := config.SaveCredentials(configDir, creds); err != nil {
+				return fmt.Errorf("save credentials: %w", err)
+			}
+
+			rsaData, err := json.MarshalIndent(rsaParams, "", "  ")
+			if err != nil {
+				return fmt.Errorf("marshal rsa parameters: %w", err)
+			}
+
+			rsaPath := filepath.Join(configDir, ".credentials_rsaparams")
+			if err := os.WriteFile(rsaPath, rsaData, 0600); err != nil {
+				return fmt.Errorf("write rsa parameters: %w", err)
+			}
+			if err := os.Chmod(rsaPath, 0600); err != nil {
+				return fmt.Errorf("chmod rsa parameters: %w", err)
+			}
+
+			fmt.Fprintf(cmd.OutOrStdout(), "Successfully registered runner '%s' (ID %d) for %s\nConfiguration saved to %s\n", cfg.AgentName, cfg.AgentID, url, configDir)
+
+			// Post-registration in interactive TTY: prompt to start service
+			if isInteractive && promptService {
+				startService, err := registration.PromptConfirm(
+					reader,
+					cmd.OutOrStdout(),
+					"Start background runner service now?",
+					true,
+				)
+				if err == nil && startService {
+					if err := serviceInstallFunc("", configDir); err != nil {
+						fmt.Fprintf(cmd.ErrOrStderr(), "Warning: runner registered successfully, but service install failed: %v\nRun 'actr service install' manually.\n", err)
+					} else if err := serviceStartFunc(); err != nil {
+						fmt.Fprintf(cmd.ErrOrStderr(), "Warning: runner registered successfully, but service start failed: %v\nRun 'actr service start' manually.\n", err)
+					} else {
+						_, _ = fmt.Fprintln(cmd.OutOrStdout(), "✓ Runner service started! Run 'actr monitor' to inspect live jobs.")
+					}
+				}
+			}
+
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&url, "url", "", "Repository or Organization URL")
+	cmd.Flags().StringVar(&token, "token", "", "Runner registration token")
+	cmd.Flags().StringVar(&name, "name", "actr", "Runner name")
+	cmd.Flags().StringSliceVar(&labels, "labels", nil, "custom runner labels (optional)")
+	cmd.Flags().StringVar(&configDir, "config-dir", config.DefaultConfigDir(), "path to directory containing runner configuration and credentials")
+	cmd.Flags().StringVar(&workFolder, "work-folder", "_work", "path to runner work folder")
+	cmd.Flags().BoolVar(&force, "force", false, "force overwrite of existing configuration")
+	cmd.Flags().BoolVar(&promptService, "prompt-service", true, "prompt to start background service after registration")
+	_ = cmd.Flags().MarkHidden("prompt-service")
+
+	_ = cmd.MarkFlagDirname("config-dir")
+	_ = cmd.MarkFlagDirname("work-folder")
+
+	return cmd
+}

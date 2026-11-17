@@ -1,0 +1,28 @@
+# Binaries
+bin/
+dist/
+
+# Test artifacts & logs
+*.log
+_diag/
+_work/
+_temp/
+
+# Go build & cache
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+
+# OS & Editor
+.DS_Store
+.vscode/
+.idea/
+.superpowers/
+.openqodex/
+.worktrees/
+.worktrees

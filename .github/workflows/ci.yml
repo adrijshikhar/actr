@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_live_test:
+        description: 'Run live self-hosted daemon test'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Verify dependencies
+        run: |
+          go mod verify
+          go mod download
+
+      - name: Run tests
+        run: go test -v -race ./...
+
+      - name: Run golangci-lint
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0
+          $(go env GOPATH)/bin/golangci-lint run ./...
+
+  live-self-hosted-test:
+    name: Live Self-Hosted Daemon Test
+    runs-on: [self-hosted, macOS, ARM64]
+    if: |
+      (github.event_name == 'workflow_dispatch' && (inputs.run_live_test == true || inputs.run_live_test == null)) ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      contains(github.event.pull_request.labels.*.name, 'self-hosted')
+    steps:
+      - name: Clone repository
+        run: |
+          git clone --depth 1 https://github.com/adrijshikhar/actr.git .
+
+      - name: Build actr binary
+        run: make build
+
+      - name: Run runner diagnostics
+        run: ./bin/actr doctor
+
+      - name: Smoke test CLI help and flags
+        run: |
+          ./bin/actr --help
+          ./bin/actr run --help
+          ./bin/actr register --help
+          ./bin/actr service --help
+
+      - name: Execute isolated step test
+        run: |
+          echo "Executing isolated step execution test on $(uname -s) $(uname -m)"
+          ./bin/actr --version
+          test -x ./bin/actr
+          echo "STEP_OUTPUT=actr_verified" >> "$GITHUB_ENV"
+
+      - name: Verify step output environment
+        run: |
+          if [ "$STEP_OUTPUT" != "actr_verified" ]; then
+            echo "Environment variable propagation failed: got '$STEP_OUTPUT'"
+            exit 1
+          fi
+          echo "Isolated step test passed successfully."

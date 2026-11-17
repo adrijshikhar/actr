@@ -1,0 +1,66 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+project_name: actr
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: actr
+    main: ./cmd/actr
+    binary: actr
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.Version={{.Version}} -X main.Commit={{.Commit}} -X main.Date={{.Date}}
+
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "Merge pull request"
+      - "Merge branch"
+
+homebrew_casks:
+  - repository:
+      owner: adrijshikhar
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    name: actr
+    homepage: "https://github.com/adrijshikhar/actr"
+    description: "Native, high-performance GitHub Actions self-hosted runner daemon"
+    directory: "Casks"
+    skip_upload: true
+
+release:
+  github:
+    owner: adrijshikhar
+    name: actr
+  replace_existing_artifacts: true
+  mode: keep-existing
