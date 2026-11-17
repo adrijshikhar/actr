@@ -1295,7 +1295,7 @@ func TestCoordinator_CommandFileParseError_FailsStep(t *testing.T) {
 			if err != nil {
 				return nil, err
 			}
-			defer f.Close()
+			defer func() { _ = f.Close() }()
 
 			largeLine := strings.Repeat("X", 11*1024*1024) + "\n"
 			if _, err := f.WriteString(largeLine); err != nil {

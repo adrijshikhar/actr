@@ -317,10 +317,6 @@ func WaitForEvent(events <-chan monitor.Event, errs <-chan error) tea.Cmd {
 	return waitForEventWithContext(context.Background(), events, errs)
 }
 
-func waitForEvent(events <-chan monitor.Event, errs <-chan error) tea.Cmd {
-	return WaitForEvent(events, errs)
-}
-
 func waitForEventWithContext(ctx context.Context, events <-chan monitor.Event, errs <-chan error) tea.Cmd {
 	return func() tea.Msg {
 		if ctx != nil && ctx.Err() != nil {

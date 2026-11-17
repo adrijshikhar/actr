@@ -623,7 +623,7 @@ func TestDockerDriver_ExecuteStep_ContextCancellation_BreaksDeadlock(t *testing.
 	mockCli := newMockDockerClient()
 
 	pr, pw := io.Pipe()
-	defer pw.Close()
+	defer func() { _ = pw.Close() }()
 
 	conn := &mockConn{
 		onClose: func() {
