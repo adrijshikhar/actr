@@ -41,6 +41,9 @@ func NewActionResolver(baseDir string, client *http.Client) *ActionResolver {
 	if client == nil {
 		client = http.DefaultClient
 	}
+	if absBase, err := filepath.Abs(baseDir); err == nil {
+		baseDir = absBase
+	}
 	return &ActionResolver{
 		BaseDir:    baseDir,
 		HTTPClient: client,
@@ -111,12 +114,16 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 		return "", ErrPathTraversal
 	}
 
-	destDir := filepath.Join(r.BaseDir, "_actions", owner, repo, version)
-	markerFile := filepath.Join(r.BaseDir, "_actions", owner, repo, version+".completed")
+	baseDir := r.BaseDir
+	if absBase, err := filepath.Abs(baseDir); err == nil {
+		baseDir = absBase
+	}
+	destDir := filepath.Join(baseDir, "_actions", owner, repo, version)
+	markerFile := filepath.Join(baseDir, "_actions", owner, repo, version+".completed")
 
 	// Fast path: check if already downloaded and completed
 	if _, err := os.Stat(markerFile); err == nil {
-		return filepath.Join(destDir, subpath), nil
+		return filepath.Abs(filepath.Join(destDir, subpath))
 	}
 
 	// Ensure parent directory exists for lock and marker files
@@ -378,5 +385,5 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 	}
 
 	success = true
-	return filepath.Join(destDir, subpath), nil
+	return filepath.Abs(filepath.Join(destDir, subpath))
 }
