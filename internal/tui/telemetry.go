@@ -561,16 +561,16 @@ func (tw *TelemetryWidget) viewHistorical(width int) string {
 		cpuRatio = 0
 	}
 
-	cpuPrefix := fmt.Sprintf("PEAK CPU: %5.1f%%  ", summary.PeakCPUPercent)
-	if len(cpuPrefix) != 18 {
-		for len(cpuPrefix) > 18 && strings.HasSuffix(cpuPrefix, " ") {
+	cpuPrefix := fmt.Sprintf("PEAK CPU: %6.1f%%    ", summary.PeakCPUPercent)
+	if len(cpuPrefix) != 21 {
+		for len(cpuPrefix) > 21 && strings.HasSuffix(cpuPrefix, " ") {
 			cpuPrefix = strings.TrimSuffix(cpuPrefix, " ")
 		}
-		if len(cpuPrefix) > 18 {
-			cpuPrefix = cpuPrefix[:18]
+		if len(cpuPrefix) > 21 {
+			cpuPrefix = cpuPrefix[:21]
 		}
-		if len(cpuPrefix) < 18 {
-			cpuPrefix = fmt.Sprintf("%-18s", cpuPrefix)
+		if len(cpuPrefix) < 21 {
+			cpuPrefix = fmt.Sprintf("%-21s", cpuPrefix)
 		}
 	}
 	cpuLine := fmt.Sprintf("%s[%s]%s", cpuPrefix, tw.cpuProg.ViewAs(cpuRatio), cpuSuffix)
@@ -603,16 +603,16 @@ func (tw *TelemetryWidget) viewHistorical(width int) string {
 		memRatio = 0
 	}
 
-	ramPrefix := fmt.Sprintf("PEAK RAM: %7s ", ramValStr)
-	if len(ramPrefix) != 18 {
-		for len(ramPrefix) > 18 && strings.HasSuffix(ramPrefix, " ") {
+	ramPrefix := fmt.Sprintf("PEAK RAM: %9s  ", ramValStr)
+	if len(ramPrefix) != 21 {
+		for len(ramPrefix) > 21 && strings.HasSuffix(ramPrefix, " ") {
 			ramPrefix = strings.TrimSuffix(ramPrefix, " ")
 		}
-		if len(ramPrefix) > 18 {
-			ramPrefix = ramPrefix[:18]
+		if len(ramPrefix) > 21 {
+			ramPrefix = ramPrefix[:21]
 		}
-		if len(ramPrefix) < 18 {
-			ramPrefix = fmt.Sprintf("%-18s", ramPrefix)
+		if len(ramPrefix) < 21 {
+			ramPrefix = fmt.Sprintf("%-21s", ramPrefix)
 		}
 	}
 	memLine := fmt.Sprintf("%s[%s]%s", ramPrefix, tw.memProg.ViewAs(memRatio), ramSuffix)

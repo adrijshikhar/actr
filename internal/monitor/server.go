@@ -628,6 +628,8 @@ func (s *Server) Publish(ev Event) {
 						diff := ev.Telemetry.Timestamp.Sub(lastTime).Seconds()
 						if diff > 0 && diff < 60 {
 							deltaSeconds = diff
+						} else if diff <= 0 {
+							deltaSeconds = 0.0
 						}
 					}
 					s.lastTelemetryTime[jID] = ev.Telemetry.Timestamp

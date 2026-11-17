@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/adrijshikhar/actr/internal/config"
+	"github.com/adrijshikhar/actr/internal/history"
 	"github.com/adrijshikhar/actr/internal/monitor"
 	"github.com/adrijshikhar/actr/internal/tui"
 	tea "github.com/charmbracelet/bubbletea"
@@ -321,9 +322,84 @@ func TestTUI_ModeB_MonospaceRAMAlignment(t *testing.T) {
 			ramIdx := strings.Index(ramLine, "[")
 			require.NotEqual(t, -1, cpuIdx)
 			require.NotEqual(t, -1, ramIdx)
-			assert.Equal(t, 18, cpuIdx, "PEAK CPU bracket '[' should be at column 18")
-			assert.Equal(t, 18, ramIdx, "PEAK RAM bracket '[' should be at column 18")
+			assert.Equal(t, 21, cpuIdx, "PEAK CPU bracket '[' should be at column 21")
+			assert.Equal(t, 21, ramIdx, "PEAK RAM bracket '[' should be at column 21")
 			assert.Equal(t, cpuIdx, ramIdx, "Peak CPU and Peak RAM bar brackets must align")
+			if ramBytes == 1073641882 {
+				assert.Contains(t, ramLine, "1023.9 MB", "Peak RAM line must not truncate 9-character unit string")
+			}
 		})
 	}
 }
+
+func TestTUI_SnapshotPropagatesLogLoadingCommand(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := testSocketPath(t)
+
+	store, err := history.NewDiskStore(tempDir)
+	require.NoError(t, err)
+
+	// Create completed run in history before starting server
+	jobID := "job-hist-snap-cmd"
+	stepID := "step-build"
+	require.NoError(t, store.StartRun(&monitor.JobInfo{
+		ID:        jobID,
+		Name:      "Build App",
+		Status:    monitor.StatusRunning,
+		StartedAt: time.Now().Add(-10 * time.Second),
+	}, nil, "docker"))
+	require.NoError(t, store.AppendStepLog(jobID, stepID, "echo building artifact"))
+	require.NoError(t, store.FinishStep(jobID, stepID, "success", 0, time.Now()))
+	require.NoError(t, store.FinishRun(jobID, monitor.StatusSuccess, nil))
+
+	server := monitor.NewServer(sockPath, "test-runner").WithHistoryStore(store)
+	require.NoError(t, server.Start())
+	defer func() {
+		_ = server.Stop()
+	}()
+
+	// Instantiate dashboard model
+	model := tui.NewDashboardModel(sockPath)
+	client := monitor.NewClient(sockPath)
+	snap, err := client.GetSnapshot(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, snap)
+
+	// Dispatch initial snapshot message
+	updatedModel, cmd := model.Update(tui.SnapshotMsg(snap))
+	_ = cmd
+	dm, ok := updatedModel.(*tui.DashboardModel)
+	require.True(t, ok)
+
+	// Expand historical node and select the step node
+	require.True(t, dm.Tree().SelectFirst(func(n *tui.TreeNode) bool {
+		if n.ID == jobID {
+			n.Expanded = true
+			return true
+		}
+		return false
+	}))
+	dm.Tree().Rebuild()
+	require.True(t, dm.Tree().SelectFirst(func(n *tui.TreeNode) bool {
+		return n.ID == stepID
+	}))
+
+	// Re-applying snapshot or receiving update while step is selected must produce a batched command containing log fetch
+	updatedModel2, cmd2 := dm.Update(tui.SnapshotMsg(snap))
+	require.NotNil(t, cmd2, "SnapshotMsg with historical step selected must return command to fetch logs")
+	_ = updatedModel2
+
+	msgCh := make(chan tea.Msg, 1)
+	go func() {
+		msgCh <- cmd2()
+	}()
+	select {
+	case msg2 := <-msgCh:
+		batchMsg, isBatch := msg2.(tea.BatchMsg)
+		require.True(t, isBatch, "SnapshotMsg must batch the historical log fetch command with waitCmd")
+		require.Len(t, batchMsg, 2, "batch must contain both log fetch command and event listener")
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for command execution: cmd2 did not return tea.BatchMsg immediately")
+	}
+}
+

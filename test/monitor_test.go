@@ -218,6 +218,18 @@ func TestMonitor_Telemetry_CumulativeRateDeltaTime(t *testing.T) {
 		},
 	})
 
+	// Sample 4 with duplicate timestamp t2 (diff <= 0): deltaSeconds must be 0.0, accumulating 0 phantom bytes
+	server.Publish(monitor.Event{
+		Type:  monitor.EventTelemetry,
+		JobID: jobID,
+		Telemetry: &monitor.TelemetrySample{
+			Timestamp:     t2,
+			NetRxRate:     4000,
+			NetTxRate:     2000,
+			DiskWriteRate: 8000,
+		},
+	})
+
 	// Expected cumulative calculations:
 	// TotalNetRxBytes:
 	// Sample 1: 2000 * 0.5 = 1000
