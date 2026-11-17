@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adrijshikhar/actr/internal/action"
 	"github.com/adrijshikhar/actr/internal/config"
 	"github.com/adrijshikhar/actr/internal/driver"
 	"github.com/adrijshikhar/actr/internal/monitor"
@@ -1824,5 +1825,152 @@ func TestCoordinator_ExecuteJob_TimeoutEnforced(t *testing.T) {
 	}
 	if completeReq.Conclusion != "cancelled" {
 		t.Errorf("expected Conclusion 'cancelled' on timeout, got %q", completeReq.Conclusion)
+	}
+}
+
+type mockActionResolver struct {
+	resolveFn func(ctx context.Context, ref *protocol.StepReference) (string, error)
+}
+
+func (m *mockActionResolver) Resolve(ctx context.Context, ref *protocol.StepReference) (string, error) {
+	if m.resolveFn != nil {
+		return m.resolveFn(ctx, ref)
+	}
+	return "", errors.New("not implemented")
+}
+
+func TestCoordinator_ExecuteJob_NodeActionStep(t *testing.T) {
+	detector := action.NewHostNodeDetector("")
+	if _, err := detector.Detect(context.Background()); err != nil {
+		t.Skipf("Node.js runtime not found on host, skipping: %v", err)
+	}
+
+	workDir := t.TempDir()
+	actionDir := filepath.Join(workDir, "mock-action")
+	if err := os.MkdirAll(actionDir, 0755); err != nil {
+		t.Fatalf("failed to create action dir: %v", err)
+	}
+
+	actionYAML := `
+name: "Mock Setup"
+runs:
+  using: "node20"
+  main: "index.js"
+inputs:
+  target-greeting:
+    default: "greetings"
+`
+	if err := os.WriteFile(filepath.Join(actionDir, "action.yml"), []byte(actionYAML), 0644); err != nil {
+		t.Fatalf("failed to write action.yml: %v", err)
+	}
+
+	actionJS := `
+const fs = require('fs');
+fs.appendFileSync(process.env.GITHUB_OUTPUT, 'out_val=hello_' + process.env['INPUT_TARGET-GREETING'] + '\n');
+fs.appendFileSync(process.env.GITHUB_ENV, 'NODE_ACTION_RAN=true\n');
+console.log("Mock action executed with input: " + process.env['INPUT_TARGET_GREETING']);
+`
+	if err := os.WriteFile(filepath.Join(actionDir, "index.js"), []byte(actionJS), 0644); err != nil {
+		t.Fatalf("failed to write index.js: %v", err)
+	}
+
+	mock := &mockDriver{}
+	coord := NewCoordinator(mock, nil, workDir).WithActionResolver(&mockActionResolver{
+		resolveFn: func(ctx context.Context, ref *protocol.StepReference) (string, error) {
+			if ref != nil && ref.Name == "actions/mock-setup" {
+				return actionDir, nil
+			}
+			return "", errors.New("action not found")
+		},
+	})
+
+	job := &protocol.JobSpecification{
+		JobID:   "job-node-action",
+		PlanID:  "plan-node-action",
+		JobName: "Node Action Job",
+		Steps: []protocol.JobStep{
+			{
+				ID:   "step-node",
+				Name: "Set up mock",
+				Type: "uses",
+				Reference: &protocol.StepReference{
+					Name:    "actions/mock-setup",
+					Version: "v1",
+				},
+				Inputs: map[string]string{
+					"target-greeting": "universe",
+				},
+			},
+			{
+				ID:     "step-verify",
+				Name:   "Verify step",
+				Type:   "script",
+				Script: "echo verified",
+			},
+		},
+	}
+
+	completeReq, err := coord.ExecuteJob(context.Background(), job, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error from ExecuteJob: %v", err)
+	}
+	if completeReq.Conclusion != "success" {
+		t.Errorf("expected Conclusion 'success', got %q", completeReq.Conclusion)
+	}
+	if completeReq.Outputs["out_val"] != "hello_universe" {
+		t.Errorf("expected output out_val 'hello_universe', got %q", completeReq.Outputs["out_val"])
+	}
+	if len(completeReq.StepResults) != 2 {
+		t.Fatalf("expected 2 step results, got %d", len(completeReq.StepResults))
+	}
+	if completeReq.StepResults[0].Conclusion != "success" || completeReq.StepResults[0].ExitCode != 0 {
+		t.Errorf("expected step 0 success, got %+v", completeReq.StepResults[0])
+	}
+
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if len(mock.stepsRun) != 1 {
+		t.Fatalf("expected 1 driver step run, got %d", len(mock.stepsRun))
+	}
+	if mock.stepsRun[0].Environment["NODE_ACTION_RAN"] != "true" {
+		t.Errorf("expected environment variable NODE_ACTION_RAN propagated to subsequent step, got %q", mock.stepsRun[0].Environment["NODE_ACTION_RAN"])
+	}
+}
+
+func TestCoordinator_ExecuteJob_NodeActionStep_ResolutionFailure(t *testing.T) {
+	workDir := t.TempDir()
+	mock := &mockDriver{}
+	coord := NewCoordinator(mock, nil, workDir).WithActionResolver(&mockActionResolver{
+		resolveFn: func(ctx context.Context, ref *protocol.StepReference) (string, error) {
+			return "", errors.New("download failed 404")
+		},
+	})
+
+	job := &protocol.JobSpecification{
+		JobID:   "job-action-fail",
+		PlanID:  "plan-action-fail",
+		JobName: "Fail Job",
+		Steps: []protocol.JobStep{
+			{
+				ID:   "step-1",
+				Name: "Missing Action",
+				Type: "uses",
+				Reference: &protocol.StepReference{
+					Name:    "actions/missing",
+					Version: "v1",
+				},
+			},
+		},
+	}
+
+	completeReq, err := coord.ExecuteJob(context.Background(), job, "", "")
+	if err != nil {
+		t.Fatalf("unexpected ExecuteJob error: %v", err)
+	}
+	if completeReq.Conclusion != "failure" {
+		t.Errorf("expected Conclusion 'failure', got %q", completeReq.Conclusion)
+	}
+	if len(completeReq.StepResults) != 1 || completeReq.StepResults[0].Conclusion != "failure" {
+		t.Errorf("expected step conclusion 'failure'")
 	}
 }
