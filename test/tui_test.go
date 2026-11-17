@@ -277,13 +277,13 @@ func TestTUI_StepNodeScopedToParentRun(t *testing.T) {
 func TestTUI_ModeB_MonospaceRAMAlignment(t *testing.T) {
 	testRAMValues := []uint64{
 		0,
-		1024,                      // 1 KB
-		10 * 1024 * 1024,          // 10 MB
-		100 * 1024 * 1024,         // 100 MB
-		105381888,                 // 100.5 MB (8-char formatBytes)
-		1073641882,                // 1023.9 MB (9-char formatBytes)
-		1610612736,                // 1.5 GB
-		16 * 1024 * 1024 * 1024,   // 16 GB
+		1024,                    // 1 KB
+		10 * 1024 * 1024,        // 10 MB
+		100 * 1024 * 1024,       // 100 MB
+		105381888,               // 100.5 MB (8-char formatBytes)
+		1073641882,              // 1023.9 MB (9-char formatBytes)
+		1610612736,              // 1.5 GB
+		16 * 1024 * 1024 * 1024, // 16 GB
 	}
 
 	for _, ramBytes := range testRAMValues {
@@ -402,4 +402,3 @@ func TestTUI_SnapshotPropagatesLogLoadingCommand(t *testing.T) {
 		t.Fatal("timed out waiting for command execution: cmd2 did not return tea.BatchMsg immediately")
 	}
 }
-

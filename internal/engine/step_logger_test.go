@@ -352,4 +352,3 @@ func TestNewLineWriter_SharedMaskerAcrossStreams(t *testing.T) {
 		t.Errorf("expected stderr line %q, got %q", expected, errLines[0])
 	}
 }
-

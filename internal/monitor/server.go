@@ -24,13 +24,13 @@ type Server struct {
 	listener   net.Listener
 	httpServer *http.Server
 
-	mu           sync.RWMutex
-	jobs         map[string]*JobInfo
-	recentJobs   []*JobInfo
-	activeJobs   []*JobInfo
-	stepLogs     map[string]*RingBuffer
-	telemetry    *TelemetrySample
-	historyStore HistoryStore
+	mu                sync.RWMutex
+	jobs              map[string]*JobInfo
+	recentJobs        []*JobInfo
+	activeJobs        []*JobInfo
+	stepLogs          map[string]*RingBuffer
+	telemetry         *TelemetrySample
+	historyStore      HistoryStore
 	maxRuns           int
 	maxDiskBytes      int64
 	peakMetrics       map[string]*RunMetricsSummary
