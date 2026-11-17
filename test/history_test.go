@@ -309,3 +309,219 @@ func TestHistory_CrashRecovery_E2E(t *testing.T) {
 	require.Len(t, runs, 1)
 	assert.Equal(t, monitor.StatusInterrupted, runs[0].Status)
 }
+
+func TestHistoryStore_PathTraversalRejection(t *testing.T) {
+	tempBase := t.TempDir()
+	runsDir := filepath.Join(tempBase, "runs")
+
+	store, err := history.NewDiskStore(runsDir)
+	require.NoError(t, err)
+
+	traversalJobIDs := []string{
+		"../escaped-job",
+		"../../etc-job",
+		"job/with/slash",
+		"job\\with\\backslash",
+		"..",
+		".",
+	}
+
+	for _, badJobID := range traversalJobIDs {
+		t.Run("jobID_"+badJobID, func(t *testing.T) {
+			job := &monitor.JobInfo{
+				ID:   badJobID,
+				Name: "Bad Job",
+			}
+			err := store.StartRun(job, nil, "host")
+			assert.Error(t, err, "StartRun should reject traversal jobID %q", badJobID)
+
+			err = store.FinishRun(badJobID, monitor.StatusSuccess, nil)
+			assert.Error(t, err, "FinishRun should reject traversal jobID %q", badJobID)
+
+			_, err = store.GetRun(badJobID)
+			assert.Error(t, err, "GetRun should reject traversal jobID %q", badJobID)
+
+			err = store.AppendStepLog(badJobID, "valid-step", "some log")
+			assert.Error(t, err, "AppendStepLog should reject traversal jobID %q", badJobID)
+
+			_, err = store.GetStepLogs(badJobID, "valid-step")
+			assert.Error(t, err, "GetStepLogs should reject traversal jobID %q", badJobID)
+
+			_, err = store.GetStepLogReader(badJobID, "valid-step")
+			assert.Error(t, err, "GetStepLogReader should reject traversal jobID %q", badJobID)
+		})
+	}
+
+	traversalStepIDs := []string{
+		"../escaped-step",
+		"../../evil-step",
+		"step/with/slash",
+		"step\\backslash",
+		"..",
+		".",
+	}
+
+	for _, badStepID := range traversalStepIDs {
+		t.Run("stepID_"+badStepID, func(t *testing.T) {
+			err := store.AppendStepLog("valid-job", badStepID, "some log")
+			assert.Error(t, err, "AppendStepLog should reject traversal stepID %q", badStepID)
+
+			_, err = store.GetStepLogs("valid-job", badStepID)
+			assert.Error(t, err, "GetStepLogs should reject traversal stepID %q", badStepID)
+
+			_, err = store.GetStepLogReader("valid-job", badStepID)
+			assert.Error(t, err, "GetStepLogReader should reject traversal stepID %q", badStepID)
+		})
+	}
+}
+
+func TestHistoryStore_CatalogCorruptNotOverwritten(t *testing.T) {
+	tempBase := t.TempDir()
+	runsDir := filepath.Join(tempBase, "runs")
+
+	store, err := history.NewDiskStore(runsDir)
+	require.NoError(t, err)
+
+	indexPath := filepath.Join(runsDir, "index.json")
+	corruptContent := []byte("{corrupted-json-content: not valid json")
+	require.NoError(t, os.WriteFile(indexPath, corruptContent, 0600))
+
+	job := &monitor.JobInfo{
+		ID:   "job-corrupt-test",
+		Name: "Test Run",
+	}
+
+	// StartRun should fail when index.json is corrupted
+	err = store.StartRun(job, nil, "host")
+	require.Error(t, err, "StartRun should fail when index.json is corrupted")
+
+	// Corrupted index.json must be preserved as index.json.corrupt.* and not wiped
+	matches, globErr := filepath.Glob(filepath.Join(runsDir, "index.json.corrupt.*"))
+	require.NoError(t, globErr)
+	require.NotEmpty(t, matches, "expected index.json.corrupt.* backup to exist")
+
+	backupBytes, readErr := os.ReadFile(matches[0])
+	require.NoError(t, readErr)
+	assert.Equal(t, corruptContent, backupBytes, "backup should match original corrupted content")
+
+	// Verify index.json was not overwritten with an empty catalog
+	if currentData, err := os.ReadFile(indexPath); err == nil {
+		assert.Equal(t, corruptContent, currentData, "index.json should retain corrupt data if not renamed, never overwritten with empty catalog")
+	}
+}
+
+func TestHistoryStore_PruneSkipsActiveRuns(t *testing.T) {
+	tempBase := t.TempDir()
+	runsDir := filepath.Join(tempBase, "runs")
+
+	store, err := history.NewDiskStore(runsDir)
+	require.NoError(t, err)
+
+	baseTime := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Second)
+
+	// Create running job
+	runningJob := &monitor.JobInfo{
+		ID:        "job-active-running",
+		Name:      "Active Running Job",
+		Status:    monitor.StatusRunning,
+		StartedAt: baseTime.Add(1 * time.Minute),
+	}
+	require.NoError(t, store.StartRun(runningJob, nil, "host"))
+
+	// Create queued job
+	queuedJob := &monitor.JobInfo{
+		ID:        "job-active-queued",
+		Name:      "Active Queued Job",
+		Status:    monitor.StatusQueued,
+		StartedAt: baseTime.Add(2 * time.Minute),
+	}
+	require.NoError(t, store.StartRun(queuedJob, nil, "host"))
+
+	// Create 2 completed jobs
+	completedJob1 := &monitor.JobInfo{
+		ID:        "job-completed-1",
+		Name:      "Completed Job 1",
+		Status:    monitor.StatusRunning,
+		StartedAt: baseTime.Add(3 * time.Minute),
+	}
+	require.NoError(t, store.StartRun(completedJob1, nil, "host"))
+	require.NoError(t, store.FinishRun(completedJob1.ID, monitor.StatusSuccess, nil))
+
+	completedJob2 := &monitor.JobInfo{
+		ID:        "job-completed-2",
+		Name:      "Completed Job 2",
+		Status:    monitor.StatusRunning,
+		StartedAt: baseTime.Add(4 * time.Minute),
+	}
+	require.NoError(t, store.StartRun(completedJob2, nil, "host"))
+	require.NoError(t, store.FinishRun(completedJob2.ID, monitor.StatusSuccess, nil))
+
+	// Prune with maxRuns=1 (1 completed run retention)
+	prunedCount, err := store.Prune(1, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 1, prunedCount, "only older completed job should be pruned")
+
+	runs, err := store.ListRuns(0)
+	require.NoError(t, err)
+
+	runMap := make(map[string]string)
+	for _, r := range runs {
+		runMap[r.ID] = string(r.Status)
+	}
+
+	// Active runs must NEVER be pruned
+	assert.Contains(t, runMap, "job-active-running")
+	assert.Contains(t, runMap, "job-active-queued")
+	assert.DirExists(t, filepath.Join(runsDir, "job-active-running"))
+	assert.DirExists(t, filepath.Join(runsDir, "job-active-queued"))
+
+	// Only older completed job should be removed
+	assert.NotContains(t, runMap, "job-completed-1")
+	assert.Contains(t, runMap, "job-completed-2")
+	assert.NoDirExists(t, filepath.Join(runsDir, "job-completed-1"))
+	assert.DirExists(t, filepath.Join(runsDir, "job-completed-2"))
+}
+
+func TestHistoryStore_PruneEmptyRunIDDoesNotDeleteBaseDir(t *testing.T) {
+	tempBase := t.TempDir()
+	runsDir := filepath.Join(tempBase, "runs")
+
+	store, err := history.NewDiskStore(runsDir)
+	require.NoError(t, err)
+
+	sentinelFile := filepath.Join(runsDir, "sentinel.txt")
+	require.NoError(t, os.WriteFile(sentinelFile, []byte("preserve-me"), 0600))
+
+	// Manually inject invalid runs with empty or whitespace IDs into index.json
+	indexPath := filepath.Join(runsDir, "index.json")
+	indexBytes, err := os.ReadFile(indexPath)
+	require.NoError(t, err)
+
+	var catalog monitor.IndexCatalog
+	require.NoError(t, json.Unmarshal(indexBytes, &catalog))
+
+	catalog.Runs = append(catalog.Runs,
+		&monitor.RunSummary{
+			ID:        "",
+			Status:    monitor.StatusSuccess,
+			StartedAt: time.Now().Add(-10 * time.Minute),
+		},
+		&monitor.RunSummary{
+			ID:        "   ",
+			Status:    monitor.StatusSuccess,
+			StartedAt: time.Now().Add(-9 * time.Minute),
+		},
+	)
+
+	newIndexBytes, err := json.Marshal(catalog)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(indexPath, newIndexBytes, 0600))
+
+	// Prune should safely handle empty IDs without removing base directory
+	_, err = store.Prune(1, 0)
+	require.NoError(t, err)
+
+	// Ensure base directory and sentinel file STILL exist
+	assert.DirExists(t, runsDir, "base directory must NOT be deleted by empty run ID")
+	assert.FileExists(t, sentinelFile, "sentinel file must remain untouched")
+}

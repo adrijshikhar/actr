@@ -369,3 +369,43 @@ func TestDiskStore_AtomicWrite(t *testing.T) {
 	// 1 initial run + 10 concurrent runs = 11 runs
 	assert.Len(t, runs, 11)
 }
+
+func TestDiskStore_Permissions(t *testing.T) {
+	tempBase := t.TempDir()
+	runsDir := filepath.Join(tempBase, "restricted-runs")
+
+	store, err := history.NewDiskStore(runsDir)
+	require.NoError(t, err)
+
+	baseInfo, err := os.Stat(runsDir)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0700), baseInfo.Mode().Perm(), "base dir should have 0700 permissions")
+
+	indexInfo, err := os.Stat(filepath.Join(runsDir, "index.json"))
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0600), indexInfo.Mode().Perm(), "index.json should have 0600 permissions")
+
+	job := &monitor.JobInfo{
+		ID:        "job-perm-test",
+		Name:      "Perm Test",
+		StartedAt: time.Now().UTC(),
+		Steps: []*monitor.StepInfo{
+			{ID: "step-1", Name: "Step 1"},
+		},
+	}
+	require.NoError(t, store.StartRun(job, nil, "host"))
+	require.NoError(t, store.AppendStepLog(job.ID, "step-1", "test log line"))
+
+	stepsDir := filepath.Join(runsDir, job.ID, "steps")
+	stepsInfo, err := os.Stat(stepsDir)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0700), stepsInfo.Mode().Perm(), "steps dir should have 0700 permissions")
+
+	metaInfo, err := os.Stat(filepath.Join(runsDir, job.ID, "meta.json"))
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0600), metaInfo.Mode().Perm(), "meta.json should have 0600 permissions")
+
+	logInfo, err := os.Stat(filepath.Join(stepsDir, "step-1.log"))
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0600), logInfo.Mode().Perm(), "step log file should have 0600 permissions")
+}

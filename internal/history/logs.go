@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -24,11 +23,9 @@ func (s *DiskStore) getStepLock(jobID, stepID string) *sync.RWMutex {
 // exists, line has newline termination, and step metadata statistics (LogBytes, LogLines) are updated
 // if the step is tracked in meta.json.
 func (s *DiskStore) AppendStepLog(jobID, stepID, line string) error {
-	if jobID == "" {
-		return errors.New("empty job ID")
-	}
-	if stepID == "" {
-		return errors.New("empty step ID")
+	logPath, err := s.stepLogPath(jobID, stepID)
+	if err != nil {
+		return fmt.Errorf("invalid job or step ID: %w", err)
 	}
 
 	lineCount := strings.Count(line, "\n")
@@ -44,14 +41,13 @@ func (s *DiskStore) AppendStepLog(jobID, stepID, line string) error {
 	lock := s.getStepLock(jobID, stepID)
 	lock.Lock()
 
-	stepsDir := filepath.Join(s.baseDir, jobID, "steps")
-	if err := os.MkdirAll(stepsDir, 0755); err != nil {
+	stepsDir := filepath.Dir(logPath)
+	if err := os.MkdirAll(stepsDir, 0700); err != nil {
 		lock.Unlock()
 		return fmt.Errorf("failed to create steps directory %s: %w", stepsDir, err)
 	}
 
-	logPath := filepath.Join(stepsDir, stepID+".log")
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		lock.Unlock()
 		return fmt.Errorf("failed to open step log file %s: %w", logPath, err)
@@ -76,18 +72,15 @@ func (s *DiskStore) AppendStepLog(jobID, stepID, line string) error {
 // GetStepLogs returns all lines from <baseDir>/<jobID>/steps/<stepID>.log preserving ANSI escape sequences.
 // If the step log file does not exist, an empty slice and nil error are returned.
 func (s *DiskStore) GetStepLogs(jobID, stepID string) ([]string, error) {
-	if jobID == "" {
-		return nil, errors.New("empty job ID")
-	}
-	if stepID == "" {
-		return nil, errors.New("empty step ID")
+	logPath, err := s.stepLogPath(jobID, stepID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid job or step ID: %w", err)
 	}
 
 	lock := s.getStepLock(jobID, stepID)
 	lock.RLock()
 	defer lock.RUnlock()
 
-	logPath := filepath.Join(s.baseDir, jobID, "steps", stepID+".log")
 	data, err := os.ReadFile(logPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -117,14 +110,11 @@ func (s *DiskStore) GetStepLogs(jobID, stepID string) ([]string, error) {
 // GetStepLogReader returns a readable stream for <baseDir>/<jobID>/steps/<stepID>.log.
 // The caller is responsible for closing the returned reader.
 func (s *DiskStore) GetStepLogReader(jobID, stepID string) (io.ReadCloser, error) {
-	if jobID == "" {
-		return nil, errors.New("empty job ID")
-	}
-	if stepID == "" {
-		return nil, errors.New("empty step ID")
+	logPath, err := s.stepLogPath(jobID, stepID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid job or step ID: %w", err)
 	}
 
-	logPath := filepath.Join(s.baseDir, jobID, "steps", stepID+".log")
 	f, err := os.Open(logPath)
 	if err != nil {
 		return nil, err
@@ -134,10 +124,15 @@ func (s *DiskStore) GetStepLogReader(jobID, stepID string) (io.ReadCloser, error
 
 // updateStepMeta atomically updates LogBytes and LogLines for stepID in meta.json if it exists.
 func (s *DiskStore) updateStepMeta(jobID, stepID string, byteCount int64, lineCount int) {
+	runDir, err := s.runDir(jobID)
+	if err != nil {
+		return
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	metaPath := filepath.Join(s.baseDir, jobID, "meta.json")
+	metaPath := filepath.Join(runDir, "meta.json")
 	data, err := os.ReadFile(metaPath)
 	if err != nil {
 		return
