@@ -13,6 +13,16 @@ import (
 	"time"
 )
 
+// StepReference represents an action reference in a workflow job step.
+type StepReference struct {
+	ID      string `json:"id,omitempty"`
+	Name    string `json:"name"`
+	Version string `json:"version,omitempty"`
+	Ref     string `json:"ref,omitempty"`
+	Type    string `json:"type"`
+	Path    string `json:"path,omitempty"`
+}
+
 // JobStep represents a single step within an acquired job specification.
 type JobStep struct {
 	ID               string            `json:"id"`
@@ -22,6 +32,7 @@ type JobStep struct {
 	WorkingDirectory string            `json:"workingDirectory,omitempty"`
 	Environment      map[string]string `json:"environment,omitempty"`
 	Inputs           map[string]string `json:"inputs,omitempty"`
+	Reference        *StepReference    `json:"reference,omitempty"`
 }
 
 // JobContainer defines the container execution environment for a workflow job.
@@ -49,7 +60,9 @@ type rawStepReference struct {
 	ID      string `json:"id"`
 	Name    string `json:"name"`
 	Version string `json:"version"`
+	Ref     string `json:"ref"`
 	Type    string `json:"type"`
+	Path    string `json:"path"`
 }
 
 type rawStep struct {
@@ -478,7 +491,11 @@ func (j *JobSpecification) UnmarshalJSON(data []byte) error {
 
 			stepType := s.Type
 			if stepType == "" && s.Reference != nil && s.Reference.Type != "" {
-				stepType = s.Reference.Type
+				if s.Reference.Type == "repository" {
+					stepType = "uses"
+				} else {
+					stepType = s.Reference.Type
+				}
 			}
 
 			script := extractASTString(s.Script)
@@ -499,13 +516,32 @@ func (j *JobSpecification) UnmarshalJSON(data []byte) error {
 				}
 			}
 
-			if stepType == "" {
+			if stepType == "" || stepType == "repository" {
 				if script != "" {
 					stepType = "script"
-				} else if s.Reference != nil && (strings.HasPrefix(s.Reference.Name, "actions/") || strings.Contains(s.Reference.Name, "@")) {
+				} else if s.Reference != nil && (strings.HasPrefix(s.Reference.Name, "actions/") || strings.Contains(s.Reference.Name, "@") || s.Reference.Type == "repository") {
 					stepType = "uses"
 				} else if stepInputs != nil && stepInputs["uses"] != "" {
 					stepType = "uses"
+				}
+			}
+
+			var ref *StepReference
+			if s.Reference != nil {
+				refVersion := s.Reference.Version
+				refValue := s.Reference.Ref
+				if refValue == "" && refVersion != "" {
+					refValue = refVersion
+				} else if refVersion == "" && refValue != "" {
+					refVersion = refValue
+				}
+				ref = &StepReference{
+					ID:      s.Reference.ID,
+					Name:    s.Reference.Name,
+					Version: refVersion,
+					Ref:     refValue,
+					Type:    s.Reference.Type,
+					Path:    s.Reference.Path,
 				}
 			}
 
@@ -517,6 +553,7 @@ func (j *JobSpecification) UnmarshalJSON(data []byte) error {
 				WorkingDirectory: workDir,
 				Environment:      stepEnv,
 				Inputs:           stepInputs,
+				Reference:        ref,
 			})
 		}
 		j.Steps = steps
@@ -787,11 +824,15 @@ func (c *RunServiceClient) AcquireJob(ctx context.Context, runServiceURL, runner
 		return nil, fmt.Errorf("acquire job returned status %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
+	return ParseAcquiredJob(bodyBytes)
+}
+
+// ParseAcquiredJob parses raw acquire job JSON payload into a JobSpecification.
+func ParseAcquiredJob(data []byte) (*JobSpecification, error) {
 	var jobSpec JobSpecification
-	if err := json.Unmarshal(bodyBytes, &jobSpec); err != nil {
+	if err := json.Unmarshal(data, &jobSpec); err != nil {
 		return nil, fmt.Errorf("unmarshal job specification: %w", err)
 	}
-
 	return &jobSpec, nil
 }
 
