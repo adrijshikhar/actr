@@ -563,8 +563,11 @@ func (tw *TelemetryWidget) viewHistorical(width int) string {
 
 	cpuPrefix := fmt.Sprintf("PEAK CPU: %5.1f%%  ", summary.PeakCPUPercent)
 	if len(cpuPrefix) != 18 {
-		if len(cpuPrefix) > 18 && strings.HasSuffix(cpuPrefix, " ") {
+		for len(cpuPrefix) > 18 && strings.HasSuffix(cpuPrefix, " ") {
 			cpuPrefix = strings.TrimSuffix(cpuPrefix, " ")
+		}
+		if len(cpuPrefix) > 18 {
+			cpuPrefix = cpuPrefix[:18]
 		}
 		if len(cpuPrefix) < 18 {
 			cpuPrefix = fmt.Sprintf("%-18s", cpuPrefix)
@@ -602,8 +605,11 @@ func (tw *TelemetryWidget) viewHistorical(width int) string {
 
 	ramPrefix := fmt.Sprintf("PEAK RAM: %7s ", ramValStr)
 	if len(ramPrefix) != 18 {
-		if len(ramPrefix) > 18 && strings.HasSuffix(ramPrefix, " ") {
+		for len(ramPrefix) > 18 && strings.HasSuffix(ramPrefix, " ") {
 			ramPrefix = strings.TrimSuffix(ramPrefix, " ")
+		}
+		if len(ramPrefix) > 18 {
+			ramPrefix = ramPrefix[:18]
 		}
 		if len(ramPrefix) < 18 {
 			ramPrefix = fmt.Sprintf("%-18s", ramPrefix)
