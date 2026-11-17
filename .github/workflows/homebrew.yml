@@ -8,6 +8,18 @@ on:
       tag:
         description: 'Release tag to update tap for (e.g. v0.1.0)'
         required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag to update tap for (e.g. v0.1.0)'
+        required: true
+        type: string
+    secrets:
+      HOMEBREW_TAP_TOKEN:
+        required: false
+      HOMEBREW_TAP_GITHUB_TOKEN:
+        required: false
 
 concurrency:
   group: homebrew-tap
@@ -28,11 +40,14 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
+          CALL_TAG: ${{ inputs.tag }}
         run: |
           if [ -n "$RELEASE_TAG" ]; then
             TAG="$RELEASE_TAG"
           elif [ -n "$INPUT_TAG" ]; then
             TAG="$INPUT_TAG"
+          elif [ -n "$CALL_TAG" ]; then
+            TAG="$CALL_TAG"
           else
             echo "Error: Neither release.tag_name nor inputs.tag was provided." >&2
             exit 1

@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,16 +16,86 @@ import (
 	"github.com/adrijshikhar/actr/internal/monitor"
 )
 
+var validIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_\-\.]+$`)
+
+// sanitizeID verifies that id contains only alphanumeric characters, underscores,
+// hyphens, and dots, is not empty, does not contain "..", and is not ".".
+func sanitizeID(id string) (string, error) {
+	if strings.TrimSpace(id) == "" {
+		return "", errors.New("empty ID")
+	}
+	if strings.Contains(id, "..") {
+		return "", fmt.Errorf("invalid ID %q: contains '..'", id)
+	}
+	if !validIDPattern.MatchString(id) {
+		return "", fmt.Errorf("invalid ID %q: contains invalid characters", id)
+	}
+	if id == "." {
+		return "", fmt.Errorf("invalid ID %q: cannot be '.'", id)
+	}
+	return id, nil
+}
+
 // DiskStore provides on-disk storage for run metadata, step logs, and the catalog index.
 type DiskStore struct {
 	baseDir   string
 	mu        sync.RWMutex
 	stepLocks sync.Map
+	stepStats sync.Map
 }
 
 var _ Store = (*DiskStore)(nil)
 var _ LogStore = (*DiskStore)(nil)
 var _ Pruner = (*DiskStore)(nil)
+
+// runDir sanitizes jobID and ensures the resolved run path resides within baseDir.
+func (s *DiskStore) runDir(jobID string) (string, error) {
+	cleanID, err := sanitizeID(jobID)
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(s.baseDir, cleanID)
+	rel, err := filepath.Rel(s.baseDir, path)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return "", fmt.Errorf("path %s escapes base directory %s", path, s.baseDir)
+	}
+	return path, nil
+}
+
+// stepLogPath sanitizes jobID and stepID and ensures the step log path resides within baseDir.
+func (s *DiskStore) stepLogPath(jobID, stepID string) (string, error) {
+	runDir, err := s.runDir(jobID)
+	if err != nil {
+		return "", err
+	}
+	cleanStepID, err := sanitizeID(stepID)
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(runDir, "steps", cleanStepID+".log")
+	rel, err := filepath.Rel(s.baseDir, path)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return "", fmt.Errorf("path %s escapes base directory %s", path, s.baseDir)
+	}
+	return path, nil
+}
+
+// backupCorruptIndex backs up a corrupted index.json to index.json.corrupt.<timestamp>.
+func (s *DiskStore) backupCorruptIndex(indexPath string) error {
+	if _, err := os.Stat(indexPath); err != nil {
+		return nil
+	}
+	timestamp := fmt.Sprintf("%d", time.Now().UTC().UnixNano())
+	backupPath := fmt.Sprintf("%s.corrupt.%s", indexPath, timestamp)
+	if err := os.Rename(indexPath, backupPath); err != nil {
+		if data, rErr := os.ReadFile(indexPath); rErr == nil {
+			_ = os.WriteFile(backupPath, data, 0600)
+			_ = os.Remove(indexPath)
+		}
+		return err
+	}
+	return nil
+}
 
 // NewDiskStore initializes a DiskStore rooted at baseDir, creating the directory
 // and an initial index.json if they do not exist, and recovering any interrupted runs.
@@ -32,7 +104,7 @@ func NewDiskStore(baseDir string) (*DiskStore, error) {
 		return nil, errors.New("baseDir cannot be empty")
 	}
 
-	if err := os.MkdirAll(baseDir, 0755); err != nil {
+	if err := os.MkdirAll(baseDir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create base directory %s: %w", baseDir, err)
 	}
 
@@ -68,12 +140,30 @@ func (s *DiskStore) StartRun(job *monitor.JobInfo, limits *config.LimitsConfig, 
 		return errors.New("invalid job or empty job ID")
 	}
 
+	runDir, err := s.runDir(job.ID)
+	if err != nil {
+		return fmt.Errorf("invalid job ID: %w", err)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	runDir := filepath.Join(s.baseDir, job.ID)
+	indexPath := filepath.Join(s.baseDir, "index.json")
+	catalog, err := s.loadIndexLocked()
+	if err != nil {
+		if os.IsNotExist(err) {
+			catalog = &IndexCatalog{
+				Version: 1,
+				Runs:    []*RunSummary{},
+			}
+		} else {
+			_ = s.backupCorruptIndex(indexPath)
+			return fmt.Errorf("failed to load index catalog: %w", err)
+		}
+	}
+
 	stepsDir := filepath.Join(runDir, "steps")
-	if err := os.MkdirAll(stepsDir, 0755); err != nil {
+	if err := os.MkdirAll(stepsDir, 0700); err != nil {
 		return fmt.Errorf("failed to create run directory %s: %w", stepsDir, err)
 	}
 
@@ -130,14 +220,6 @@ func (s *DiskStore) StartRun(job *monitor.JobInfo, limits *config.LimitsConfig, 
 		return fmt.Errorf("failed to write run metadata: %w", err)
 	}
 
-	catalog, err := s.loadIndexLocked()
-	if err != nil {
-		catalog = &IndexCatalog{
-			Version: 1,
-			Runs:    []*RunSummary{},
-		}
-	}
-
 	summary := &RunSummary{
 		ID:          meta.ID,
 		Name:        meta.Name,
@@ -167,7 +249,6 @@ func (s *DiskStore) StartRun(job *monitor.JobInfo, limits *config.LimitsConfig, 
 	s.sortRuns(catalog.Runs)
 	catalog.UpdatedAt = time.Now().UTC()
 
-	indexPath := filepath.Join(s.baseDir, "index.json")
 	if err := writeJSONAtomic(indexPath, catalog); err != nil {
 		return fmt.Errorf("failed to update index catalog: %w", err)
 	}
@@ -182,10 +263,29 @@ func (s *DiskStore) FinishRun(jobID string, status monitor.StepStatus, metrics *
 		return errors.New("empty job ID")
 	}
 
+	runDir, err := s.runDir(jobID)
+	if err != nil {
+		return fmt.Errorf("invalid job ID %q: %w", jobID, err)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	metaPath := filepath.Join(s.baseDir, jobID, "meta.json")
+	indexPath := filepath.Join(s.baseDir, "index.json")
+	catalog, err := s.loadIndexLocked()
+	if err != nil {
+		if os.IsNotExist(err) {
+			catalog = &IndexCatalog{
+				Version: 1,
+				Runs:    []*RunSummary{},
+			}
+		} else {
+			_ = s.backupCorruptIndex(indexPath)
+			return fmt.Errorf("failed to load index catalog: %w", err)
+		}
+	}
+
+	metaPath := filepath.Join(runDir, "meta.json")
 	data, err := os.ReadFile(metaPath)
 	if err != nil {
 		return fmt.Errorf("failed to read run metadata for job %s: %w", jobID, err)
@@ -218,16 +318,37 @@ func (s *DiskStore) FinishRun(jobID string, status monitor.StepStatus, metrics *
 		}
 	}
 
-	if err := writeJSONAtomic(metaPath, &meta); err != nil {
-		return fmt.Errorf("failed to update run metadata for job %s: %w", jobID, err)
+	// Flush any in-memory step stats that haven't been finalized via FinishStep
+	for _, st := range meta.Steps {
+		if st == nil {
+			continue
+		}
+		key := jobID + "/" + st.ID
+		if val, ok := s.stepStats.LoadAndDelete(key); ok {
+			stat := val.(*stepStats)
+			st.LogBytes += stat.bytes.Load()
+			st.LogLines += int(stat.lines.Load())
+		}
+		s.stepLocks.Delete(key)
 	}
 
-	catalog, err := s.loadIndexLocked()
-	if err != nil {
-		catalog = &IndexCatalog{
-			Version: 1,
-			Runs:    []*RunSummary{},
+	// Clean up any remaining step locks or stats for this job
+	prefix := jobID + "/"
+	s.stepLocks.Range(func(k, _ any) bool {
+		if ks, ok := k.(string); ok && strings.HasPrefix(ks, prefix) {
+			s.stepLocks.Delete(k)
 		}
+		return true
+	})
+	s.stepStats.Range(func(k, _ any) bool {
+		if ks, ok := k.(string); ok && strings.HasPrefix(ks, prefix) {
+			s.stepStats.Delete(k)
+		}
+		return true
+	})
+
+	if err := writeJSONAtomic(metaPath, &meta); err != nil {
+		return fmt.Errorf("failed to update run metadata for job %s: %w", jobID, err)
 	}
 
 	var target *RunSummary
@@ -263,7 +384,6 @@ func (s *DiskStore) FinishRun(jobID string, status monitor.StepStatus, metrics *
 	s.sortRuns(catalog.Runs)
 	catalog.UpdatedAt = now
 
-	indexPath := filepath.Join(s.baseDir, "index.json")
 	if err := writeJSONAtomic(indexPath, catalog); err != nil {
 		return fmt.Errorf("failed to update index catalog: %w", err)
 	}
@@ -311,10 +431,15 @@ func (s *DiskStore) GetRun(jobID string) (*RunMetadata, error) {
 		return nil, errors.New("empty job ID")
 	}
 
+	runDir, err := s.runDir(jobID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid job ID %q: %w", jobID, err)
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	metaPath := filepath.Join(s.baseDir, jobID, "meta.json")
+	metaPath := filepath.Join(runDir, "meta.json")
 	data, err := os.ReadFile(metaPath)
 	if err != nil {
 		return nil, err
@@ -323,6 +448,18 @@ func (s *DiskStore) GetRun(jobID string) (*RunMetadata, error) {
 	var meta RunMetadata
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal run metadata: %w", err)
+	}
+
+	for _, st := range meta.Steps {
+		if st == nil {
+			continue
+		}
+		key := jobID + "/" + st.ID
+		if val, ok := s.stepStats.Load(key); ok {
+			stat := val.(*stepStats)
+			st.LogBytes += stat.bytes.Load()
+			st.LogLines += int(stat.lines.Load())
+		}
 	}
 
 	return &meta, nil
@@ -359,7 +496,7 @@ func (s *DiskStore) sortRuns(runs []*RunSummary) {
 // in the target directory before atomically renaming it to targetPath.
 func writeJSONAtomic(targetPath string, v any) error {
 	dir := filepath.Dir(targetPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 
@@ -397,7 +534,7 @@ func writeJSONAtomic(targetPath string, v any) error {
 		return fmt.Errorf("failed to close temp file: %w", err)
 	}
 
-	_ = os.Chmod(tmpPath, 0644)
+	_ = os.Chmod(tmpPath, 0600)
 
 	if err := os.Rename(tmpPath, targetPath); err != nil {
 		return fmt.Errorf("failed to rename temp file to %s: %w", targetPath, err)
@@ -405,4 +542,24 @@ func writeJSONAtomic(targetPath string, v any) error {
 
 	cleanup = false
 	return nil
+}
+
+// StepLockCount returns the current count of allocated step locks in memory (for testing and diagnostics).
+func (s *DiskStore) StepLockCount() int {
+	count := 0
+	s.stepLocks.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	return count
+}
+
+// StepStatsCount returns the current count of active step stat trackers in memory (for testing and diagnostics).
+func (s *DiskStore) StepStatsCount() int {
+	count := 0
+	s.stepStats.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	return count
 }

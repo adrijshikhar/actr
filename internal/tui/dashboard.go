@@ -26,6 +26,25 @@ type ErrMsg error
 type ReconnectMsg struct{}
 type reconnectMsg = ReconnectMsg
 
+// streamClosedMsg indicates the event stream closed.
+type streamClosedMsg struct{}
+
+// streamErrMsg wraps streaming errors.
+type streamErrMsg struct {
+	err error
+}
+
+// monitorEventMsg is an alias for EventMsg for internal compatibility.
+type monitorEventMsg = EventMsg
+
+// historicalLogsLoadedMsg delivers asynchronously fetched logs for a historical step.
+type historicalLogsLoadedMsg struct {
+	runID  string
+	stepID string
+	logs   []string
+	err    error
+}
+
 const (
 	StatusBadgeConnected = "● CONNECTED (LIVE)"
 	StatusBadgeOffline   = "◉ OFFLINE (HISTORY)"
@@ -154,6 +173,38 @@ func (m *DashboardModel) ApplySnapshot(snap *monitor.Snapshot) {
 	m.applySnapshot(snap)
 }
 
+// Tree returns the underlying TreeWidget.
+func (m *DashboardModel) Tree() *TreeWidget {
+	if m == nil {
+		return nil
+	}
+	return m.tree
+}
+
+// Viewport returns a pointer to the underlying viewport model.
+func (m *DashboardModel) Viewport() *viewport.Model {
+	if m == nil {
+		return nil
+	}
+	return &m.viewport
+}
+
+// StepLogs returns the in-memory map of step logs.
+func (m *DashboardModel) StepLogs() map[string][]string {
+	if m == nil {
+		return nil
+	}
+	return m.stepLogs
+}
+
+// Telemetry returns the underlying TelemetryWidget.
+func (m *DashboardModel) Telemetry() *TelemetryWidget {
+	if m == nil {
+		return nil
+	}
+	return m.telemetry
+}
+
 // HydrateSnapshotFromStore reads up to limit runs from historyStore and builds a Snapshot
 // populated with RecentJobs (including steps) ready for offline dashboard hydration.
 func HydrateSnapshotFromStore(store monitor.HistoryStore, limit int) (*monitor.Snapshot, error) {
@@ -247,11 +298,12 @@ func (m *DashboardModel) Init() tea.Cmd {
 		m.events, m.errs = m.client.StreamEvents(ctx)
 	}
 
+	client := m.client
 	return func() tea.Msg {
-		if m.client == nil {
+		if client == nil {
 			return ErrMsg(fmt.Errorf("client not configured"))
 		}
-		snap, err := m.client.GetSnapshot(ctx)
+		snap, err := client.GetSnapshot(ctx)
 		if err != nil {
 			return ErrMsg(err)
 		}
@@ -259,35 +311,52 @@ func (m *DashboardModel) Init() tea.Cmd {
 	}
 }
 
-func (m *DashboardModel) waitForEvents(ctx context.Context) tea.Cmd {
+// WaitForEvent returns a tea.Cmd that waits for an incoming event or error on the provided channels.
+// It is pure and does not touch or mutate the model.
+func WaitForEvent(events <-chan monitor.Event, errs <-chan error) tea.Cmd {
+	return waitForEventWithContext(context.Background(), events, errs)
+}
+
+func waitForEventWithContext(ctx context.Context, events <-chan monitor.Event, errs <-chan error) tea.Cmd {
 	return func() tea.Msg {
-		if ctx.Err() != nil {
+		if ctx != nil && ctx.Err() != nil {
 			return nil
 		}
-		if m.events == nil {
-			if m.client == nil {
-				return ErrMsg(fmt.Errorf("client not configured"))
-			}
-			m.events, m.errs = m.client.StreamEvents(ctx)
+		if events == nil && errs == nil {
+			return nil
+		}
+		var done <-chan struct{}
+		if ctx != nil {
+			done = ctx.Done()
 		}
 		select {
-		case <-ctx.Done():
+		case <-done:
 			return nil
-		case ev, ok := <-m.events:
+		case ev, ok := <-events:
 			if !ok {
-				m.events = nil
-				m.errs = nil
-				return ErrMsg(fmt.Errorf("stream closed"))
+				return streamClosedMsg{}
 			}
-			return EventMsg(ev)
-		case err, ok := <-m.errs:
+			return monitorEventMsg(ev)
+		case err, ok := <-errs:
 			if !ok {
-				m.events = nil
-				m.errs = nil
-				return ErrMsg(fmt.Errorf("stream closed"))
+				return streamClosedMsg{}
 			}
-			return ErrMsg(err)
+			return streamErrMsg{err: err}
 		}
+	}
+}
+
+func (m *DashboardModel) waitForEvents(ctx context.Context) tea.Cmd {
+	return waitForEventWithContext(ctx, m.events, m.errs)
+}
+
+func fetchHistoricalLogsCmd(client *monitor.Client, runID, stepID string) tea.Cmd {
+	return func() tea.Msg {
+		if client == nil {
+			return historicalLogsLoadedMsg{runID: runID, stepID: stepID, logs: nil, err: fmt.Errorf("client not configured")}
+		}
+		logs, err := client.GetHistoricalStepLogs(context.Background(), runID, stepID)
+		return historicalLogsLoadedMsg{runID: runID, stepID: stepID, logs: logs, err: err}
 	}
 }
 
@@ -321,32 +390,27 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "k", "up":
 			if !m.isZoomed {
 				m.tree.Up()
-				m.updateActiveStepLogs()
-				return m, nil
+				return m, m.updateActiveStepLogs()
 			}
 		case "j", "down":
 			if !m.isZoomed {
 				m.tree.Down()
-				m.updateActiveStepLogs()
-				return m, nil
+				return m, m.updateActiveStepLogs()
 			}
 		case "enter", " ":
 			if !m.isZoomed {
 				m.tree.Toggle()
-				m.updateActiveStepLogs()
-				return m, nil
+				return m, m.updateActiveStepLogs()
 			}
 		case "h", "left":
 			if !m.isZoomed {
 				m.tree.Collapse()
-				m.updateActiveStepLogs()
-				return m, nil
+				return m, m.updateActiveStepLogs()
 			}
 		case "l", "right":
 			if !m.isZoomed {
 				m.tree.Expand()
-				m.updateActiveStepLogs()
-				return m, nil
+				return m, m.updateActiveStepLogs()
 			}
 		case "pgdown", "pagedown", "ctrl+d":
 			var cmd tea.Cmd
@@ -371,7 +435,7 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.events, m.errs = m.client.StreamEvents(ctx)
 		}
 		if ctx.Err() == nil {
-			return m, m.waitForEvents(ctx)
+			return m, waitForEventWithContext(ctx, m.events, m.errs)
 		}
 		return m, nil
 
@@ -382,7 +446,41 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			ctx = context.Background()
 		}
 		if ctx.Err() == nil {
-			return m, m.waitForEvents(ctx)
+			return m, waitForEventWithContext(ctx, m.events, m.errs)
+		}
+		return m, nil
+
+	case streamClosedMsg:
+		m.lastErr = fmt.Errorf("stream closed")
+		m.events = nil
+		m.errs = nil
+		m.isOffline = true
+		m.updateBranchLabels()
+		ctx := m.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if ctx.Err() == nil {
+			return m, tea.Tick(1*time.Second, func(time.Time) tea.Msg {
+				return ReconnectMsg{}
+			})
+		}
+		return m, nil
+
+	case streamErrMsg:
+		m.lastErr = msg.err
+		m.events = nil
+		m.errs = nil
+		m.isOffline = true
+		m.updateBranchLabels()
+		ctx := m.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if ctx.Err() == nil {
+			return m, tea.Tick(1*time.Second, func(time.Time) tea.Msg {
+				return ReconnectMsg{}
+			})
 		}
 		return m, nil
 
@@ -409,15 +507,44 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			ctx = context.Background()
 		}
 		if ctx.Err() == nil {
+			client := m.client
 			return m, func() tea.Msg {
-				if m.client == nil {
+				if client == nil {
 					return ErrMsg(fmt.Errorf("client not configured"))
 				}
-				snap, err := m.client.GetSnapshot(ctx)
+				snap, err := client.GetSnapshot(ctx)
 				if err != nil {
 					return ErrMsg(err)
 				}
 				return SnapshotMsg(snap)
+			}
+		}
+		return m, nil
+
+	case historicalLogsLoadedMsg:
+		if msg.err == nil && len(msg.logs) > 0 {
+			logs := msg.logs
+			if len(logs) > maxStepLogLines {
+				logs = logs[len(logs)-maxStepLogLines:]
+			}
+			m.stepLogs[msg.runID+"/"+msg.stepID] = logs
+			m.stepLogs[msg.stepID] = logs
+			sel := m.tree.SelectedNode()
+			if sel != nil && sel.ID == msg.stepID && (sel.Parent == nil || sel.Parent.ID == msg.runID) {
+				m.viewport.SetContent(strings.Join(logs, "\n"))
+				if m.autoFollow {
+					m.viewport.GotoBottom()
+				}
+			}
+		} else if msg.err != nil {
+			sel := m.tree.SelectedNode()
+			if sel != nil && sel.ID == msg.stepID && (sel.Parent == nil || sel.Parent.ID == msg.runID) {
+				m.viewport.SetContent(fmt.Sprintf("Failed to load logs: %v", msg.err))
+			}
+		} else {
+			sel := m.tree.SelectedNode()
+			if sel != nil && sel.ID == msg.stepID && (sel.Parent == nil || sel.Parent.ID == msg.runID) {
+				m.viewport.SetContent(renderStepEmptyState(sel))
 			}
 		}
 		return m, nil
@@ -1048,26 +1175,7 @@ func (m *DashboardModel) upsertStepNode(jobID string, step *monitor.StepInfo) {
 	}
 	live, hist := m.ensureBranches()
 
-	// 1. Search the tree to see if step already exists
-	var existingStep *TreeNode
-	m.tree.Root.Walk(func(n *TreeNode) bool {
-		if n.ID == step.ID {
-			existingStep = n
-			return false
-		}
-		return true
-	})
-
-	if existingStep != nil {
-		if step.Name != "" {
-			existingStep.Label = step.Name
-		}
-		existingStep.Status = step.Status
-		m.tree.Rebuild()
-		return
-	}
-
-	// 2. Step is new, find or create the parent job container
+	// 1. Find or create the parent job container
 	var parentJob *TreeNode
 	if jobID != "" {
 		m.tree.Root.Walk(func(n *TreeNode) bool {
@@ -1117,6 +1225,25 @@ func (m *DashboardModel) upsertStepNode(jobID string, step *monitor.StepInfo) {
 		}
 	}
 
+	// 2. Search strictly within the parent run node's children to prevent cross-run ID collisions
+	var existingStep *TreeNode
+	for _, child := range parentJob.Children {
+		if child.ID == step.ID {
+			existingStep = child
+			break
+		}
+	}
+
+	if existingStep != nil {
+		if step.Name != "" {
+			existingStep.Label = step.Name
+		}
+		existingStep.Status = step.Status
+		m.tree.Rebuild()
+		return
+	}
+
+	// 3. Step is new, add child to parentJob
 	label := step.Name
 	if label == "" {
 		label = step.ID
@@ -1144,7 +1271,7 @@ func (m *DashboardModel) updateNodeStatus(nodeID string, status monitor.StepStat
 	m.tree.Rebuild()
 }
 
-func (m *DashboardModel) updateActiveStepLogs() {
+func (m *DashboardModel) updateActiveStepLogs() tea.Cmd {
 	if m.width > 0 && m.height > 0 && (m.viewport.Width == 0 || m.viewport.Height == 0) {
 		m.updateSizes()
 	}
@@ -1160,50 +1287,46 @@ func (m *DashboardModel) updateActiveStepLogs() {
 			lines = m.stepLogs[sel.ID]
 		}
 
-		// If logs are not in memory, check if this is a historical step and fetch on-demand
-		if len(lines) == 0 && isHistoricalNode(sel) && sel.Parent != nil && sel.Parent.ID != "" && sel.Parent.ID != "historical-runs" {
-			jobID := sel.Parent.ID
-			stepID := sel.ID
-			var fetched []string
-			var err error
-
-			if m.historyStore != nil {
-				fetched, err = m.historyStore.GetStepLogs(jobID, stepID)
-			}
-			if len(fetched) == 0 && m.client != nil && !m.isOffline {
-				ctx := m.ctx
-				if ctx == nil {
-					ctx = context.Background()
-				}
-				fetched, err = m.client.GetHistoricalStepLogs(ctx, jobID, stepID)
-			}
-			if len(fetched) == 0 && m.historyStore != nil && err != nil {
-				fetched, _ = m.historyStore.GetStepLogs(jobID, stepID)
-			}
-
-			if len(fetched) > 0 {
-				if len(fetched) > maxStepLogLines {
-					fetched = fetched[len(fetched)-maxStepLogLines:]
-				}
-				lines = fetched
-				m.stepLogs[jobID+"/"+stepID] = lines
-				m.stepLogs[stepID] = lines
-			}
-		}
-
 		if len(lines) > 0 {
 			m.viewport.SetContent(strings.Join(lines, "\n"))
 			if m.autoFollow {
 				m.viewport.GotoBottom()
 			}
-		} else {
-			if sel.ID == "root" || sel.Parent == nil || sel.ID == "live-runs" || sel.ID == "historical-runs" {
-				m.viewport.SetContent(m.renderRootState(m.tree.Root.Label))
-			} else {
-				m.viewport.SetContent(renderStepEmptyState(sel))
+			return nil
+		}
+
+		// If logs are not in memory, check if this is a historical step
+		if isHistoricalNode(sel) && sel.Parent != nil && sel.Parent.ID != "" && sel.Parent.ID != "historical-runs" {
+			jobID := sel.Parent.ID
+			stepID := sel.ID
+			// In offline mode with a direct history store, read immediately without IPC
+			if m.isOffline && m.historyStore != nil {
+				fetched, _ := m.historyStore.GetStepLogs(jobID, stepID)
+				if len(fetched) > 0 {
+					if len(fetched) > maxStepLogLines {
+						fetched = fetched[len(fetched)-maxStepLogLines:]
+					}
+					m.stepLogs[jobID+"/"+stepID] = fetched
+					m.stepLogs[stepID] = fetched
+					m.viewport.SetContent(strings.Join(fetched, "\n"))
+					if m.autoFollow {
+						m.viewport.GotoBottom()
+					}
+					return nil
+				}
+			} else if m.client != nil {
+				m.viewport.SetContent("(loading logs...)")
+				return fetchHistoricalLogsCmd(m.client, jobID, stepID)
 			}
 		}
+
+		if sel.ID == "root" || sel.Parent == nil || sel.ID == "live-runs" || sel.ID == "historical-runs" {
+			m.viewport.SetContent(m.renderRootState(m.tree.Root.Label))
+		} else {
+			m.viewport.SetContent(renderStepEmptyState(sel))
+		}
 	}
+	return nil
 }
 
 // View renders the split-pane dashboard or 100% full-screen zoom mode.

@@ -1188,7 +1188,18 @@ func TestDashboard_HistoricalStepSelection_LoadsLogs(t *testing.T) {
 		t.Fatalf("expected step-hist-1 visible in tree rows")
 	}
 
-	m.updateActiveStepLogs()
+	cmd := m.updateActiveStepLogs()
+	if cmd == nil {
+		t.Fatal("expected fetchHistoricalLogsCmd when selecting historical step with unhydrated logs")
+	}
+	vpPending := m.viewport.View()
+	if !strings.Contains(vpPending, "loading logs") {
+		t.Fatalf("expected viewport to show loading state while logs are pending, got:\n%s", vpPending)
+	}
+
+	msg := cmd()
+	newModel, _ = m.Update(msg)
+	m = newModel.(*DashboardModel)
 
 	// Step logs should now be loaded into memory and rendered in the viewport
 	cachedLogs := m.stepLogs["job-hist-1/step-hist-1"]

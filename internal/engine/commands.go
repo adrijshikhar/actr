@@ -20,6 +20,7 @@ func ParseCommandFile(path string) (map[string]string, error) {
 
 	results := make(map[string]string)
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
 
 	var currentKey, delimiter string
 	var multiLine strings.Builder
@@ -38,21 +39,28 @@ func ParseCommandFile(path string) (map[string]string, error) {
 			continue
 		}
 
-		if idx := strings.Index(line, "<<"); idx != -1 {
-			currentKey = strings.TrimSpace(line[:idx])
-			delimiter = strings.TrimSpace(line[idx+2:])
+		heredocIdx := strings.Index(line, "<<")
+		eqIdx := strings.Index(line, "=")
+
+		if heredocIdx != -1 && (eqIdx == -1 || heredocIdx < eqIdx) {
+			currentKey = strings.TrimSpace(line[:heredocIdx])
+			delimiter = strings.TrimSpace(line[heredocIdx+2:])
 			inMultiLine = true
 			continue
 		}
 
-		if idx := strings.Index(line, "="); idx != -1 {
-			k := strings.TrimSpace(line[:idx])
-			v := line[idx+1:]
+		if eqIdx != -1 {
+			k := strings.TrimSpace(line[:eqIdx])
+			v := line[eqIdx+1:]
 			results[k] = v
 		}
 	}
 
-	return results, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return results, nil
 }
 
 // ParseEnvFile parses a file pointed to by $GITHUB_ENV.
@@ -83,6 +91,7 @@ func ParsePathFile(path string) ([]string, error) {
 
 	var paths []string
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line != "" {
@@ -90,5 +99,9 @@ func ParsePathFile(path string) ([]string, error) {
 		}
 	}
 
-	return paths, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return paths, nil
 }

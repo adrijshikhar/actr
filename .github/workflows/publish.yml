@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test-and-verify:
@@ -28,11 +28,14 @@ jobs:
     steps:
       - name: Determine Target Git Ref
         id: target
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ -n "${{ github.event.inputs.tag }}" ]; then
-            TAG="${{ github.event.inputs.tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
           else
-            TAG="${{ github.ref_name }}"
+            TAG="$REF_NAME"
           fi
           VERSION="${TAG#v}"
           echo "ref=$TAG" >> "$GITHUB_OUTPUT"
@@ -68,19 +71,25 @@ jobs:
     runs-on: ubuntu-latest
     needs: test-and-verify
     if: github.repository == 'adrijshikhar/actr'
+    permissions:
+      contents: write
     outputs:
       tag: ${{ steps.target.outputs.ref }}
       version: ${{ steps.target.outputs.version }}
     steps:
       - name: Determine Target Git Ref
         id: target
+        env:
+          VERIFY_TAG: ${{ needs.test-and-verify.outputs.tag }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ -n "${{ needs.test-and-verify.outputs.tag }}" ]; then
-            TAG="${{ needs.test-and-verify.outputs.tag }}"
-          elif [ -n "${{ github.event.inputs.tag }}" ]; then
-            TAG="${{ github.event.inputs.tag }}"
+          if [ -n "$VERIFY_TAG" ]; then
+            TAG="$VERIFY_TAG"
+          elif [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
           else
-            TAG="${{ github.ref_name }}"
+            TAG="$REF_NAME"
           fi
           VERSION="${TAG#v}"
           echo "ref=$TAG" >> "$GITHUB_OUTPUT"
@@ -116,10 +125,12 @@ jobs:
     steps:
       - name: Download & Verify Release Checksums
         id: checksum
+        env:
+          TAG: ${{ needs.goreleaser.outputs.tag }}
+          VERSION: ${{ needs.goreleaser.outputs.version }}
+          GITHUB_REPO: ${{ github.repository }}
         run: |
-          TAG="${{ needs.goreleaser.outputs.tag }}"
-          VERSION="${{ needs.goreleaser.outputs.version }}"
-          BASE_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}"
+          BASE_URL="https://github.com/${GITHUB_REPO}/releases/download/${TAG}"
           CHECKSUMS_URL="${BASE_URL}/checksums.txt"
 
           echo "Downloading checksums.txt from $CHECKSUMS_URL"
@@ -150,8 +161,9 @@ jobs:
           done
 
       - name: Run Binary Smoke Test Probe
+        env:
+          VERSION: ${{ needs.goreleaser.outputs.version }}
         run: |
-          VERSION="${{ needs.goreleaser.outputs.version }}"
           RUNNER_ARCH="$(uname -m)"
           if [ "$RUNNER_ARCH" = "arm64" ]; then
             tar -xzf "actr_${VERSION}_darwin_arm64.tar.gz" actr
@@ -168,3 +180,12 @@ jobs:
             exit 1
           fi
           echo "✓ Binary probe verification PASSED: $PROBE_VERSION"
+
+  homebrew:
+    name: Trigger Homebrew Tap Update
+    needs: [goreleaser, verify-asset]
+    if: github.repository == 'adrijshikhar/actr'
+    uses: ./.github/workflows/homebrew.yml
+    with:
+      tag: ${{ needs.goreleaser.outputs.tag }}
+    secrets: inherit

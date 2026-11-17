@@ -213,6 +213,25 @@ func (c *Coordinator) NotifyStepFinish(jobID, stepID, stepName string, status mo
 	}
 }
 
+func newFailedCompleteJobRequest(job *protocol.JobSpecification) *protocol.CompleteJobRequest {
+	jobID := ""
+	planID := ""
+	if job != nil {
+		jobID = job.JobID
+		planID = job.PlanID
+	}
+	if jobID == "" {
+		jobID = "job"
+	}
+	return &protocol.CompleteJobRequest{
+		PlanID:      planID,
+		JobID:       jobID,
+		Conclusion:  "failure",
+		Outputs:     make(map[string]string),
+		StepResults: make([]protocol.StepResult, 0),
+	}
+}
+
 // ExecuteJob runs all steps of the given JobSpecification sequentially, maintaining cumulative
 // environment updates, aggregating step outputs, managing background lease renewal, and returning
 // the CompleteJobRequest summary.
@@ -223,11 +242,17 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 
 	d, err := c.resolveDriver(job)
 	if err != nil {
-		return nil, err
+		return newFailedCompleteJobRequest(job), err
 	}
 
 	if ctx == nil {
 		ctx = context.Background()
+	}
+
+	if c.limits != nil && c.limits.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.limits.Timeout)
+		defer cancel()
 	}
 
 	jobID := job.JobID
@@ -309,17 +334,17 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	baseWorkDir, err := filepath.Abs(c.workDir)
 	if err != nil {
 		conclusion = "failure"
-		return nil, fmt.Errorf("resolve base work directory: %w", err)
+		return newFailedCompleteJobRequest(job), fmt.Errorf("resolve base work directory: %w", err)
 	}
 	if err := os.MkdirAll(baseWorkDir, 0o755); err != nil {
 		conclusion = "failure"
-		return nil, fmt.Errorf("create base work directory: %w", err)
+		return newFailedCompleteJobRequest(job), fmt.Errorf("create base work directory: %w", err)
 	}
 
 	runnerTemp := filepath.Join(baseWorkDir, "_temp")
 	if err := os.MkdirAll(runnerTemp, 0o755); err != nil {
 		conclusion = "failure"
-		return nil, fmt.Errorf("create runner temp directory: %w", err)
+		return newFailedCompleteJobRequest(job), fmt.Errorf("create runner temp directory: %w", err)
 	}
 
 	jobDirName := job.JobName
@@ -333,7 +358,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	_ = os.RemoveAll(jobWorkspace)
 	if err := os.MkdirAll(jobWorkspace, 0o755); err != nil {
 		conclusion = "failure"
-		return nil, fmt.Errorf("create job workspace: %w", err)
+		return newFailedCompleteJobRequest(job), fmt.Errorf("create job workspace: %w", err)
 	}
 
 	// Initialize cumulative environment
@@ -472,7 +497,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 
 	if err := d.PrepareJob(ctx, jobCtx); err != nil {
 		conclusion = "failure"
-		return nil, fmt.Errorf("prepare job: %w", err)
+		return newFailedCompleteJobRequest(job), fmt.Errorf("prepare job: %w", err)
 	}
 
 	// Start background lease renew ticker if RunService is configured
@@ -539,7 +564,13 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		envFile, err := os.CreateTemp(runnerTemp, fmt.Sprintf("env_%s_*.txt", stepID))
 		if err != nil {
 			conclusion = "failure"
-			return nil, fmt.Errorf("create GITHUB_ENV file: %w", err)
+			return &protocol.CompleteJobRequest{
+				PlanID:      job.PlanID,
+				JobID:       job.JobID,
+				Conclusion:  "failure",
+				Outputs:     outputs,
+				StepResults: stepResults,
+			}, fmt.Errorf("create GITHUB_ENV file: %w", err)
 		}
 		envPath := envFile.Name()
 		_ = envFile.Close()
@@ -548,7 +579,13 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		if err != nil {
 			conclusion = "failure"
 			_ = os.Remove(envPath)
-			return nil, fmt.Errorf("create GITHUB_OUTPUT file: %w", err)
+			return &protocol.CompleteJobRequest{
+				PlanID:      job.PlanID,
+				JobID:       job.JobID,
+				Conclusion:  "failure",
+				Outputs:     outputs,
+				StepResults: stepResults,
+			}, fmt.Errorf("create GITHUB_OUTPUT file: %w", err)
 		}
 		outputPath := outFile.Name()
 		_ = outFile.Close()
@@ -558,7 +595,13 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			conclusion = "failure"
 			_ = os.Remove(envPath)
 			_ = os.Remove(outputPath)
-			return nil, fmt.Errorf("create GITHUB_PATH file: %w", err)
+			return &protocol.CompleteJobRequest{
+				PlanID:      job.PlanID,
+				JobID:       job.JobID,
+				Conclusion:  "failure",
+				Outputs:     outputs,
+				StepResults: stepResults,
+			}, fmt.Errorf("create GITHUB_PATH file: %w", err)
 		}
 		pathFilePath := pathFile.Name()
 		_ = pathFile.Close()
@@ -587,7 +630,13 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			_ = os.Remove(envPath)
 			_ = os.Remove(outputPath)
 			_ = os.Remove(pathFilePath)
-			return nil, fmt.Errorf("create step working directory: %w", err)
+			return &protocol.CompleteJobRequest{
+				PlanID:      job.PlanID,
+				JobID:       job.JobID,
+				Conclusion:  "failure",
+				Outputs:     outputs,
+				StepResults: stepResults,
+			}, fmt.Errorf("create step working directory: %w", err)
 		}
 
 		stepScript := step.Script
@@ -640,12 +689,38 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		}
 
 		// Step succeeded: parse environment, output, and path files
-		newEnv, _ := ParseEnvAndOutputFile(envPath)
+		newEnv, err := ParseEnvAndOutputFile(envPath)
+		if err != nil {
+			c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusFailed)
+			stepResults = append(stepResults, protocol.StepResult{
+				ID:         stepID,
+				Conclusion: "failure",
+				ExitCode:   1,
+			})
+			_ = os.Remove(envPath)
+			_ = os.Remove(outputPath)
+			_ = os.Remove(pathFilePath)
+			conclusion = "failure"
+			break
+		}
 		for k, v := range newEnv {
 			cumulativeEnv[k] = v
 		}
 
-		newOutputs, _ := ParseEnvAndOutputFile(outputPath)
+		newOutputs, err := ParseEnvAndOutputFile(outputPath)
+		if err != nil {
+			c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusFailed)
+			stepResults = append(stepResults, protocol.StepResult{
+				ID:         stepID,
+				Conclusion: "failure",
+				ExitCode:   1,
+			})
+			_ = os.Remove(envPath)
+			_ = os.Remove(outputPath)
+			_ = os.Remove(pathFilePath)
+			conclusion = "failure"
+			break
+		}
 		stepOutputsMap := make(map[string]any)
 		for k, v := range newOutputs {
 			outputs[k] = v
@@ -661,7 +736,20 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			stepsMap[step.Name] = map[string]any{"outputs": stepOutputsMap}
 		}
 
-		newPaths, _ := ParsePathFile(pathFilePath)
+		newPaths, err := ParsePathFile(pathFilePath)
+		if err != nil {
+			c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusFailed)
+			stepResults = append(stepResults, protocol.StepResult{
+				ID:         stepID,
+				Conclusion: "failure",
+				ExitCode:   1,
+			})
+			_ = os.Remove(envPath)
+			_ = os.Remove(outputPath)
+			_ = os.Remove(pathFilePath)
+			conclusion = "failure"
+			break
+		}
 		if len(newPaths) > 0 {
 			pathPrefix := strings.Join(newPaths, string(filepath.ListSeparator))
 			pathKey := "PATH"
@@ -872,7 +960,7 @@ func generateCheckoutScript(step protocol.JobStep, env map[string]string) string
 	if step.Inputs != nil {
 		repo = step.Inputs["repository"]
 	}
-	if repo == "" {
+	if repo == "" && env != nil {
 		repo = env["GITHUB_REPOSITORY"]
 	}
 	ref := ""
@@ -884,15 +972,21 @@ func generateCheckoutScript(step protocol.JobStep, env map[string]string) string
 		subPath = step.Inputs["path"]
 	}
 
-	return fmt.Sprintf(`set -e
+	if env != nil {
+		env["ACTR_CHECKOUT_REPO"] = repo
+		env["ACTR_CHECKOUT_REF"] = ref
+		env["ACTR_CHECKOUT_PATH"] = subPath
+	}
+
+	return `set -e
 TARGET_DIR="${GITHUB_WORKSPACE}"
-if [ -n "%s" ]; then
-    TARGET_DIR="${GITHUB_WORKSPACE}/%s"
+if [ -n "$ACTR_CHECKOUT_PATH" ]; then
+    TARGET_DIR="${GITHUB_WORKSPACE}/$ACTR_CHECKOUT_PATH"
 fi
 mkdir -p "$TARGET_DIR"
 cd "$TARGET_DIR"
 
-REPO_NAME="%s"
+REPO_NAME="$ACTR_CHECKOUT_REPO"
 if [ -z "$REPO_NAME" ]; then
     REPO_NAME="${GITHUB_REPOSITORY}"
 fi
@@ -911,7 +1005,7 @@ if [ ! -d ".git" ]; then
     git remote set-url origin "https://github.com/${REPO_NAME}.git" 2>/dev/null || true
 fi
 
-TARGET_REF="%s"
+TARGET_REF="$ACTR_CHECKOUT_REF"
 if [ -z "$TARGET_REF" ]; then
     TARGET_REF="${GITHUB_SHA}"
 fi
@@ -920,9 +1014,10 @@ if [ -z "$TARGET_REF" ]; then
 fi
 
 if [ -n "$TARGET_REF" ]; then
-    git checkout -f "$TARGET_REF" 2>/dev/null || true
+    git fetch --depth=1 origin "$TARGET_REF" || git fetch origin
+    git checkout -f "$TARGET_REF"
 fi
-`, subPath, subPath, repo, ref)
+`
 }
 
 func parseContextData(v any) any {

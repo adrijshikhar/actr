@@ -184,3 +184,86 @@ func TestStepWriter_SuppressesSensitiveWorkflowCommands(t *testing.T) {
 		}
 	}
 }
+
+func TestStepLogger_AddMask_DynamicSecretRedaction(t *testing.T) {
+	var buf bytes.Buffer
+	sl := NewStepLogger("mask-job", &buf, false)
+	writer := sl.NewWriter("stdout")
+
+	input := "echo ::add-mask::supersecret\npassword is supersecret\n"
+	_, err := writer.Write([]byte(input))
+	if err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+	writer.Flush()
+
+	out := buf.String()
+	if strings.Contains(out, "supersecret") {
+		t.Errorf("expected output to NOT contain 'supersecret', got:\n%s", out)
+	}
+	if !strings.Contains(out, "password is ***") {
+		t.Errorf("expected output to contain 'password is ***', got:\n%s", out)
+	}
+	if strings.Contains(out, "add-mask") {
+		t.Errorf("expected add-mask command to be suppressed, got:\n%s", out)
+	}
+}
+
+func TestStepWriter_AddMask_NewLineWriter(t *testing.T) {
+	var loggedLines []string
+	writer := NewLineWriter(func(line string) {
+		loggedLines = append(loggedLines, line)
+	})
+
+	input := "echo ::add-mask::supersecret\npassword is supersecret\n"
+	_, err := writer.Write([]byte(input))
+	if err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+	writer.Flush()
+
+	if len(loggedLines) != 1 {
+		t.Fatalf("expected 1 logged line (add-mask suppressed), got %d: %v", len(loggedLines), loggedLines)
+	}
+	if loggedLines[0] != "password is ***" {
+		t.Errorf("expected 'password is ***', got %q", loggedLines[0])
+	}
+	if strings.Contains(loggedLines[0], "supersecret") {
+		t.Errorf("expected secret to be masked, got %q", loggedLines[0])
+	}
+}
+
+func TestStepLogger_SharedMaskerBetweenStreams(t *testing.T) {
+	var buf bytes.Buffer
+	sl := NewStepLogger("shared-mask", &buf, false)
+	stdoutWriter := sl.NewWriter("stdout")
+	stderrWriter := sl.NewWriter("stderr")
+
+	// Emit mask on stdout
+	_, _ = stdoutWriter.Write([]byte("::add-mask::stream-token-xyz\n"))
+	stdoutWriter.Flush()
+
+	// Emit secret on stderr
+	_, _ = stderrWriter.Write([]byte("error with stream-token-xyz occurred\n"))
+	stderrWriter.Flush()
+
+	out := buf.String()
+	if strings.Contains(out, "stream-token-xyz") {
+		t.Errorf("expected secret to be masked across streams, got:\n%s", out)
+	}
+	if !strings.Contains(out, "error with *** occurred") {
+		t.Errorf("expected masked line 'error with *** occurred', got:\n%s", out)
+	}
+}
+
+func TestSecretMasker_LongerSecretsMaskedFirst(t *testing.T) {
+	sm := NewSecretMasker()
+	sm.AddMask("short")
+	sm.AddMask("short_and_long")
+
+	result := sm.Mask("access short_and_long and short token")
+	expected := "access *** and *** token"
+	if result != expected {
+		t.Errorf("expected %q, got %q", expected, result)
+	}
+}

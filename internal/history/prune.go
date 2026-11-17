@@ -5,15 +5,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/adrijshikhar/actr/internal/monitor"
 )
 
 // Prune enforces LRU retention limits across stored workflow runs.
-// If maxRuns > 0 and the number of runs exceeds maxRuns, oldest runs are pruned.
+// Active runs ("running" or "queued") are never pruned.
+// If maxRuns > 0 and the number of completed runs exceeds maxRuns, oldest completed runs are pruned.
 // If maxDiskBytes > 0 and the total disk usage of run folders exceeds maxDiskBytes,
-// oldest runs are pruned one-by-one until total usage is <= 90% of maxDiskBytes.
+// oldest completed runs are pruned one-by-one until total usage is <= 90% of maxDiskBytes.
 // Updated index.json is written atomically.
 func (s *DiskStore) Prune(maxRuns int, maxDiskBytes int64) (int, error) {
 	s.mu.Lock()
@@ -33,44 +35,80 @@ func (s *DiskStore) Prune(maxRuns int, maxDiskBytes int64) (int, error) {
 
 	s.sortRuns(catalog.Runs)
 
+	// Partition runs by status: active runs vs completed runs.
+	// Active runs (running, queued) must never be pruned.
+	var activeRuns []*RunSummary
+	var completedRuns []*RunSummary
+	for _, r := range catalog.Runs {
+		if r == nil {
+			continue
+		}
+		if r.Status == monitor.StatusRunning || r.Status == monitor.StatusQueued {
+			activeRuns = append(activeRuns, r)
+		} else {
+			completedRuns = append(completedRuns, r)
+		}
+	}
+
 	prunedCount := 0
 
-	// 1. Count pruning: remove oldest runs beyond maxRuns limit
-	if maxRuns > 0 && len(catalog.Runs) > maxRuns {
-		toPrune := catalog.Runs[maxRuns:]
-		catalog.Runs = catalog.Runs[:maxRuns]
+	// 1. Count pruning: remove oldest completed runs beyond maxRuns limit
+	if maxRuns > 0 && len(completedRuns) > maxRuns {
+		toPrune := completedRuns[maxRuns:]
+		completedRuns = completedRuns[:maxRuns]
 		for _, run := range toPrune {
-			runDir := filepath.Join(s.baseDir, run.ID)
+			if run == nil || strings.TrimSpace(run.ID) == "" {
+				continue
+			}
+			runDir, err := s.runDir(run.ID)
+			if err != nil {
+				continue
+			}
 			_ = os.RemoveAll(runDir)
 			prunedCount++
 		}
 	}
 
-	// 2. Disk size pruning: prune oldest runs until total usage is <= 90% of maxDiskBytes
-	if maxDiskBytes > 0 && len(catalog.Runs) > 0 {
-		runSizes := make(map[string]int64, len(catalog.Runs))
+	// 2. Disk size pruning: prune oldest completed runs until total usage is <= 90% of maxDiskBytes
+	if maxDiskBytes > 0 {
+		runSizes := make(map[string]int64)
 		var totalSize int64
-		for _, r := range catalog.Runs {
-			sz := dirSize(filepath.Join(s.baseDir, r.ID))
+
+		// Calculate size of all valid runs (both active and completed)
+		for _, r := range append(activeRuns, completedRuns...) {
+			if r == nil || strings.TrimSpace(r.ID) == "" {
+				continue
+			}
+			runDir, err := s.runDir(r.ID)
+			if err != nil {
+				continue
+			}
+			sz := dirSize(runDir)
 			runSizes[r.ID] = sz
 			totalSize += sz
 		}
 
 		if totalSize > maxDiskBytes {
 			threshold := int64(float64(maxDiskBytes) * 0.90)
-			for len(catalog.Runs) > 0 && totalSize > threshold {
-				lastIdx := len(catalog.Runs) - 1
-				oldest := catalog.Runs[lastIdx]
-				runDir := filepath.Join(s.baseDir, oldest.ID)
-				_ = os.RemoveAll(runDir)
-				totalSize -= runSizes[oldest.ID]
-				catalog.Runs = catalog.Runs[:lastIdx]
-				prunedCount++
+			for len(completedRuns) > 0 && totalSize > threshold {
+				lastIdx := len(completedRuns) - 1
+				oldest := completedRuns[lastIdx]
+				completedRuns = completedRuns[:lastIdx]
+
+				if oldest != nil && strings.TrimSpace(oldest.ID) != "" {
+					if runDir, err := s.runDir(oldest.ID); err == nil {
+						_ = os.RemoveAll(runDir)
+						totalSize -= runSizes[oldest.ID]
+						prunedCount++
+					}
+				}
 			}
 		}
 	}
 
-	if prunedCount > 0 {
+	if prunedCount > 0 || len(catalog.Runs) != len(activeRuns)+len(completedRuns) {
+		catalog.Runs = append(activeRuns, completedRuns...)
+		s.sortRuns(catalog.Runs)
 		catalog.UpdatedAt = time.Now().UTC()
 		indexPath := filepath.Join(s.baseDir, "index.json")
 		if err := writeJSONAtomic(indexPath, catalog); err != nil {
@@ -116,7 +154,15 @@ func (s *DiskStore) RecoverInterruptedRuns() (int, error) {
 			}
 			recoveredCount++
 
-			metaPath := filepath.Join(s.baseDir, run.ID, "meta.json")
+			if strings.TrimSpace(run.ID) == "" {
+				continue
+			}
+			runDir, err := s.runDir(run.ID)
+			if err != nil {
+				continue
+			}
+
+			metaPath := filepath.Join(runDir, "meta.json")
 			data, err := os.ReadFile(metaPath)
 			if err == nil {
 				var meta RunMetadata

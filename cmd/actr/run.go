@@ -500,6 +500,16 @@ func newRunCmd() *cobra.Command {
 					logger.Error("job execution encountered error", "error", execErr)
 				}
 
+				if completeReq == nil && jobSpec != nil {
+					completeReq = &protocol.CompleteJobRequest{
+						PlanID:      jobSpec.PlanID,
+						JobID:       jobSpec.JobID,
+						Conclusion:  "failure",
+						Outputs:     map[string]string{},
+						StepResults: []protocol.StepResult{},
+					}
+				}
+
 				if completeReq != nil {
 					completeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 					if completeErr := runServiceClient.CompleteJob(completeCtx, runServiceURL, jobToken, completeReq); completeErr != nil {

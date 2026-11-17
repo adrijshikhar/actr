@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/adrijshikhar/actr/internal/config"
 	"github.com/adrijshikhar/actr/internal/driver"
@@ -115,16 +116,10 @@ func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout,
 	cmd.Dir = absWorkDir
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = 5 * time.Second
+	setProcessGroup(cmd)
 	cmd.Cancel = func() error {
-		if cmd.Process == nil || cmd.Process.Pid <= 0 {
-			return nil
-		}
-		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		if err == syscall.ESRCH {
-			return nil
-		}
-		return err
+		return killProcessGroup(cmd)
 	}
 
 	// Environment layering

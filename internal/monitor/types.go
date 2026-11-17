@@ -195,6 +195,7 @@ type HistoryStore interface {
 	LogStore
 	Pruner
 	StartRun(job *JobInfo, limits *config.LimitsConfig, driver string) error
+	FinishStep(jobID, stepID, conclusion string, exitCode int, finishedAt time.Time) error
 	FinishRun(jobID string, status StepStatus, metrics *RunMetricsSummary) error
 	ListRuns(limit int) ([]*RunSummary, error)
 	GetRun(jobID string) (*RunMetadata, error)

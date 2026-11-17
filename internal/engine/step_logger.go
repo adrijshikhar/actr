@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +31,67 @@ const (
 	ansiBlue   = "\033[1;34m"
 )
 
+// SecretMasker maintains a thread-safe list of sensitive values and redacts them with ***.
+type SecretMasker struct {
+	mu    sync.RWMutex
+	masks []string
+}
+
+// NewSecretMasker creates a new SecretMasker.
+func NewSecretMasker() *SecretMasker {
+	return &SecretMasker{
+		masks: make([]string, 0),
+	}
+}
+
+// AddMask registers a secret string to be redacted from log outputs.
+func (sm *SecretMasker) AddMask(secret string) {
+	secret = strings.TrimSpace(secret)
+	if secret == "" {
+		return
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	for _, m := range sm.masks {
+		if m == secret {
+			return
+		}
+	}
+	sm.masks = append(sm.masks, secret)
+	// Sort longer masks first to prevent partial redactions when one secret is a substring of another.
+	sort.Slice(sm.masks, func(i, j int) bool {
+		return len(sm.masks[i]) > len(sm.masks[j])
+	})
+}
+
+// Mask replaces all occurrences of registered secrets with ***.
+func (sm *SecretMasker) Mask(s string) string {
+	if sm == nil {
+		return s
+	}
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if len(sm.masks) == 0 {
+		return s
+	}
+	for _, m := range sm.masks {
+		s = strings.ReplaceAll(s, m, "***")
+	}
+	return s
+}
+
+// Masks returns a copy of registered secret masks.
+func (sm *SecretMasker) Masks() []string {
+	if sm == nil {
+		return nil
+	}
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	res := make([]string, len(sm.masks))
+	copy(res, sm.masks)
+	return res
+}
+
 // StepLogger formats and prefixes step output streams for terminal visualization.
 type StepLogger struct {
 	jobName    string
@@ -37,6 +99,7 @@ type StepLogger struct {
 	color      bool
 	jobPrefix  string
 	pipePrefix string
+	masker     *SecretMasker
 	mu         sync.Mutex
 }
 
@@ -53,6 +116,7 @@ func NewStepLogger(jobName string, out io.Writer, color bool) *StepLogger {
 		jobName: jobName,
 		out:     out,
 		color:   color,
+		masker:  NewSecretMasker(),
 	}
 
 	if color {
@@ -69,6 +133,45 @@ func NewStepLogger(jobName string, out io.Writer, color bool) *StepLogger {
 	return sl
 }
 
+// Masker returns the secret masker associated with the logger.
+func (sl *StepLogger) Masker() *SecretMasker {
+	if sl == nil {
+		return nil
+	}
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+	if sl.masker == nil {
+		sl.masker = NewSecretMasker()
+	}
+	return sl.masker
+}
+
+// WithMasker attaches a custom secret masker to the logger.
+func (sl *StepLogger) WithMasker(masker *SecretMasker) *StepLogger {
+	if sl == nil {
+		return nil
+	}
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+	sl.masker = masker
+	return sl
+}
+
+// AddMask registers a secret string to be redacted.
+func (sl *StepLogger) AddMask(secret string) {
+	if sl != nil {
+		sl.Masker().AddMask(secret)
+	}
+}
+
+// Mask replaces all occurrences of registered secrets with ***.
+func (sl *StepLogger) Mask(s string) string {
+	if sl == nil {
+		return s
+	}
+	return sl.Masker().Mask(s)
+}
+
 // LogStepStart outputs a step start banner.
 func (sl *StepLogger) LogStepStart(stepName, script string) {
 	sl.mu.Lock()
@@ -79,6 +182,9 @@ func (sl *StepLogger) LogStepStart(stepName, script string) {
 		banner = fmt.Sprintf("%s %s⭐ Run %s%s\n", sl.jobPrefix, ansiBold, stepName, ansiReset)
 	} else {
 		banner = fmt.Sprintf("%s ⭐ Run %s\n", sl.jobPrefix, stepName)
+	}
+	if sl.masker != nil {
+		banner = sl.masker.Mask(banner)
 	}
 	_, _ = io.WriteString(sl.out, banner)
 }
@@ -103,6 +209,9 @@ func (sl *StepLogger) LogStepEnd(stepName string, success bool, duration time.Du
 			banner = fmt.Sprintf("%s ❌ Failure %s (%s)\n", sl.jobPrefix, stepName, durStr)
 		}
 	}
+	if sl.masker != nil {
+		banner = sl.masker.Mask(banner)
+	}
 	_, _ = io.WriteString(sl.out, banner)
 }
 
@@ -111,6 +220,7 @@ func (sl *StepLogger) NewWriter(streamName string) *StepWriter {
 	return &StepWriter{
 		logger: sl,
 		stream: streamName,
+		masker: sl.Masker(),
 	}
 }
 
@@ -118,6 +228,7 @@ func (sl *StepLogger) NewWriter(streamName string) *StepWriter {
 func NewLineWriter(onLine func(string)) *StepWriter {
 	return &StepWriter{
 		onLine: onLine,
+		masker: NewSecretMasker(),
 	}
 }
 
@@ -128,6 +239,43 @@ type StepWriter struct {
 	buf    bytes.Buffer
 	mu     sync.Mutex
 	onLine func(string)
+	masker *SecretMasker
+}
+
+// ensureMasker guarantees a non-nil masker is returned.
+func (sw *StepWriter) ensureMasker() *SecretMasker {
+	if sw.masker != nil {
+		return sw.masker
+	}
+	if sw.logger != nil {
+		sw.masker = sw.logger.Masker()
+		return sw.masker
+	}
+	sw.masker = NewSecretMasker()
+	return sw.masker
+}
+
+// Masker returns the secret masker.
+func (sw *StepWriter) Masker() *SecretMasker {
+	return sw.ensureMasker()
+}
+
+// WithMasker attaches a custom secret masker to the StepWriter.
+func (sw *StepWriter) WithMasker(masker *SecretMasker) *StepWriter {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	sw.masker = masker
+	return sw
+}
+
+// AddMask registers a secret string to be redacted.
+func (sw *StepWriter) AddMask(secret string) {
+	sw.ensureMasker().AddMask(secret)
+}
+
+// Mask replaces all occurrences of registered secrets with ***.
+func (sw *StepWriter) Mask(s string) string {
+	return sw.ensureMasker().Mask(s)
 }
 
 // WithCallback registers a callback invoked for each unformatted line.
@@ -175,16 +323,24 @@ func (sw *StepWriter) Flush() {
 
 func (sw *StepWriter) writeFormattedLine(line string) {
 	trimmed := strings.TrimRight(line, "\r")
+	if secret, ok := parseAddMask(trimmed); ok {
+		if secret != "" {
+			sw.AddMask(secret)
+		}
+		return
+	}
 	if isSuppressedWorkflowCommand(trimmed) {
 		return
 	}
+
+	masked := sw.Mask(trimmed)
 	if sw.onLine != nil {
-		sw.onLine(trimmed)
+		sw.onLine(masked)
 	}
 	if sw.logger == nil {
 		return
 	}
-	formatted := sw.formatLine(trimmed)
+	formatted := sw.formatLine(masked)
 	if formatted == "" {
 		return
 	}
@@ -192,6 +348,23 @@ func (sw *StepWriter) writeFormattedLine(line string) {
 	sw.logger.mu.Lock()
 	defer sw.logger.mu.Unlock()
 	_, _ = fmt.Fprintln(sw.logger.out, formatted)
+}
+
+func parseAddMask(line string) (string, bool) {
+	idx := strings.Index(line, "::add-mask")
+	if idx == -1 {
+		return "", false
+	}
+	rest := line[idx+len("::add-mask"):]
+	if !strings.HasPrefix(rest, "::") && !strings.HasPrefix(rest, " ") {
+		return "", false
+	}
+	delimIdx := strings.Index(rest, "::")
+	if delimIdx == -1 {
+		return "", false
+	}
+	val := strings.TrimSpace(rest[delimIdx+2:])
+	return val, true
 }
 
 func isSuppressedWorkflowCommand(line string) bool {
