@@ -34,6 +34,7 @@ type StepInfo struct {
 	Name      string     `json:"name"`
 	Number    int        `json:"number"`
 	Status    StepStatus `json:"status"`
+	ExitCode  int        `json:"exit_code,omitempty"`
 	StartedAt time.Time  `json:"started_at"`
 	EndedAt   time.Time  `json:"ended_at"`
 }
@@ -195,7 +196,7 @@ type HistoryStore interface {
 	LogStore
 	Pruner
 	StartRun(job *JobInfo, limits *config.LimitsConfig, driver string) error
-	FinishStep(jobID, stepID, conclusion string, exitCode int, finishedAt time.Time) error
+	FinishStep(jobID, stepID, conclusion string, exitCode int, finishedAt time.Time, startedAt ...time.Time) error
 	FinishRun(jobID string, status StepStatus, metrics *RunMetricsSummary) error
 	ListRuns(limit int) ([]*RunSummary, error)
 	GetRun(jobID string) (*RunMetadata, error)

@@ -1214,7 +1214,7 @@ func TestCoordinator_GitHubVariablesAndCheckoutSynthesis(t *testing.T) {
 	if strings.Contains(checkoutStep.Script, "git checkout -f \"$TARGET_REF\" 2>/dev/null || true") {
 		t.Errorf("checkout step script should not contain '|| true' on checkout: %s", checkoutStep.Script)
 	}
-	if !strings.Contains(checkoutStep.Script, "git fetch --depth=1 origin \"$TARGET_REF\" || git fetch origin") {
+	if !strings.Contains(checkoutStep.Script, "git fetch --depth=1 \"$CLONE_URL\" \"$TARGET_REF\"") {
 		t.Errorf("checkout step script should fetch target ref explicitly: %s", checkoutStep.Script)
 	}
 	if checkoutStep.Environment["ACTR_CHECKOUT_REPO"] != "adrijshikhar/cxstatusline" {

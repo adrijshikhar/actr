@@ -88,7 +88,7 @@ func (s *DiskStore) AppendStepLog(jobID, stepID, line string) error {
 // FinishStep finalizes an individual step in meta.json with the provided conclusion,
 // exit code, and finish timestamp, flushes accumulated in-memory log statistics,
 // and cleans up step locks and stats.
-func (s *DiskStore) FinishStep(jobID, stepID, conclusion string, exitCode int, finishedAt time.Time) error {
+func (s *DiskStore) FinishStep(jobID, stepID, conclusion string, exitCode int, finishedAt time.Time, startedAt ...time.Time) error {
 	if jobID == "" {
 		return errors.New("empty job ID")
 	}
@@ -156,6 +156,10 @@ func (s *DiskStore) FinishStep(jobID, stepID, conclusion string, exitCode int, f
 	}
 	target.Status = status
 	target.ExitCode = exitCode
+
+	if len(startedAt) > 0 && !startedAt[0].IsZero() && target.StartedAt.IsZero() {
+		target.StartedAt = startedAt[0]
+	}
 
 	if finishedAt.IsZero() {
 		finishedAt = time.Now().UTC()

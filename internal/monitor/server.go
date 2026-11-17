@@ -374,6 +374,8 @@ func (s *Server) Publish(ev Event) {
 		stepFinishID   string
 		stepConclusion string
 		stepFinishedAt time.Time
+		stepStartedAt  time.Time
+		stepExitCode   int
 
 		doAppendLog bool
 		logJobID    string
@@ -564,6 +566,11 @@ func (s *Server) Publish(ev Event) {
 				stepFinishID = ev.Step.ID
 				stepConclusion = string(ev.Step.Status)
 				stepFinishedAt = ev.Step.EndedAt
+				stepStartedAt = stepClone.StartedAt
+				stepExitCode = ev.Step.ExitCode
+				if stepExitCode == 0 && ev.Step.Status == StatusFailed {
+					stepExitCode = 1
+				}
 			}
 		}
 	case EventStepLog:
@@ -657,7 +664,7 @@ func (s *Server) Publish(ev Event) {
 		_ = store.StartRun(startJob, startLimits, startDriver)
 	}
 	if doFinishStep {
-		_ = store.FinishStep(stepJobID, stepFinishID, stepConclusion, 0, stepFinishedAt)
+		_ = store.FinishStep(stepJobID, stepFinishID, stepConclusion, stepExitCode, stepFinishedAt, stepStartedAt)
 	}
 	if doAppendLog {
 		_ = store.AppendStepLog(logJobID, logStepID, logLine)

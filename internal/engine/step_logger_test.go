@@ -267,3 +267,89 @@ func TestSecretMasker_LongerSecretsMaskedFirst(t *testing.T) {
 		t.Errorf("expected %q, got %q", expected, result)
 	}
 }
+
+func TestParseAddMask_AnchoredToLineStart(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		wantVal  string
+		wantBool bool
+	}{
+		{
+			name:     "valid add-mask standard",
+			input:    "::add-mask::secret123",
+			wantVal:  "secret123",
+			wantBool: true,
+		},
+		{
+			name:     "valid add-mask with leading whitespace",
+			input:    "   ::add-mask::secret123   ",
+			wantVal:  "secret123",
+			wantBool: true,
+		},
+		{
+			name:     "valid add-mask with echo prefix",
+			input:    "echo ::add-mask::secret123",
+			wantVal:  "secret123",
+			wantBool: true,
+		},
+		{
+			name:     "valid add-mask with space delimiter",
+			input:    "::add-mask ::secret123",
+			wantVal:  "secret123",
+			wantBool: true,
+		},
+		{
+			name:     "false positive in middle of sentence rejected",
+			input:    "grep -r ::add-mask in file.txt :: result",
+			wantVal:  "",
+			wantBool: false,
+		},
+		{
+			name:     "false positive with text before add-mask rejected",
+			input:    "Found line: ::add-mask::mysecret",
+			wantVal:  "",
+			wantBool: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotVal, gotBool := parseAddMask(tt.input)
+			if gotBool != tt.wantBool || gotVal != tt.wantVal {
+				t.Errorf("parseAddMask(%q) = (%q, %v), want (%q, %v)", tt.input, gotVal, gotBool, tt.wantVal, tt.wantBool)
+			}
+		})
+	}
+}
+
+func TestNewLineWriter_SharedMaskerAcrossStreams(t *testing.T) {
+	sharedMasker := NewSecretMasker()
+	var outLines []string
+	var errLines []string
+
+	stdoutWriter := NewLineWriter(func(line string) {
+		outLines = append(outLines, line)
+	}).WithMasker(sharedMasker)
+
+	stderrWriter := NewLineWriter(func(line string) {
+		errLines = append(errLines, line)
+	}).WithMasker(sharedMasker)
+
+	// Step stdout registers a mask
+	_, _ = stdoutWriter.Write([]byte("echo ::add-mask::stream-shared-key\n"))
+	stdoutWriter.Flush()
+
+	// Step stderr writes output containing the secret
+	_, _ = stderrWriter.Write([]byte("FATAL: connection failed with key stream-shared-key\n"))
+	stderrWriter.Flush()
+
+	if len(errLines) != 1 {
+		t.Fatalf("expected 1 stderr line, got %d", len(errLines))
+	}
+	expected := "FATAL: connection failed with key ***"
+	if errLines[0] != expected {
+		t.Errorf("expected stderr line %q, got %q", expected, errLines[0])
+	}
+}
+
