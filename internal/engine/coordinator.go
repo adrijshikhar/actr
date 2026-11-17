@@ -406,6 +406,18 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		return newFailedCompleteJobRequest(job), fmt.Errorf("create runner temp directory: %w", err)
 	}
 
+	runnerToolCache := os.Getenv("RUNNER_TOOL_CACHE")
+	if runnerToolCache == "" {
+		runnerToolCache = filepath.Join(baseWorkDir, "_tool")
+	}
+	if absToolCache, err := filepath.Abs(runnerToolCache); err == nil {
+		runnerToolCache = absToolCache
+	}
+	if err := os.MkdirAll(runnerToolCache, 0o755); err != nil {
+		conclusion = "failure"
+		return newFailedCompleteJobRequest(job), fmt.Errorf("create runner tool cache directory: %w", err)
+	}
+
 	jobDirName := job.JobName
 	if jobDirName == "" {
 		jobDirName = job.JobID
@@ -530,6 +542,12 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	cumulativeEnv["RUNNER_ARCH"] = runnerArch()
 	cumulativeEnv["RUNNER_WORKSPACE"] = baseWorkDir
 	cumulativeEnv["RUNNER_TEMP"] = runnerTemp
+	cumulativeEnv["RUNNER_TOOL_CACHE"] = runnerToolCache
+	cumulativeEnv["AGENT_TOOLSDIRECTORY"] = runnerToolCache
+	cumulativeEnv["RUNNER_ENVIRONMENT"] = "self-hosted"
+	if u := os.Getenv("USER"); u != "" {
+		cumulativeEnv["RUNNER_USER"] = u
+	}
 	cumulativeEnv["GITHUB_WORKSPACE"] = jobWorkspace
 	cumulativeEnv["CI"] = "true"
 	cumulativeEnv["GITHUB_ACTIONS"] = "true"
@@ -747,6 +765,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 				Env:            stepEnv,
 				WorkspaceDir:   stepWorkDir,
 				TempDir:        runnerTemp,
+				ToolCacheDir:   runnerToolCache,
 				StatePath:      statePath,
 				PathFilePath:   pathFilePath,
 				EnvFilePath:    envPath,
@@ -1523,6 +1542,7 @@ func (c *Coordinator) executeSinglePostHook(ctx context.Context, jobID string, h
 		workspaceDir = hook.ActionDir
 	}
 	tempDir := postEnv["RUNNER_TEMP"]
+	toolCacheDir := postEnv["RUNNER_TOOL_CACHE"]
 
 	actCtx := &action.ActionContext{
 		StepID:       hook.StepID,
@@ -1531,6 +1551,7 @@ func (c *Coordinator) executeSinglePostHook(ctx context.Context, jobID string, h
 		Env:          postEnv,
 		WorkspaceDir: workspaceDir,
 		TempDir:      tempDir,
+		ToolCacheDir: toolCacheDir,
 	}
 
 	if hook.ActionDir != "" {

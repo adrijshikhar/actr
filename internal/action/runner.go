@@ -20,6 +20,7 @@ type ActionContext struct {
 	Env            map[string]string
 	WorkspaceDir   string
 	TempDir        string
+	ToolCacheDir   string
 	StatePath      string
 	PathFilePath   string
 	EnvFilePath    string
@@ -70,6 +71,11 @@ func BuildActionEnvironment(actCtx *ActionContext) map[string]string {
 	env["GITHUB_PATH"] = actCtx.PathFilePath
 	env["GITHUB_ENV"] = actCtx.EnvFilePath
 	env["GITHUB_OUTPUT"] = actCtx.OutputFilePath
+
+	if actCtx.ToolCacheDir != "" {
+		env["RUNNER_TOOL_CACHE"] = actCtx.ToolCacheDir
+		env["AGENT_TOOLSDIRECTORY"] = actCtx.ToolCacheDir
+	}
 
 	if actCtx.ActionDir != "" {
 		env["GITHUB_ACTION_PATH"] = actCtx.ActionDir

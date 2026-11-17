@@ -50,6 +50,7 @@ func TestBuildActionEnvironment_DualKeyAndSanitization(t *testing.T) {
 		},
 		WorkspaceDir:   "/tmp/workspace",
 		TempDir:        "/tmp/runner_temp",
+		ToolCacheDir:   "/tmp/runner_tool_cache",
 		StatePath:      "/tmp/state.txt",
 		PathFilePath:   "/tmp/path.txt",
 		EnvFilePath:    "/tmp/env.txt",
@@ -85,6 +86,8 @@ func TestBuildActionEnvironment_DualKeyAndSanitization(t *testing.T) {
 	assert.Equal(t, "step-1", env["GITHUB_ACTION"])
 	assert.Equal(t, "/tmp/workspace", env["GITHUB_WORKSPACE"])
 	assert.Equal(t, "/tmp/runner_temp", env["RUNNER_TEMP"])
+	assert.Equal(t, "/tmp/runner_tool_cache", env["RUNNER_TOOL_CACHE"])
+	assert.Equal(t, "/tmp/runner_tool_cache", env["AGENT_TOOLSDIRECTORY"])
 	assert.Equal(t, "/tmp/state.txt", env["GITHUB_STATE"])
 	assert.Equal(t, "/tmp/path.txt", env["GITHUB_PATH"])
 	assert.Equal(t, "/tmp/env.txt", env["GITHUB_ENV"])
