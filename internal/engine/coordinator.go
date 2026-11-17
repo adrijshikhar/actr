@@ -1014,8 +1014,12 @@ if [ -z "$TARGET_REF" ]; then
 fi
 
 if [ -n "$TARGET_REF" ]; then
-    git fetch --depth=1 origin "$TARGET_REF" || git fetch origin
-    git checkout -f "$TARGET_REF"
+    CLEAN_REF="${TARGET_REF#refs/heads/}"
+    git checkout -f -- "$CLEAN_REF" 2>/dev/null || \
+    git checkout -f -- "$TARGET_REF" 2>/dev/null || (
+        git fetch --depth=1 "$CLONE_URL" "$TARGET_REF" 2>/dev/null || git fetch "$CLONE_URL"
+        git checkout -f -- "$CLEAN_REF" 2>/dev/null || git checkout -f -- "$TARGET_REF"
+    )
 fi
 `
 }

@@ -1281,6 +1281,19 @@ func TestCoordinator_CheckoutScriptParameterization_SafeInputs(t *testing.T) {
 			t.Errorf("checkout command must not ignore errors with || true: %s", line)
 		}
 	}
+
+	// Verify fetch uses CLONE_URL to support authenticated private repository checkout
+	if !strings.Contains(script, `git fetch --depth=1 "$CLONE_URL"`) {
+		t.Errorf("expected script to fetch using $CLONE_URL for private repo auth, got: %s", script)
+	}
+
+	// Verify ref stripping and separator usage
+	if !strings.Contains(script, `CLEAN_REF="${TARGET_REF#refs/heads/}"`) {
+		t.Errorf("expected script to normalize refs/heads/, got: %s", script)
+	}
+	if !strings.Contains(script, `git checkout -f -- "$TARGET_REF"`) {
+		t.Errorf("expected script to use -- separator for checkout, got: %s", script)
+	}
 }
 
 func TestCoordinator_CommandFileParseError_FailsStep(t *testing.T) {
