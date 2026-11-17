@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -778,8 +780,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		}
 
 		// Step succeeded: parse environment, output, and path files
-		newEnv, err := ParseEnvAndOutputFile(envPath)
-		if err != nil {
+		if err := IngestEnvFile(envPath, cumulativeEnv); err != nil {
 			c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusFailed)
 			stepResults = append(stepResults, protocol.StepResult{
 				ID:         stepID,
@@ -789,9 +790,6 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			cleanupStepFiles()
 			conclusion = "failure"
 			break
-		}
-		for k, v := range newEnv {
-			cumulativeEnv[k] = v
 		}
 
 		newOutputs, err := ParseEnvAndOutputFile(outputPath)
@@ -821,7 +819,14 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			stepsMap[step.Name] = map[string]any{"outputs": stepOutputsMap}
 		}
 
-		newPaths, err := ParsePathFile(pathFilePath)
+		pathKey := "PATH"
+		for k := range cumulativeEnv {
+			if strings.EqualFold(k, "PATH") {
+				pathKey = k
+				break
+			}
+		}
+		updatedPath, err := IngestPathFile(pathFilePath, cumulativeEnv[pathKey])
 		if err != nil {
 			c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusFailed)
 			stepResults = append(stepResults, protocol.StepResult{
@@ -833,21 +838,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			conclusion = "failure"
 			break
 		}
-		if len(newPaths) > 0 {
-			pathPrefix := strings.Join(newPaths, string(filepath.ListSeparator))
-			pathKey := "PATH"
-			for k := range cumulativeEnv {
-				if strings.EqualFold(k, "PATH") {
-					pathKey = k
-					break
-				}
-			}
-			if existing, ok := cumulativeEnv[pathKey]; ok && existing != "" {
-				cumulativeEnv[pathKey] = pathPrefix + string(filepath.ListSeparator) + existing
-			} else {
-				cumulativeEnv[pathKey] = pathPrefix
-			}
-		}
+		cumulativeEnv[pathKey] = updatedPath
 
 		stepResults = append(stepResults, protocol.StepResult{
 			ID:         stepID,
@@ -1322,4 +1313,80 @@ func evaluateExpression(expr string, ctx map[string]any) string {
 	}
 
 	return trimmed
+}
+
+// IngestPathFile reads lines from the file at filePath, cleans each non-empty entry,
+// prepends them to currentPath (joined with filepath.ListSeparator), and truncates the file.
+func IngestPathFile(filePath string, currentPath string) (string, error) {
+	if filePath == "" {
+		return currentPath, nil
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return currentPath, nil
+		}
+		return currentPath, err
+	}
+
+	if err := os.Truncate(filePath, 0); err != nil {
+		return currentPath, err
+	}
+
+	if len(data) == 0 {
+		return currentPath, nil
+	}
+
+	var newPaths []string
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		cleaned := filepath.Clean(line)
+		if cleaned != "" {
+			newPaths = append(newPaths, cleaned)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return currentPath, err
+	}
+
+	if len(newPaths) == 0 {
+		return currentPath, nil
+	}
+
+	prefix := strings.Join(newPaths, string(filepath.ListSeparator))
+	if currentPath == "" {
+		return prefix, nil
+	}
+	return prefix + string(filepath.ListSeparator) + currentPath, nil
+}
+
+// IngestEnvFile reads key=value or multiline delimiter syntax from filePath,
+// merges them into currentEnv, and truncates the file.
+func IngestEnvFile(filePath string, currentEnv map[string]string) error {
+	if filePath == "" {
+		return nil
+	}
+
+	newVars, err := ParseCommandFile(filePath)
+	if err != nil {
+		return err
+	}
+
+	if err := os.Truncate(filePath, 0); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	if currentEnv != nil {
+		for k, v := range newVars {
+			currentEnv[k] = v
+		}
+	}
+
+	return nil
 }

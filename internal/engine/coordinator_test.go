@@ -1974,3 +1974,251 @@ func TestCoordinator_ExecuteJob_NodeActionStep_ResolutionFailure(t *testing.T) {
 		t.Errorf("expected step conclusion 'failure'")
 	}
 }
+
+func TestDynamicToolchainIngestion(t *testing.T) {
+	t.Run("IngestPathFile_CleanAndPrepend", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		pathFile := filepath.Join(tmpDir, "path.txt")
+
+		// 1. Initial path with dirty paths (extra slashes, dot-dot)
+		rawContent := "/opt/tools//bin/\n/custom/../other/bin\n\n/single/path\n"
+		if err := os.WriteFile(pathFile, []byte(rawContent), 0o600); err != nil {
+			t.Fatalf("failed to write path file: %v", err)
+		}
+
+		initialPath := filepath.Clean("/usr/bin") + string(filepath.ListSeparator) + filepath.Clean("/bin")
+		updatedPath, err := IngestPathFile(pathFile, initialPath)
+		if err != nil {
+			t.Fatalf("IngestPathFile failed: %v", err)
+		}
+
+		expectedCleaned1 := filepath.Clean("/opt/tools/bin")
+		expectedCleaned2 := filepath.Clean("/other/bin")
+		expectedCleaned3 := filepath.Clean("/single/path")
+		expectedPrefix := expectedCleaned1 + string(filepath.ListSeparator) +
+			expectedCleaned2 + string(filepath.ListSeparator) +
+			expectedCleaned3
+
+		if !strings.HasPrefix(updatedPath, expectedPrefix) {
+			t.Errorf("expected updatedPath to start with %q, got %q", expectedPrefix, updatedPath)
+		}
+		if !strings.HasSuffix(updatedPath, initialPath) {
+			t.Errorf("expected updatedPath to end with %q, got %q", initialPath, updatedPath)
+		}
+
+		// 2. Verify truncation: file must be empty after ingestion
+		fi, err := os.Stat(pathFile)
+		if err != nil {
+			t.Fatalf("failed to stat path file: %v", err)
+		}
+		if fi.Size() != 0 {
+			t.Errorf("expected path file to be truncated to 0 bytes, got %d bytes", fi.Size())
+		}
+
+		// 3. Second ingestion on truncated file should not alter the path
+		secondPath, err := IngestPathFile(pathFile, updatedPath)
+		if err != nil {
+			t.Fatalf("second IngestPathFile failed: %v", err)
+		}
+		if secondPath != updatedPath {
+			t.Errorf("expected unchanged path after re-ingesting truncated file, got %q vs %q", secondPath, updatedPath)
+		}
+
+		// 4. Ingestion into empty currentPath
+		singleFile := filepath.Join(tmpDir, "single.txt")
+		if err := os.WriteFile(singleFile, []byte("/only/path\n"), 0o600); err != nil {
+			t.Fatalf("failed to write single path file: %v", err)
+		}
+		emptyBase, err := IngestPathFile(singleFile, "")
+		if err != nil {
+			t.Fatalf("IngestPathFile with empty base failed: %v", err)
+		}
+		expectedSingle := filepath.Clean("/only/path")
+		if emptyBase != expectedSingle {
+			t.Errorf("expected %q, got %q", expectedSingle, emptyBase)
+		}
+
+		// 5. Non-existent file should be a no-op
+		nonExistentPath, err := IngestPathFile(filepath.Join(tmpDir, "does-not-exist.txt"), "/existing/path")
+		if err != nil {
+			t.Fatalf("IngestPathFile on non-existent file returned error: %v", err)
+		}
+		if nonExistentPath != "/existing/path" {
+			t.Errorf("expected /existing/path, got %q", nonExistentPath)
+		}
+	})
+
+	t.Run("IngestEnvFile_KeyValAndMultiline", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		envFile := filepath.Join(tmpDir, "env.txt")
+
+		content := strings.Join([]string{
+			"SIMPLE_KEY=simple_val",
+			"MULTILINE_VAR<<EOF",
+			"line one",
+			"line two with special chars: = < >",
+			"EOF",
+			"ANOTHER_KEY=another_val",
+			"DELIM_WITH_SPACES<<MY_DELIMITER",
+			"first line",
+			"second line",
+			"MY_DELIMITER",
+			"",
+		}, "\n")
+
+		if err := os.WriteFile(envFile, []byte(content), 0o600); err != nil {
+			t.Fatalf("failed to write env file: %v", err)
+		}
+
+		envMap := map[string]string{
+			"EXISTING": "original",
+		}
+
+		if err := IngestEnvFile(envFile, envMap); err != nil {
+			t.Fatalf("IngestEnvFile failed: %v", err)
+		}
+
+		if envMap["EXISTING"] != "original" {
+			t.Errorf("expected EXISTING to remain 'original', got %q", envMap["EXISTING"])
+		}
+		if envMap["SIMPLE_KEY"] != "simple_val" {
+			t.Errorf("expected SIMPLE_KEY='simple_val', got %q", envMap["SIMPLE_KEY"])
+		}
+		expectedMulti := "line one\nline two with special chars: = < >"
+		if envMap["MULTILINE_VAR"] != expectedMulti {
+			t.Errorf("expected MULTILINE_VAR=%q, got %q", expectedMulti, envMap["MULTILINE_VAR"])
+		}
+		if envMap["ANOTHER_KEY"] != "another_val" {
+			t.Errorf("expected ANOTHER_KEY='another_val', got %q", envMap["ANOTHER_KEY"])
+		}
+		expectedDelim := "first line\nsecond line"
+		if envMap["DELIM_WITH_SPACES"] != expectedDelim {
+			t.Errorf("expected DELIM_WITH_SPACES=%q, got %q", expectedDelim, envMap["DELIM_WITH_SPACES"])
+		}
+
+		// Verify truncation
+		fi, err := os.Stat(envFile)
+		if err != nil {
+			t.Fatalf("failed to stat env file: %v", err)
+		}
+		if fi.Size() != 0 {
+			t.Errorf("expected env file to be truncated to 0 bytes, got %d", fi.Size())
+		}
+
+		// Re-ingestion on truncated file should be a no-op
+		if err := IngestEnvFile(envFile, envMap); err != nil {
+			t.Fatalf("second IngestEnvFile failed: %v", err)
+		}
+
+		// Non-existent file should be a no-op
+		if err := IngestEnvFile(filepath.Join(tmpDir, "does-not-exist.txt"), envMap); err != nil {
+			t.Fatalf("IngestEnvFile on non-existent file failed: %v", err)
+		}
+	})
+
+	t.Run("CoordinatorJob_SubsequentStepsReceiveUpdatedEnvAndPath", func(t *testing.T) {
+		workDir := t.TempDir()
+
+		step1PathToAdd := filepath.Clean("/custom/toolchain/go/bin")
+		step2PathToAdd := filepath.Clean("/custom/toolchain/rust/bin")
+
+		mock := &mockDriver{
+			executeFunc: func(ctx context.Context, step *driver.StepSpec, stdout, stderr io.Writer) (*driver.StepResult, error) {
+				switch step.ID {
+				case "setup-step":
+					// Step 1 appends dirty path and multiline env
+					pathFile := step.Environment["GITHUB_PATH"]
+					if err := os.WriteFile(pathFile, []byte("/custom/toolchain/go//bin/\n"), 0o600); err != nil {
+						return nil, err
+					}
+
+					envFile := step.Environment["GITHUB_ENV"]
+					envContent := "GO_VERSION=1.23.0\nRELEASE_NOTES<<DELIM\nFirst line\nSecond line\nDELIM\n"
+					if err := os.WriteFile(envFile, []byte(envContent), 0o600); err != nil {
+						return nil, err
+					}
+					return &driver.StepResult{ExitCode: 0}, nil
+
+				case "build-step":
+					// Step 2 verifies it received step 1's path and env
+					gotPath := step.Environment["PATH"]
+					if !strings.HasPrefix(gotPath, step1PathToAdd) {
+						return nil, fmt.Errorf("build-step expected PATH to start with %s, got %s", step1PathToAdd, gotPath)
+					}
+					if step.Environment["GO_VERSION"] != "1.23.0" {
+						return nil, fmt.Errorf("build-step expected GO_VERSION=1.23.0, got %q", step.Environment["GO_VERSION"])
+					}
+					if step.Environment["RELEASE_NOTES"] != "First line\nSecond line" {
+						return nil, fmt.Errorf("build-step expected RELEASE_NOTES='First line\\nSecond line', got %q", step.Environment["RELEASE_NOTES"])
+					}
+
+					// Step 2 appends another path and env var
+					pathFile := step.Environment["GITHUB_PATH"]
+					if err := os.WriteFile(pathFile, []byte(step2PathToAdd+"\n"), 0o600); err != nil {
+						return nil, err
+					}
+					envFile := step.Environment["GITHUB_ENV"]
+					if err := os.WriteFile(envFile, []byte("CARGO_HOME=/custom/cargo\n"), 0o600); err != nil {
+						return nil, err
+					}
+					return &driver.StepResult{ExitCode: 0}, nil
+
+				case "test-step":
+					// Step 3 verifies step 2's additions are prepended before step 1's
+					gotPath := step.Environment["PATH"]
+					expectedPrefix := step2PathToAdd + string(filepath.ListSeparator) + step1PathToAdd
+					if !strings.HasPrefix(gotPath, expectedPrefix) {
+						return nil, fmt.Errorf("test-step expected PATH to start with %s, got %s", expectedPrefix, gotPath)
+					}
+					if step.Environment["GO_VERSION"] != "1.23.0" {
+						return nil, fmt.Errorf("test-step expected GO_VERSION=1.23.0, got %q", step.Environment["GO_VERSION"])
+					}
+					if step.Environment["CARGO_HOME"] != "/custom/cargo" {
+						return nil, fmt.Errorf("test-step expected CARGO_HOME=/custom/cargo, got %q", step.Environment["CARGO_HOME"])
+					}
+					return &driver.StepResult{ExitCode: 0}, nil
+
+				default:
+					return &driver.StepResult{ExitCode: 0}, nil
+				}
+			},
+		}
+
+		coord := NewCoordinator(mock, nil, workDir)
+
+		job := &protocol.JobSpecification{
+			JobID:   "job-toolchain-test",
+			JobName: "toolchain-job",
+			Steps: []protocol.JobStep{
+				{
+					ID:   "setup-step",
+					Name: "Setup Toolchain",
+				},
+				{
+					ID:   "build-step",
+					Name: "Build Application",
+				},
+				{
+					ID:   "test-step",
+					Name: "Test Application",
+				},
+			},
+		}
+
+		req, err := coord.ExecuteJob(context.Background(), job, "", "")
+		if err != nil {
+			t.Fatalf("ExecuteJob failed: %v", err)
+		}
+		if req.Conclusion != "success" {
+			t.Fatalf("expected job conclusion 'success', got %q", req.Conclusion)
+		}
+		if len(req.StepResults) != 3 {
+			t.Fatalf("expected 3 step results, got %d", len(req.StepResults))
+		}
+		for i, sr := range req.StepResults {
+			if sr.Conclusion != "success" {
+				t.Errorf("step %d (%s) failed: %+v", i, sr.ID, sr)
+			}
+		}
+	})
+}
