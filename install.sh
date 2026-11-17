@@ -80,20 +80,63 @@ info "Installing actr ${VERSION} (${OS}/${ARCH})..."
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
 
+# Helper: download file securely without leaking Authorization header across redirects
+download_file() {
+  url="$1"
+  dest="$2"
+  show_progress="${3:-false}"
+
+  # Attempt 1: unauthenticated download (no token sent, completely safe from redirect leaks)
+  if [ "$show_progress" = "true" ]; then
+    if curl -fSL --progress-bar "$url" -o "$dest" 2>/dev/null; then
+      return 0
+    fi
+  else
+    if curl -fsSL "$url" -o "$dest" 2>/dev/null; then
+      return 0
+    fi
+  fi
+
+  # Attempt 2: authenticated download without leaking Authorization header across redirects
+  if [ -n "${GITHUB_TOKEN:-}" ] || [ -n "${GH_TOKEN:-}" ]; then
+    TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+    # Probe redirect without following, so Authorization header is sent only to the initial host
+    REDIRECT_TARGET="$(curl -s -H "Authorization: token $TOKEN" -o /dev/null -w "%{redirect_url}" "$url" 2>/dev/null || echo '')"
+    if [ -n "$REDIRECT_TARGET" ]; then
+      # Fetch from redirect target without Authorization header
+      if [ "$show_progress" = "true" ]; then
+        if curl -fSL --progress-bar "$REDIRECT_TARGET" -o "$dest" 2>/dev/null; then
+          return 0
+        fi
+      else
+        if curl -fsSL "$REDIRECT_TARGET" -o "$dest" 2>/dev/null; then
+          return 0
+        fi
+      fi
+    else
+      # No redirect returned; request directly with token
+      if [ "$show_progress" = "true" ]; then
+        if curl -fSL --progress-bar -H "Authorization: token $TOKEN" "$url" -o "$dest" 2>/dev/null; then
+          return 0
+        fi
+      else
+        if curl -fsSL -H "Authorization: token $TOKEN" "$url" -o "$dest" 2>/dev/null; then
+          return 0
+        fi
+      fi
+    fi
+  fi
+
+  return 1
+}
+
 # 5. Download Artifacts
 info "Downloading ${TARBALL_NAME}..."
 DOWNLOAD_SUCCESS=false
 
-if curl -fSL --progress-bar "$DOWNLOAD_URL" -o "$TMP_DIR/$TARBALL_NAME" 2>/dev/null; then
+if download_file "$DOWNLOAD_URL" "$TMP_DIR/$TARBALL_NAME" true; then
   DOWNLOAD_SUCCESS=true
-elif [ -n "${GITHUB_TOKEN:-}" ] || [ -n "${GH_TOKEN:-}" ]; then
-  TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
-  if curl -fSL -H "Authorization: token $TOKEN" "$DOWNLOAD_URL" -o "$TMP_DIR/$TARBALL_NAME" 2>/dev/null; then
-    DOWNLOAD_SUCCESS=true
-  fi
-fi
-
-if [ "$DOWNLOAD_SUCCESS" = "false" ] && command -v gh >/dev/null 2>&1; then
+elif command -v gh >/dev/null 2>&1; then
   if gh release download "$VERSION" -R "$REPO" -p "$TARBALL_NAME" -D "$TMP_DIR" >/dev/null 2>&1; then
     DOWNLOAD_SUCCESS=true
     gh release download "$VERSION" -R "$REPO" -p "checksums.txt" -D "$TMP_DIR" >/dev/null 2>&1 || true
@@ -104,26 +147,46 @@ if [ "$DOWNLOAD_SUCCESS" = "false" ]; then
   error "Failed to download $DOWNLOAD_URL. Please verify your internet connection, release visibility, or GitHub token."
 fi
 
-# 6. Verify Checksum
-if [ -f "$TMP_DIR/checksums.txt" ] || curl -fsSL "$CHECKSUMS_URL" -o "$TMP_DIR/checksums.txt" 2>/dev/null; then
-  info "Verifying SHA256 checksum..."
-  EXPECTED_SUM="$(grep "$TARBALL_NAME" "$TMP_DIR/checksums.txt" | awk '{print $1}' || echo '')"
-  if [ -n "$EXPECTED_SUM" ]; then
-    if command -v shasum >/dev/null 2>&1; then
-      ACTUAL_SUM="$(shasum -a 256 "$TMP_DIR/$TARBALL_NAME" | awk '{print $1}')"
-    elif command -v sha256sum >/dev/null 2>&1; then
-      ACTUAL_SUM="$(sha256sum "$TMP_DIR/$TARBALL_NAME" | awk '{print $1}')"
-    else
-      ACTUAL_SUM=""
+# 6. Verify Checksum (Fail-closed by default)
+if [ "${ACTR_INSECURE_SKIP_CHECKSUM:-0}" = "1" ] || [ "${ACTR_INSECURE_SKIP_CHECKSUM:-0}" = "true" ]; then
+  warn "ACTR_INSECURE_SKIP_CHECKSUM is set; skipping checksum verification."
+else
+  # 6a. Ensure checksums.txt is retrieved
+  if [ ! -f "$TMP_DIR/checksums.txt" ]; then
+    CHECKSUM_SUCCESS=false
+    if download_file "$CHECKSUMS_URL" "$TMP_DIR/checksums.txt" false; then
+      CHECKSUM_SUCCESS=true
+    elif command -v gh >/dev/null 2>&1; then
+      if gh release download "$VERSION" -R "$REPO" -p "checksums.txt" -D "$TMP_DIR" >/dev/null 2>&1; then
+        CHECKSUM_SUCCESS=true
+      fi
     fi
 
-    if [ -n "$ACTUAL_SUM" ]; then
-      if [ "$EXPECTED_SUM" != "$ACTUAL_SUM" ]; then
-        error "Checksum verification failed! Expected: $EXPECTED_SUM, Got: $ACTUAL_SUM"
-      fi
-      success "Checksum verified"
+    if [ "$CHECKSUM_SUCCESS" = "false" ] || [ ! -f "$TMP_DIR/checksums.txt" ]; then
+      error "Failed to download checksums.txt from $CHECKSUMS_URL. Aborting installation (set ACTR_INSECURE_SKIP_CHECKSUM=1 to bypass)."
     fi
   fi
+
+  # 6b. Ensure hashing utility exists
+  if command -v sha256sum >/dev/null 2>&1; then
+    ACTUAL_SUM="$(sha256sum "$TMP_DIR/$TARBALL_NAME" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    ACTUAL_SUM="$(shasum -a 256 "$TMP_DIR/$TARBALL_NAME" | awk '{print $1}')"
+  else
+    error "Neither sha256sum nor shasum found in PATH. Cannot verify archive checksum (set ACTR_INSECURE_SKIP_CHECKSUM=1 to bypass)."
+  fi
+
+  info "Verifying SHA256 checksum..."
+  EXPECTED_SUM="$(grep "$TARBALL_NAME" "$TMP_DIR/checksums.txt" | awk '{print $1}' || echo '')"
+  if [ -z "$EXPECTED_SUM" ]; then
+    error "Checksum entry for $TARBALL_NAME not found in checksums.txt."
+  fi
+
+  # 6c. Verify checksum match
+  if [ "$EXPECTED_SUM" != "$ACTUAL_SUM" ]; then
+    error "Checksum verification failed! Expected: $EXPECTED_SUM, Got: $ACTUAL_SUM"
+  fi
+  success "Checksum verified"
 fi
 
 # 7. Extract Binary

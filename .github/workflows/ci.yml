@@ -52,8 +52,7 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64]
     if: |
       (github.event_name == 'workflow_dispatch' && (inputs.run_live_test == true || inputs.run_live_test == null)) ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      contains(github.event.pull_request.labels.*.name, 'self-hosted')
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
     steps:
       - name: Clone repository
         run: |

@@ -224,3 +224,188 @@ func TestInstaller_ChecksumMismatchRejection(t *testing.T) {
 		t.Fatalf("binary should not have been installed on checksum failure!")
 	}
 }
+
+func TestInstaller_MissingChecksumsTxtFailsClosed(t *testing.T) {
+	tempDir := t.TempDir()
+	tempBin := filepath.Join(tempDir, "actr_source")
+
+	cmd := exec.Command("go", "build", "-o", tempBin, "../cmd/actr")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build test actr: %v, out: %s", err, string(out))
+	}
+
+	version := "1.2.3"
+	osName := runtime.GOOS
+	archName := runtime.GOARCH
+	tarballName := fmt.Sprintf("actr_%s_%s_%s.tar.gz", version, osName, archName)
+	archivePath := filepath.Join(tempDir, tarballName)
+	_ = createArchive(t, tempBin, archivePath)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + tarballName:
+			http.ServeFile(w, r, archivePath)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	installDest := filepath.Join(tempDir, "target_bin")
+	fakeHome := filepath.Join(tempDir, "fake_home")
+	_ = os.MkdirAll(installDest, 0755)
+	_ = os.MkdirAll(fakeHome, 0755)
+
+	installScript, err := filepath.Abs("../install.sh")
+	if err != nil {
+		t.Fatalf("failed to resolve install.sh: %v", err)
+	}
+
+	installCmd := exec.Command("/bin/sh", installScript)
+	installCmd.Env = append(os.Environ(),
+		"ACTR_VERSION=v"+version,
+		"ACTR_DOWNLOAD_BASE_URL="+server.URL,
+		"ACTR_INSTALL_DIR="+installDest,
+		"HOME="+fakeHome,
+	)
+
+	out, err := installCmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected installer to fail when checksums.txt is missing, but it succeeded!\nOutput:\n%s", string(out))
+	}
+
+	if !strings.Contains(string(out), "Failed to download checksums.txt") {
+		t.Fatalf("expected error message to contain 'Failed to download checksums.txt', got:\n%s", string(out))
+	}
+
+	installedBin := filepath.Join(installDest, "actr")
+	if _, err := os.Stat(installedBin); err == nil {
+		t.Fatalf("binary should not have been installed when checksums.txt is missing!")
+	}
+}
+
+func TestInstaller_SkipChecksumOptOut(t *testing.T) {
+	tempDir := t.TempDir()
+	tempBin := filepath.Join(tempDir, "actr_source")
+
+	cmd := exec.Command("go", "build", "-o", tempBin, "../cmd/actr")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build test actr: %v, out: %s", err, string(out))
+	}
+
+	version := "1.2.3"
+	osName := runtime.GOOS
+	archName := runtime.GOARCH
+	tarballName := fmt.Sprintf("actr_%s_%s_%s.tar.gz", version, osName, archName)
+	archivePath := filepath.Join(tempDir, tarballName)
+	_ = createArchive(t, tempBin, archivePath)
+
+	// Server does NOT serve checksums.txt
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + tarballName:
+			http.ServeFile(w, r, archivePath)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	installDest := filepath.Join(tempDir, "target_bin")
+	fakeHome := filepath.Join(tempDir, "fake_home")
+	_ = os.MkdirAll(installDest, 0755)
+	_ = os.MkdirAll(fakeHome, 0755)
+
+	installScript, err := filepath.Abs("../install.sh")
+	if err != nil {
+		t.Fatalf("failed to resolve install.sh: %v", err)
+	}
+
+	installCmd := exec.Command("/bin/sh", installScript)
+	installCmd.Env = append(os.Environ(),
+		"ACTR_VERSION=v"+version,
+		"ACTR_DOWNLOAD_BASE_URL="+server.URL,
+		"ACTR_INSTALL_DIR="+installDest,
+		"HOME="+fakeHome,
+		"ACTR_INSECURE_SKIP_CHECKSUM=1",
+	)
+
+	out, err := installCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("expected installer to succeed with ACTR_INSECURE_SKIP_CHECKSUM=1, failed: %v\nOutput:\n%s", err, string(out))
+	}
+
+	if !strings.Contains(string(out), "skipping checksum verification") {
+		t.Fatalf("expected warning message about skipping checksum verification, got:\n%s", string(out))
+	}
+
+	installedBin := filepath.Join(installDest, "actr")
+	if _, err := os.Stat(installedBin); err != nil {
+		t.Fatalf("binary should have been installed with ACTR_INSECURE_SKIP_CHECKSUM=1, not found: %v", err)
+	}
+}
+
+func TestInstaller_MissingChecksumEntryFailsClosed(t *testing.T) {
+	tempDir := t.TempDir()
+	tempBin := filepath.Join(tempDir, "actr_source")
+
+	cmd := exec.Command("go", "build", "-o", tempBin, "../cmd/actr")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build test actr: %v, out: %s", err, string(out))
+	}
+
+	version := "1.2.3"
+	osName := runtime.GOOS
+	archName := runtime.GOARCH
+	tarballName := fmt.Sprintf("actr_%s_%s_%s.tar.gz", version, osName, archName)
+	archivePath := filepath.Join(tempDir, tarballName)
+	_ = createArchive(t, tempBin, archivePath)
+
+	// Checksums file exists but does NOT contain entry for this tarball
+	checksumContent := "abcdef1234567890  some_other_archive.tar.gz\n"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + tarballName:
+			http.ServeFile(w, r, archivePath)
+		case "/checksums.txt":
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = fmt.Fprint(w, checksumContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	installDest := filepath.Join(tempDir, "target_bin")
+	fakeHome := filepath.Join(tempDir, "fake_home")
+	_ = os.MkdirAll(installDest, 0755)
+	_ = os.MkdirAll(fakeHome, 0755)
+
+	installScript, err := filepath.Abs("../install.sh")
+	if err != nil {
+		t.Fatalf("failed to resolve install.sh: %v", err)
+	}
+
+	installCmd := exec.Command("/bin/sh", installScript)
+	installCmd.Env = append(os.Environ(),
+		"ACTR_VERSION=v"+version,
+		"ACTR_DOWNLOAD_BASE_URL="+server.URL,
+		"ACTR_INSTALL_DIR="+installDest,
+		"HOME="+fakeHome,
+	)
+
+	out, err := installCmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected installer to fail when checksum entry is missing, but it succeeded!\nOutput:\n%s", string(out))
+	}
+
+	if !strings.Contains(string(out), "Checksum entry for "+tarballName+" not found in checksums.txt") {
+		t.Fatalf("expected error message to contain 'Checksum entry for ... not found in checksums.txt', got:\n%s", string(out))
+	}
+
+	installedBin := filepath.Join(installDest, "actr")
+	if _, err := os.Stat(installedBin); err == nil {
+		t.Fatalf("binary should not have been installed when checksum entry is missing!")
+	}
+}
