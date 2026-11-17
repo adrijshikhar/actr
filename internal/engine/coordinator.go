@@ -193,10 +193,17 @@ func (c *Coordinator) NotifyJobStepLog(jobID, stepID, line string) {
 }
 
 // NotifyStepFinish publishes an EventStepFinish to the monitor server if configured.
-func (c *Coordinator) NotifyStepFinish(jobID, stepID, stepName string, status monitor.StepStatus) {
+func (c *Coordinator) NotifyStepFinish(jobID, stepID, stepName string, status monitor.StepStatus, exitCode ...int) {
 	c.mu.RLock()
 	srv := c.monServer
 	c.mu.RUnlock()
+
+	code := 0
+	if len(exitCode) > 0 {
+		code = exitCode[0]
+	} else if status == monitor.StatusFailed {
+		code = 1
+	}
 
 	if srv != nil {
 		srv.Publish(monitor.Event{
@@ -204,10 +211,11 @@ func (c *Coordinator) NotifyStepFinish(jobID, stepID, stepName string, status mo
 			JobID:  jobID,
 			StepID: stepID,
 			Step: &monitor.StepInfo{
-				ID:      stepID,
-				Name:    stepName,
-				Status:  status,
-				EndedAt: time.Now(),
+				ID:       stepID,
+				Name:     stepName,
+				Status:   status,
+				ExitCode: code,
+				EndedAt:  time.Now(),
 			},
 		})
 	}
@@ -540,9 +548,14 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		stdout = os.Stdout
 	}
 
+	jobMasker := NewSecretMasker()
+	if job.JobToken != "" {
+		jobMasker.AddMask(job.JobToken)
+	}
+
 	var stepLogger *StepLogger
 	if c.stepLoggerEnabled {
-		stepLogger = NewStepLogger(jobDisplayName, stdout, c.colorEnabled)
+		stepLogger = NewStepLogger(jobDisplayName, stdout, c.colorEnabled).WithMasker(jobMasker)
 	}
 
 	for i, step := range job.Steps {
@@ -652,7 +665,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			Script:           stepScript,
 		}
 
-		res, _, stepErr := c.executeStep(ctx, d, jobID, spec, stepLogger, stepDisplayName)
+		res, _, stepErr := c.executeStep(ctx, d, jobID, spec, stepLogger, stepDisplayName, jobMasker)
 
 		if ctx.Err() != nil {
 			exitCode := 1
@@ -788,7 +801,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 
 // executeStep executes a single step, publishing step start/finish events, streaming logs,
 // and sampling telemetry via a 500ms ticker.
-func (c *Coordinator) executeStep(ctx context.Context, d driver.Driver, jobID string, spec *driver.StepSpec, stepLogger *StepLogger, stepDisplayName string) (*driver.StepResult, time.Duration, error) {
+func (c *Coordinator) executeStep(ctx context.Context, d driver.Driver, jobID string, spec *driver.StepSpec, stepLogger *StepLogger, stepDisplayName string, jobMasker *SecretMasker) (*driver.StepResult, time.Duration, error) {
 	c.NotifyStepStart(jobID, spec.ID, stepDisplayName)
 
 	stdout := c.stdout
@@ -810,6 +823,14 @@ func (c *Coordinator) executeStep(ctx context.Context, d driver.Driver, jobID st
 	sampler := c.sampler
 	c.mu.RUnlock()
 
+	if jobMasker == nil {
+		if stepLogger != nil {
+			jobMasker = stepLogger.Masker()
+		} else {
+			jobMasker = NewSecretMasker()
+		}
+	}
+
 	if stepLogger != nil {
 		stepLogger.LogStepStart(stepDisplayName, spec.Script)
 		stepOutWriter = stepLogger.NewWriter("stdout")
@@ -827,10 +848,10 @@ func (c *Coordinator) executeStep(ctx context.Context, d driver.Driver, jobID st
 	} else if monSrv != nil {
 		stepOutWriter = NewLineWriter(func(line string) {
 			c.NotifyJobStepLog(jobID, spec.ID, line)
-		})
+		}).WithMasker(jobMasker)
 		stepErrWriter = NewLineWriter(func(line string) {
 			c.NotifyJobStepLog(jobID, spec.ID, line)
-		})
+		}).WithMasker(jobMasker)
 		stepOut = io.MultiWriter(stdout, stepOutWriter)
 		stepErrStream = io.MultiWriter(stderr, stepErrWriter)
 	}
@@ -912,10 +933,17 @@ func (c *Coordinator) executeStep(ctx context.Context, d driver.Driver, jobID st
 		stepLogger.LogStepEnd(stepDisplayName, success, duration)
 	}
 
+	exitCode := 0
+	if res != nil {
+		exitCode = res.ExitCode
+	} else if !success {
+		exitCode = 1
+	}
+
 	if success {
-		c.NotifyStepFinish(jobID, spec.ID, stepDisplayName, monitor.StatusSuccess)
+		c.NotifyStepFinish(jobID, spec.ID, stepDisplayName, monitor.StatusSuccess, exitCode)
 	} else {
-		c.NotifyStepFinish(jobID, spec.ID, stepDisplayName, monitor.StatusFailed)
+		c.NotifyStepFinish(jobID, spec.ID, stepDisplayName, monitor.StatusFailed, exitCode)
 	}
 
 	return res, duration, stepErr
@@ -1014,8 +1042,12 @@ if [ -z "$TARGET_REF" ]; then
 fi
 
 if [ -n "$TARGET_REF" ]; then
-    git fetch --depth=1 origin "$TARGET_REF" || git fetch origin
-    git checkout -f "$TARGET_REF"
+    CLEAN_REF="${TARGET_REF#refs/heads/}"
+    git checkout -f -- "$CLEAN_REF" 2>/dev/null || \
+    git checkout -f -- "$TARGET_REF" 2>/dev/null || (
+        git fetch --depth=1 "$CLONE_URL" "$TARGET_REF" 2>/dev/null || git fetch "$CLONE_URL"
+        git checkout -f -- "$CLEAN_REF" 2>/dev/null || git checkout -f -- "$TARGET_REF"
+    )
 fi
 `
 }

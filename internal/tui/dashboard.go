@@ -166,11 +166,11 @@ func (m *DashboardModel) WithHistoryStore(store monitor.HistoryStore) *Dashboard
 }
 
 // ApplySnapshot applies a monitor.Snapshot to rebuild tree and update telemetry.
-func (m *DashboardModel) ApplySnapshot(snap *monitor.Snapshot) {
+func (m *DashboardModel) ApplySnapshot(snap *monitor.Snapshot) tea.Cmd {
 	if m == nil {
-		return
+		return nil
 	}
-	m.applySnapshot(snap)
+	return m.applySnapshot(snap)
 }
 
 // Tree returns the underlying TreeWidget.
@@ -426,7 +426,7 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastErr = nil
 		wasOffline := m.isOffline
 		m.isOffline = false
-		m.applySnapshot((*monitor.Snapshot)(msg))
+		cmd := m.applySnapshot((*monitor.Snapshot)(msg))
 		ctx := m.ctx
 		if ctx == nil {
 			ctx = context.Background()
@@ -434,21 +434,33 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if (wasOffline || m.events == nil) && m.client != nil {
 			m.events, m.errs = m.client.StreamEvents(ctx)
 		}
+		var waitCmd tea.Cmd
 		if ctx.Err() == nil {
-			return m, waitForEventWithContext(ctx, m.events, m.errs)
+			waitCmd = waitForEventWithContext(ctx, m.events, m.errs)
 		}
-		return m, nil
+		if cmd != nil && waitCmd != nil {
+			return m, tea.Batch(cmd, waitCmd)
+		} else if cmd != nil {
+			return m, cmd
+		}
+		return m, waitCmd
 
 	case EventMsg:
-		m.handleEvent(monitor.Event(msg))
+		cmd := m.handleEvent(monitor.Event(msg))
 		ctx := m.ctx
 		if ctx == nil {
 			ctx = context.Background()
 		}
+		var waitCmd tea.Cmd
 		if ctx.Err() == nil {
-			return m, waitForEventWithContext(ctx, m.events, m.errs)
+			waitCmd = waitForEventWithContext(ctx, m.events, m.errs)
 		}
-		return m, nil
+		if cmd != nil && waitCmd != nil {
+			return m, tea.Batch(cmd, waitCmd)
+		} else if cmd != nil {
+			return m, cmd
+		}
+		return m, waitCmd
 
 	case streamClosedMsg:
 		m.lastErr = fmt.Errorf("stream closed")
@@ -632,9 +644,9 @@ func (m *DashboardModel) updateSizes() {
 	m.viewport.Height = logHeight
 }
 
-func (m *DashboardModel) applySnapshot(snap *monitor.Snapshot) {
+func (m *DashboardModel) applySnapshot(snap *monitor.Snapshot) tea.Cmd {
 	if snap == nil {
-		return
+		return nil
 	}
 	if snap.Telemetry != nil {
 		m.telemetry.Update(snap.Telemetry)
@@ -644,9 +656,6 @@ func (m *DashboardModel) applySnapshot(snap *monitor.Snapshot) {
 			lines = lines[len(lines)-maxStepLogLines:]
 		}
 		m.stepLogs[stepKey] = lines
-		if idx := strings.Index(stepKey, "/"); idx != -1 {
-			m.stepLogs[stepKey[idx+1:]] = lines
-		}
 	}
 	m.rebuildTreeFromSnapshot(snap)
 	if m.autoFocusRunningStep && !m.autoFocused {
@@ -660,7 +669,7 @@ func (m *DashboardModel) applySnapshot(snap *monitor.Snapshot) {
 			})
 		}
 	}
-	m.updateActiveStepLogs()
+	return m.updateActiveStepLogs()
 }
 
 func formatRunnerRootLabel(runnerName string) string {
@@ -906,17 +915,30 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 		liveNode.AddChild(jobNode)
 	}
 
+	selectedID := ""
+	selectedParentID := ""
+	if sel := m.tree.SelectedNode(); sel != nil {
+		selectedID = sel.ID
+		if sel.Parent != nil {
+			selectedParentID = sel.Parent.ID
+		}
+	}
+
 	seenHistIDs := make(map[string]bool)
 	for _, job := range snap.RecentJobs {
 		if job == nil {
 			continue
 		}
 		seenHistIDs[job.ID] = true
+		expanded := false
+		if oldJob, ok := existingHistJobs[job.ID]; ok {
+			expanded = oldJob.Expanded
+		}
 		jobNode := &TreeNode{
 			ID:       job.ID,
 			Label:    job.Name,
 			Status:   job.Status,
-			Expanded: false,
+			Expanded: expanded,
 			Data:     job,
 		}
 		for _, step := range job.Steps {
@@ -947,9 +969,18 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 
 	m.tree.Root = root
 	m.tree.Rebuild()
+
+	if selectedID != "" {
+		_ = m.tree.SelectFirst(func(n *TreeNode) bool {
+			if selectedParentID != "" && n.Parent != nil {
+				return n.ID == selectedID && n.Parent.ID == selectedParentID
+			}
+			return n.ID == selectedID
+		})
+	}
 }
 
-func (m *DashboardModel) handleEvent(ev monitor.Event) {
+func (m *DashboardModel) handleEvent(ev monitor.Event) tea.Cmd {
 	switch ev.Type {
 	case monitor.EventTelemetry:
 		m.telemetry.Update(ev.Telemetry)
@@ -1002,9 +1033,9 @@ func (m *DashboardModel) handleEvent(ev monitor.Event) {
 		}
 	case monitor.EventJobFinish:
 		if ev.Job != nil {
-			m.handleJobFinish(ev.Job.ID, ev.Job)
+			return m.handleJobFinish(ev.Job.ID, ev.Job)
 		} else if ev.JobID != "" {
-			m.handleJobFinish(ev.JobID, nil)
+			return m.handleJobFinish(ev.JobID, nil)
 		}
 	case monitor.EventStepStart, monitor.EventStepFinish:
 		if ev.Step != nil {
@@ -1017,6 +1048,7 @@ func (m *DashboardModel) handleEvent(ev monitor.Event) {
 			m.updateNodeStatus(ev.StepID, status)
 		}
 	}
+	return nil
 }
 
 func (m *DashboardModel) handleJobStart(job *monitor.JobInfo) {
@@ -1069,7 +1101,7 @@ func (m *DashboardModel) handleJobStart(job *monitor.JobInfo) {
 	m.tree.Rebuild()
 }
 
-func (m *DashboardModel) handleJobFinish(jobID string, job *monitor.JobInfo) {
+func (m *DashboardModel) handleJobFinish(jobID string, job *monitor.JobInfo) tea.Cmd {
 	live, hist := m.ensureBranches()
 	var target *TreeNode
 	var targetIdx = -1
@@ -1166,7 +1198,7 @@ func (m *DashboardModel) handleJobFinish(jobID string, job *monitor.JobInfo) {
 	if selectedBefore != nil {
 		m.tree.SelectNode(selectedBefore)
 	}
-	m.updateActiveStepLogs()
+	return m.updateActiveStepLogs()
 }
 
 func (m *DashboardModel) upsertStepNode(jobID string, step *monitor.StepInfo) {
@@ -1280,10 +1312,13 @@ func (m *DashboardModel) updateActiveStepLogs() tea.Cmd {
 	if sel != nil {
 		m.activeStepID = sel.ID
 		var lines []string
-		if sel.Parent != nil && sel.Parent.ID != "" && sel.Parent.ID != "root" && sel.Parent.ID != "live-runs" && sel.Parent.ID != "historical-runs" {
+		hasParentJob := sel.Parent != nil && sel.Parent.ID != "" && sel.Parent.ID != "root" && sel.Parent.ID != "live-runs" && sel.Parent.ID != "historical-runs"
+		if hasParentJob {
 			lines = m.stepLogs[sel.Parent.ID+"/"+sel.ID]
-		}
-		if len(lines) == 0 {
+			if len(lines) == 0 && !isHistoricalNode(sel) {
+				lines = m.stepLogs[sel.ID]
+			}
+		} else {
 			lines = m.stepLogs[sel.ID]
 		}
 

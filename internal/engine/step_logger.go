@@ -351,11 +351,14 @@ func (sw *StepWriter) writeFormattedLine(line string) {
 }
 
 func parseAddMask(line string) (string, bool) {
-	idx := strings.Index(line, "::add-mask")
-	if idx == -1 {
+	trimmed := strings.TrimSpace(line)
+	// Strip optional "echo " prefix if echoed directly in raw script output
+	trimmed = strings.TrimPrefix(trimmed, "echo ")
+	trimmed = strings.TrimSpace(trimmed)
+	if !strings.HasPrefix(trimmed, "::add-mask") {
 		return "", false
 	}
-	rest := line[idx+len("::add-mask"):]
+	rest := trimmed[len("::add-mask"):]
 	if !strings.HasPrefix(rest, "::") && !strings.HasPrefix(rest, " ") {
 		return "", false
 	}

@@ -73,8 +73,6 @@ func (s *DiskStore) AppendStepLog(jobID, stepID, line string) error {
 		lock.Unlock()
 		return fmt.Errorf("failed to close step log file %s: %w", logPath, err)
 	}
-	lock.Unlock()
-
 	// In-memory tracking of step line counts and byte counts during streaming
 	key := jobID + "/" + stepID
 	val, _ := s.stepStats.LoadOrStore(key, &stepStats{})
@@ -82,13 +80,15 @@ func (s *DiskStore) AppendStepLog(jobID, stepID, line string) error {
 	stat.bytes.Add(byteCount)
 	stat.lines.Add(int64(lineCount))
 
+	lock.Unlock()
+
 	return nil
 }
 
 // FinishStep finalizes an individual step in meta.json with the provided conclusion,
 // exit code, and finish timestamp, flushes accumulated in-memory log statistics,
 // and cleans up step locks and stats.
-func (s *DiskStore) FinishStep(jobID, stepID, conclusion string, exitCode int, finishedAt time.Time) error {
+func (s *DiskStore) FinishStep(jobID, stepID, conclusion string, exitCode int, finishedAt time.Time, startedAt ...time.Time) error {
 	if jobID == "" {
 		return errors.New("empty job ID")
 	}
@@ -110,7 +110,10 @@ func (s *DiskStore) FinishStep(jobID, stepID, conclusion string, exitCode int, f
 	// Acquire stepLock to ensure any in-flight append completes
 	lock := s.getStepLock(jobID, cleanStepID)
 	lock.Lock()
-	defer lock.Unlock()
+	defer func() {
+		lock.Unlock()
+		s.stepLocks.Delete(key)
+	}()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -154,6 +157,10 @@ func (s *DiskStore) FinishStep(jobID, stepID, conclusion string, exitCode int, f
 	target.Status = status
 	target.ExitCode = exitCode
 
+	if len(startedAt) > 0 && !startedAt[0].IsZero() && target.StartedAt.IsZero() {
+		target.StartedAt = startedAt[0]
+	}
+
 	if finishedAt.IsZero() {
 		finishedAt = time.Now().UTC()
 	}
@@ -172,9 +179,6 @@ func (s *DiskStore) FinishStep(jobID, stepID, conclusion string, exitCode int, f
 		target.LogBytes += stat.bytes.Load()
 		target.LogLines += int(stat.lines.Load())
 	}
-
-	// Remove step lock entry from map
-	s.stepLocks.Delete(key)
 
 	if err := writeJSONAtomic(metaPath, &meta); err != nil {
 		return fmt.Errorf("failed to update run metadata for job %s: %w", jobID, err)

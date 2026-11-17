@@ -218,6 +218,18 @@ func TestMonitor_Telemetry_CumulativeRateDeltaTime(t *testing.T) {
 		},
 	})
 
+	// Sample 4 with duplicate timestamp t2 (diff <= 0): deltaSeconds must be 0.0, accumulating 0 phantom bytes
+	server.Publish(monitor.Event{
+		Type:  monitor.EventTelemetry,
+		JobID: jobID,
+		Telemetry: &monitor.TelemetrySample{
+			Timestamp:     t2,
+			NetRxRate:     4000,
+			NetTxRate:     2000,
+			DiskWriteRate: 8000,
+		},
+	})
+
 	// Expected cumulative calculations:
 	// TotalNetRxBytes:
 	// Sample 1: 2000 * 0.5 = 1000
@@ -259,3 +271,85 @@ func TestMonitor_Telemetry_CumulativeRateDeltaTime(t *testing.T) {
 	assert.Equal(t, expectedNetTx, meta.MetricsSummary.TotalNetTxBytes, "cumulative NetTx bytes must account for interval delta time")
 	assert.Equal(t, expectedDiskWrite, meta.MetricsSummary.TotalDiskWrittenBytes, "cumulative DiskWritten bytes must account for interval delta time")
 }
+
+func TestMonitor_StepDurationAndExitCode_RecordedInHistory(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := testSocketPath(t)
+
+	store, err := history.NewDiskStore(tempDir)
+	require.NoError(t, err)
+
+	server := monitor.NewServer(sockPath, "test-runner").WithHistoryStore(store)
+	require.NoError(t, server.Start())
+	defer func() {
+		_ = server.Stop()
+	}()
+
+	jobID := "job-duration-test"
+	stepID := "step-build"
+	t0 := time.Now().UTC().Add(-10 * time.Second)
+
+	// 1. Job Start
+	server.Publish(monitor.Event{
+		Type:  monitor.EventJobStart,
+		JobID: jobID,
+		Job: &monitor.JobInfo{
+			ID:        jobID,
+			Name:      "Build & Test",
+			Status:    monitor.StatusRunning,
+			StartedAt: t0,
+		},
+	})
+
+	// 2. Step Start at t0 + 2s
+	stepStart := t0.Add(2 * time.Second)
+	server.Publish(monitor.Event{
+		Type:   monitor.EventStepStart,
+		JobID:  jobID,
+		StepID: stepID,
+		Step: &monitor.StepInfo{
+			ID:        stepID,
+			Name:      "Build Target",
+			Status:    monitor.StatusRunning,
+			StartedAt: stepStart,
+		},
+	})
+
+	// 3. Step Finish at t0 + 7s (5 seconds duration), failed with exit code 42
+	stepFinish := t0.Add(7 * time.Second)
+	server.Publish(monitor.Event{
+		Type:   monitor.EventStepFinish,
+		JobID:  jobID,
+		StepID: stepID,
+		Step: &monitor.StepInfo{
+			ID:       stepID,
+			Name:     "Build Target",
+			Status:   monitor.StatusFailed,
+			ExitCode: 42,
+			EndedAt:  stepFinish,
+		},
+	})
+
+	// 4. Job Finish
+	server.Publish(monitor.Event{
+		Type:  monitor.EventJobFinish,
+		JobID: jobID,
+		Job: &monitor.JobInfo{
+			ID:      jobID,
+			Status:  monitor.StatusFailed,
+			EndedAt: stepFinish,
+		},
+	})
+
+	meta, err := store.GetRun(jobID)
+	require.NoError(t, err)
+	require.NotNil(t, meta)
+	require.Len(t, meta.Steps, 1)
+
+	stepMeta := meta.Steps[0]
+	assert.Equal(t, stepID, stepMeta.ID)
+	assert.Equal(t, monitor.StatusFailed, stepMeta.Status)
+	assert.Equal(t, 42, stepMeta.ExitCode, "ExitCode must be recorded from step finish")
+	assert.Equal(t, int64(5), stepMeta.DurationSec, "DurationSec must be recorded based on step start and end times")
+}
+

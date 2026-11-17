@@ -60,28 +60,37 @@ func NewServer(sockPath string, runnerName string) *Server {
 
 // WithHistoryStore sets the history persistence store for the server and hydrates recent runs.
 func (s *Server) WithHistoryStore(store HistoryStore) *Server {
+	s.mu.Lock()
 	s.historyStore = store
+	s.mu.Unlock()
 	s.hydrateFromStore()
 	return s
 }
 
 // HistoryStore returns the configured history persistence store.
 func (s *Server) HistoryStore() HistoryStore {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.historyStore
 }
 
 // WithRetention configures maximum runs and disk storage limits for automated pruning.
 func (s *Server) WithRetention(maxRuns int, maxDiskBytes int64) *Server {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.maxRuns = maxRuns
 	s.maxDiskBytes = maxDiskBytes
 	return s
 }
 
 func (s *Server) hydrateFromStore() {
-	if s.historyStore == nil {
+	s.mu.RLock()
+	store := s.historyStore
+	s.mu.RUnlock()
+	if store == nil {
 		return
 	}
-	runs, err := s.historyStore.ListRuns(50)
+	runs, err := store.ListRuns(50)
 	if err != nil || len(runs) == 0 {
 		return
 	}
@@ -98,7 +107,7 @@ func (s *Server) hydrateFromStore() {
 		}
 
 		var steps []*StepInfo
-		if meta, err := s.historyStore.GetRun(r.ID); err == nil && meta != nil {
+		if meta, err := store.GetRun(r.ID); err == nil && meta != nil {
 			steps = make([]*StepInfo, 0, len(meta.Steps))
 			for _, st := range meta.Steps {
 				if st == nil {
@@ -232,12 +241,16 @@ func (s *Server) handleHistoricalStepLogs(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if s.historyStore == nil {
+	s.mu.RLock()
+	store := s.historyStore
+	s.mu.RUnlock()
+
+	if store == nil {
 		http.Error(w, "history store not configured", http.StatusNotFound)
 		return
 	}
 
-	meta, err := s.historyStore.GetRun(runID)
+	meta, err := store.GetRun(runID)
 	if err != nil {
 		http.Error(w, "run not found", http.StatusNotFound)
 		return
@@ -255,7 +268,7 @@ func (s *Server) handleHistoricalStepLogs(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	lines, err := s.historyStore.GetStepLogs(runID, stepID)
+	lines, err := store.GetStepLogs(runID, stepID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -374,6 +387,8 @@ func (s *Server) Publish(ev Event) {
 		stepFinishID   string
 		stepConclusion string
 		stepFinishedAt time.Time
+		stepStartedAt  time.Time
+		stepExitCode   int
 
 		doAppendLog bool
 		logJobID    string
@@ -564,6 +579,11 @@ func (s *Server) Publish(ev Event) {
 				stepFinishID = ev.Step.ID
 				stepConclusion = string(ev.Step.Status)
 				stepFinishedAt = ev.Step.EndedAt
+				stepStartedAt = stepClone.StartedAt
+				stepExitCode = ev.Step.ExitCode
+				if stepExitCode == 0 && ev.Step.Status == StatusFailed {
+					stepExitCode = 1
+				}
 			}
 		}
 	case EventStepLog:
@@ -621,6 +641,8 @@ func (s *Server) Publish(ev Event) {
 						diff := ev.Telemetry.Timestamp.Sub(lastTime).Seconds()
 						if diff > 0 && diff < 60 {
 							deltaSeconds = diff
+						} else if diff <= 0 {
+							deltaSeconds = 0.0
 						}
 					}
 					s.lastTelemetryTime[jID] = ev.Telemetry.Timestamp
@@ -657,7 +679,7 @@ func (s *Server) Publish(ev Event) {
 		_ = store.StartRun(startJob, startLimits, startDriver)
 	}
 	if doFinishStep {
-		_ = store.FinishStep(stepJobID, stepFinishID, stepConclusion, 0, stepFinishedAt)
+		_ = store.FinishStep(stepJobID, stepFinishID, stepConclusion, stepExitCode, stepFinishedAt, stepStartedAt)
 	}
 	if doAppendLog {
 		_ = store.AppendStepLog(logJobID, logStepID, logLine)

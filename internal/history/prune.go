@@ -2,6 +2,7 @@ package history
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -131,6 +132,13 @@ func (s *DiskStore) RecoverInterruptedRuns() (int, error) {
 		if os.IsNotExist(err) {
 			return 0, nil
 		}
+		if errors.Is(err, ErrCorruptedIndex) {
+			indexPath := filepath.Join(s.baseDir, "index.json")
+			_ = s.backupCorruptIndex(indexPath)
+			catalog = &IndexCatalog{Version: 1, Runs: []*RunSummary{}}
+			_ = writeJSONAtomic(indexPath, catalog)
+			return 0, nil
+		}
 		return 0, fmt.Errorf("failed to load index catalog: %w", err)
 	}
 
@@ -142,7 +150,7 @@ func (s *DiskStore) RecoverInterruptedRuns() (int, error) {
 	recoveredCount := 0
 
 	for _, run := range catalog.Runs {
-		if run.Status == monitor.StatusRunning {
+		if run.Status == monitor.StatusRunning || run.Status == monitor.StatusQueued {
 			run.Status = StatusInterrupted
 			run.EndedAt = now
 			if !run.StartedAt.IsZero() {

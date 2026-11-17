@@ -38,6 +38,19 @@ func newMonitorCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfgDir := resolveConfigDir(configDirFlag, cmd.Flags().Changed("config-dir"))
 
+			runsDir := runsDirFlag
+			if runsDir == "" {
+				runsDir = filepath.Join(cfgDir, "runs")
+			}
+
+			var store history.Store
+			if s, err := history.NewDiskStore(runsDir); err == nil {
+				store = s
+				if demoFlag {
+					_ = demo.SeedHistoryStore(store)
+				}
+			}
+
 			var srv *monitor.Server
 			if demoFlag {
 				tmpSock := filepath.Join(os.TempDir(), fmt.Sprintf("actr-demo-%d.sock", os.Getpid()))
@@ -45,7 +58,7 @@ func newMonitorCmd() *cobra.Command {
 				defer cancel()
 
 				var err error
-				srv, err = demo.StartServer(ctx, tmpSock)
+				srv, err = demo.StartServerWithStore(ctx, tmpSock, store)
 				if err != nil {
 					return fmt.Errorf("start demo server: %w", err)
 				}
@@ -56,11 +69,6 @@ func newMonitorCmd() *cobra.Command {
 				sockPath = tmpSock
 			} else if sockPath == "" {
 				sockPath = filepath.Join(cfgDir, "daemon.sock")
-			}
-
-			runsDir := runsDirFlag
-			if runsDir == "" {
-				runsDir = filepath.Join(cfgDir, "runs")
 			}
 
 			isDaemonRunning := false
@@ -75,20 +83,17 @@ func newMonitorCmd() *cobra.Command {
 			var model *tui.DashboardModel
 			if demoFlag || isDaemonRunning {
 				model = tui.NewDashboardModel(sockPath)
-				if store, err := history.NewDiskStore(runsDir); err == nil {
-					if demoFlag {
-						_ = demo.SeedHistoryStore(store)
-						if srv != nil {
-							srv.WithHistoryStore(store)
-						}
-					}
+				if store != nil {
 					model.SetHistoryStore(store)
 				}
 			} else {
 				// Offline mode fallback: load historical runs directly from disk store
-				store, err := history.NewDiskStore(runsDir)
-				if err != nil {
-					return fmt.Errorf("initialize history store at %s: %w", runsDir, err)
+				if store == nil {
+					var err error
+					store, err = history.NewDiskStore(runsDir)
+					if err != nil {
+						return fmt.Errorf("initialize history store at %s: %w", runsDir, err)
+					}
 				}
 				snap, err := tui.HydrateSnapshotFromStore(store, 50)
 				if err != nil {

@@ -29,23 +29,22 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	server, err := demo.StartServer(ctx, sockPath)
+	var store history.Store
+	if s, err := history.NewDiskStore(runsDir); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to initialize history store at %s: %v\n", runsDir, err)
+	} else {
+		store = s
+		if err := demo.SeedHistoryStore(store); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to seed history store: %v\n", err)
+		}
+	}
+
+	server, err := demo.StartServerWithStore(ctx, sockPath, store)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to start demo server: %v\n", err)
 		os.Exit(1)
 	}
 	defer func() { _ = server.Stop() }()
-
-	store, err := history.NewDiskStore(runsDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: failed to initialize history store at %s: %v\n", runsDir, err)
-	} else {
-		if err := demo.SeedHistoryStore(store); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: failed to seed history store: %v\n", err)
-		} else {
-			server.WithHistoryStore(store)
-		}
-	}
 
 	fmt.Printf("Demo runner daemon listening on %s (PID %d)\n", sockPath, os.Getpid())
 	fmt.Printf("Historical runs seeded in: %s\n", runsDir)

@@ -1214,7 +1214,7 @@ func TestCoordinator_GitHubVariablesAndCheckoutSynthesis(t *testing.T) {
 	if strings.Contains(checkoutStep.Script, "git checkout -f \"$TARGET_REF\" 2>/dev/null || true") {
 		t.Errorf("checkout step script should not contain '|| true' on checkout: %s", checkoutStep.Script)
 	}
-	if !strings.Contains(checkoutStep.Script, "git fetch --depth=1 origin \"$TARGET_REF\" || git fetch origin") {
+	if !strings.Contains(checkoutStep.Script, "git fetch --depth=1 \"$CLONE_URL\" \"$TARGET_REF\"") {
 		t.Errorf("checkout step script should fetch target ref explicitly: %s", checkoutStep.Script)
 	}
 	if checkoutStep.Environment["ACTR_CHECKOUT_REPO"] != "adrijshikhar/cxstatusline" {
@@ -1280,6 +1280,19 @@ func TestCoordinator_CheckoutScriptParameterization_SafeInputs(t *testing.T) {
 		if strings.Contains(line, "checkout") && strings.Contains(line, "|| true") {
 			t.Errorf("checkout command must not ignore errors with || true: %s", line)
 		}
+	}
+
+	// Verify fetch uses CLONE_URL to support authenticated private repository checkout
+	if !strings.Contains(script, `git fetch --depth=1 "$CLONE_URL"`) {
+		t.Errorf("expected script to fetch using $CLONE_URL for private repo auth, got: %s", script)
+	}
+
+	// Verify ref stripping and separator usage
+	if !strings.Contains(script, `CLEAN_REF="${TARGET_REF#refs/heads/}"`) {
+		t.Errorf("expected script to normalize refs/heads/, got: %s", script)
+	}
+	if !strings.Contains(script, `git checkout -f -- "$TARGET_REF"`) {
+		t.Errorf("expected script to use -- separator for checkout, got: %s", script)
 	}
 }
 

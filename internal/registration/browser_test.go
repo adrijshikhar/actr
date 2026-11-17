@@ -56,6 +56,15 @@ func TestOpenBrowser(t *testing.T) {
 			"custom-scheme://test",
 			"not a url at all",
 			"://missing-scheme",
+			`https://github.com/test"quote`,
+			`https://github.com/test'quote`,
+			"https://github.com/test`backtick`",
+			"https://github.com/test with spaces",
+			"https://github.com/test&param=1",
+			"https://github.com/test^caret",
+			"https://github.com/test<bracket",
+			"https://github.com/test>bracket",
+			"https://github.com/test|pipe",
 		}
 
 		for _, tc := range invalidCases {
@@ -64,6 +73,34 @@ func TestOpenBrowser(t *testing.T) {
 				err := OpenBrowser(tc, mockLauncher)
 				require.Error(t, err)
 				assert.False(t, called, "launcher should not be called for invalid url %q", tc)
+			})
+		}
+	})
+
+	t.Run("urls with illegal characters rejected", func(t *testing.T) {
+		illegalCases := []struct {
+			name string
+			url  string
+		}{
+			{"double quote", `https://github.com/test"inject`},
+			{"single quote", `https://github.com/test'inject`},
+			{"backtick", "https://github.com/test`inject`"},
+			{"space", "https://github.com/test space"},
+			{"ampersand", "https://github.com/test&foo=bar"},
+			{"caret", "https://github.com/test^car"},
+			{"pipe", "https://github.com/test|pipe"},
+			{"less than", "https://github.com/test<tag"},
+			{"greater than", "https://github.com/test>tag"},
+			{"newline", "https://github.com/test\ninject"},
+			{"carriage return", "https://github.com/test\rinject"},
+			{"tab", "https://github.com/test\tinject"},
+		}
+
+		for _, tc := range illegalCases {
+			t.Run(tc.name, func(t *testing.T) {
+				err := OpenBrowser(tc.url, nil)
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "contains illegal characters")
 			})
 		}
 	})
@@ -97,7 +134,7 @@ func TestBrowserCommand(t *testing.T) {
 	t.Run("windows command structure", func(t *testing.T) {
 		cmd, err := browserCommand("windows", testURL)
 		require.NoError(t, err)
-		assert.Equal(t, []string{"cmd.exe", "/c", "start", "", testURL}, cmd.Args)
+		assert.Equal(t, []string{"rundll32", "url.dll,FileProtocolHandler", testURL}, cmd.Args)
 	})
 
 	t.Run("darwin command structure", func(t *testing.T) {

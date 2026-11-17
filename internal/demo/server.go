@@ -10,16 +10,18 @@ import (
 	"github.com/adrijshikhar/actr/internal/monitor"
 )
 
-// StartServer initializes and starts a demonstration monitor server on sockPath.
-// It pre-seeds past completed jobs, sets up an active in-flight job, and continuously
-// streams realistic logs, step status transitions, and fluctuating telemetry until ctx is cancelled.
-func StartServer(ctx context.Context, sockPath string) (*monitor.Server, error) {
+// StartServerWithStore initializes and starts a demonstration monitor server on sockPath
+// with an attached history store.
+func StartServerWithStore(ctx context.Context, sockPath string, store monitor.HistoryStore) (*monitor.Server, error) {
 	_ = os.Remove(sockPath)
 	if err := os.MkdirAll(filepath.Dir(sockPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create socket dir: %w", err)
 	}
 
 	server := monitor.NewServer(sockPath, "m5-pro (macOS arm64)")
+	if store != nil {
+		server.WithHistoryStore(store)
+	}
 	if err := server.Start(); err != nil {
 		return nil, fmt.Errorf("start monitor server: %w", err)
 	}
@@ -28,6 +30,13 @@ func StartServer(ctx context.Context, sockPath string) (*monitor.Server, error) 
 	go runSimulation(ctx, server)
 
 	return server, nil
+}
+
+// StartServer initializes and starts a demonstration monitor server on sockPath.
+// It pre-seeds past completed jobs, sets up an active in-flight job, and continuously
+// streams realistic logs, step status transitions, and fluctuating telemetry until ctx is cancelled.
+func StartServer(ctx context.Context, sockPath string) (*monitor.Server, error) {
+	return StartServerWithStore(ctx, sockPath, nil)
 }
 
 func seedInitialState(server *monitor.Server) {
