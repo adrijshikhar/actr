@@ -17,6 +17,9 @@ func validateBrowserURL(rawURL string) (string, error) {
 	if trimmed == "" {
 		return "", fmt.Errorf("target URL is empty")
 	}
+	if strings.ContainsAny(trimmed, "\"'\t\r\n`^<>|& ") {
+		return "", fmt.Errorf("invalid browser target URL: contains illegal characters")
+	}
 	parsed, err := url.ParseRequestURI(trimmed)
 	if err != nil {
 		return "", fmt.Errorf("invalid browser target URL: %w", err)
@@ -37,7 +40,7 @@ func browserCommand(goos, rawURL string) (*exec.Cmd, error) {
 		}
 		return exec.Command("xdg-open", rawURL), nil
 	case "windows":
-		return exec.Command("cmd.exe", "/c", "start", "", rawURL), nil
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", rawURL), nil
 	default:
 		return nil, fmt.Errorf("unsupported platform for browser launch: %s", goos)
 	}
