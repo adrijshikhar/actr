@@ -352,4 +352,3 @@ func TestMonitor_StepDurationAndExitCode_RecordedInHistory(t *testing.T) {
 	assert.Equal(t, 42, stepMeta.ExitCode, "ExitCode must be recorded from step finish")
 	assert.Equal(t, int64(5), stepMeta.DurationSec, "DurationSec must be recorded based on step start and end times")
 }
-
