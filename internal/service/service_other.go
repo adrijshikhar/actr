@@ -9,7 +9,7 @@ import (
 var errUnsupportedOS = errors.New("unsupported operating system for service management")
 
 // Install returns an error on unsupported platforms.
-func Install(binPath string) error {
+func Install(binPath string, configDirs ...string) error {
 	return errUnsupportedOS
 }
 

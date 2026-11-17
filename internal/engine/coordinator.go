@@ -213,6 +213,25 @@ func (c *Coordinator) NotifyStepFinish(jobID, stepID, stepName string, status mo
 	}
 }
 
+func newFailedCompleteJobRequest(job *protocol.JobSpecification) *protocol.CompleteJobRequest {
+	jobID := ""
+	planID := ""
+	if job != nil {
+		jobID = job.JobID
+		planID = job.PlanID
+	}
+	if jobID == "" {
+		jobID = "job"
+	}
+	return &protocol.CompleteJobRequest{
+		PlanID:      planID,
+		JobID:       jobID,
+		Conclusion:  "failure",
+		Outputs:     make(map[string]string),
+		StepResults: make([]protocol.StepResult, 0),
+	}
+}
+
 // ExecuteJob runs all steps of the given JobSpecification sequentially, maintaining cumulative
 // environment updates, aggregating step outputs, managing background lease renewal, and returning
 // the CompleteJobRequest summary.
@@ -223,11 +242,17 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 
 	d, err := c.resolveDriver(job)
 	if err != nil {
-		return nil, err
+		return newFailedCompleteJobRequest(job), err
 	}
 
 	if ctx == nil {
 		ctx = context.Background()
+	}
+
+	if c.limits != nil && c.limits.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.limits.Timeout)
+		defer cancel()
 	}
 
 	jobID := job.JobID
@@ -309,17 +334,17 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	baseWorkDir, err := filepath.Abs(c.workDir)
 	if err != nil {
 		conclusion = "failure"
-		return nil, fmt.Errorf("resolve base work directory: %w", err)
+		return newFailedCompleteJobRequest(job), fmt.Errorf("resolve base work directory: %w", err)
 	}
 	if err := os.MkdirAll(baseWorkDir, 0o755); err != nil {
 		conclusion = "failure"
-		return nil, fmt.Errorf("create base work directory: %w", err)
+		return newFailedCompleteJobRequest(job), fmt.Errorf("create base work directory: %w", err)
 	}
 
 	runnerTemp := filepath.Join(baseWorkDir, "_temp")
 	if err := os.MkdirAll(runnerTemp, 0o755); err != nil {
 		conclusion = "failure"
-		return nil, fmt.Errorf("create runner temp directory: %w", err)
+		return newFailedCompleteJobRequest(job), fmt.Errorf("create runner temp directory: %w", err)
 	}
 
 	jobDirName := job.JobName
@@ -333,7 +358,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	_ = os.RemoveAll(jobWorkspace)
 	if err := os.MkdirAll(jobWorkspace, 0o755); err != nil {
 		conclusion = "failure"
-		return nil, fmt.Errorf("create job workspace: %w", err)
+		return newFailedCompleteJobRequest(job), fmt.Errorf("create job workspace: %w", err)
 	}
 
 	// Initialize cumulative environment
@@ -472,7 +497,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 
 	if err := d.PrepareJob(ctx, jobCtx); err != nil {
 		conclusion = "failure"
-		return nil, fmt.Errorf("prepare job: %w", err)
+		return newFailedCompleteJobRequest(job), fmt.Errorf("prepare job: %w", err)
 	}
 
 	// Start background lease renew ticker if RunService is configured
@@ -539,7 +564,13 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		envFile, err := os.CreateTemp(runnerTemp, fmt.Sprintf("env_%s_*.txt", stepID))
 		if err != nil {
 			conclusion = "failure"
-			return nil, fmt.Errorf("create GITHUB_ENV file: %w", err)
+			return &protocol.CompleteJobRequest{
+				PlanID:      job.PlanID,
+				JobID:       job.JobID,
+				Conclusion:  "failure",
+				Outputs:     outputs,
+				StepResults: stepResults,
+			}, fmt.Errorf("create GITHUB_ENV file: %w", err)
 		}
 		envPath := envFile.Name()
 		_ = envFile.Close()
@@ -548,7 +579,13 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		if err != nil {
 			conclusion = "failure"
 			_ = os.Remove(envPath)
-			return nil, fmt.Errorf("create GITHUB_OUTPUT file: %w", err)
+			return &protocol.CompleteJobRequest{
+				PlanID:      job.PlanID,
+				JobID:       job.JobID,
+				Conclusion:  "failure",
+				Outputs:     outputs,
+				StepResults: stepResults,
+			}, fmt.Errorf("create GITHUB_OUTPUT file: %w", err)
 		}
 		outputPath := outFile.Name()
 		_ = outFile.Close()
@@ -558,7 +595,13 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			conclusion = "failure"
 			_ = os.Remove(envPath)
 			_ = os.Remove(outputPath)
-			return nil, fmt.Errorf("create GITHUB_PATH file: %w", err)
+			return &protocol.CompleteJobRequest{
+				PlanID:      job.PlanID,
+				JobID:       job.JobID,
+				Conclusion:  "failure",
+				Outputs:     outputs,
+				StepResults: stepResults,
+			}, fmt.Errorf("create GITHUB_PATH file: %w", err)
 		}
 		pathFilePath := pathFile.Name()
 		_ = pathFile.Close()
@@ -587,7 +630,13 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			_ = os.Remove(envPath)
 			_ = os.Remove(outputPath)
 			_ = os.Remove(pathFilePath)
-			return nil, fmt.Errorf("create step working directory: %w", err)
+			return &protocol.CompleteJobRequest{
+				PlanID:      job.PlanID,
+				JobID:       job.JobID,
+				Conclusion:  "failure",
+				Outputs:     outputs,
+				StepResults: stepResults,
+			}, fmt.Errorf("create step working directory: %w", err)
 		}
 
 		stepScript := step.Script

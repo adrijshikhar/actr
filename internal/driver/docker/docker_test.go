@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,9 +33,15 @@ import (
 // mockConn implements a no-op net.Conn for hijacked docker stream simulation.
 type mockConn struct {
 	net.Conn
+	closeCalled atomic.Bool
+	onClose     func()
 }
 
 func (m *mockConn) Close() error {
+	m.closeCalled.Store(true)
+	if m.onClose != nil {
+		m.onClose()
+	}
 	return nil
 }
 
@@ -88,6 +95,7 @@ type mockDockerClient struct {
 	execStreamStdout string
 	execStreamStderr string
 	execAttachError  error
+	customHijacked   *types.HijackedResponse
 
 	execInspectResp container.ExecInspect
 	execInspectErr  error
@@ -171,6 +179,9 @@ func (m *mockDockerClient) ContainerExecAttach(ctx context.Context, execID strin
 	m.attachedExecID = execID
 	if m.execAttachError != nil {
 		return types.HijackedResponse{}, m.execAttachError
+	}
+	if m.customHijacked != nil {
+		return *m.customHijacked, nil
 	}
 	stream := makeDockerStream(m.execStreamStdout, m.execStreamStderr)
 	return types.HijackedResponse{
@@ -576,4 +587,96 @@ func TestLiveDockerIntegration(t *testing.T) {
 	content, err := os.ReadFile(hostFile)
 	require.NoError(t, err)
 	assert.Contains(t, string(content), "hello from container")
+}
+
+func TestDockerDriver_PrepareJob_StartFailure_CleansUpContainer(t *testing.T) {
+	mockCli := newMockDockerClient()
+	mockCli.startError = errors.New("cannot start container: port already in use")
+
+	drv := NewDriver(mockCli, true)
+
+	tempDir := t.TempDir()
+	jobCtx := &driver.JobContext{
+		JobID:        "job-start-fail",
+		WorkspaceDir: filepath.Join(tempDir, "workspace"),
+		TempDir:      filepath.Join(tempDir, "temp"),
+		Container: &protocol.JobContainer{
+			Image: "alpine:latest",
+		},
+	}
+
+	err := drv.PrepareJob(context.Background(), jobCtx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "start container: cannot start container")
+
+	// ContainerRemove must have been called during start failure cleanup
+	assert.Equal(t, mockCli.createResponseID, mockCli.removedContainerID)
+	assert.True(t, mockCli.removedOptions.Force)
+	assert.True(t, mockCli.removedOptions.RemoveVolumes)
+
+	// Subsequent CleanupJob also runs without issue
+	cleanupErr := drv.CleanupJob(context.Background())
+	require.NoError(t, cleanupErr)
+}
+
+func TestDockerDriver_ExecuteStep_ContextCancellation_BreaksDeadlock(t *testing.T) {
+	mockCli := newMockDockerClient()
+
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	conn := &mockConn{
+		onClose: func() {
+			_ = pw.Close()
+		},
+	}
+
+	mockCli.customHijacked = &types.HijackedResponse{
+		Reader: bufio.NewReader(pr),
+		Conn:   conn,
+	}
+
+	drv := NewDriver(mockCli, true)
+
+	tempDir := t.TempDir()
+	jobCtx := &driver.JobContext{
+		JobID:        "job-cancel-test",
+		WorkspaceDir: filepath.Join(tempDir, "workspace"),
+		TempDir:      filepath.Join(tempDir, "temp"),
+		Container: &protocol.JobContainer{
+			Image: "alpine:latest",
+		},
+	}
+	require.NoError(t, drv.PrepareJob(context.Background(), jobCtx))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	step := &driver.StepSpec{
+		ID:     "step-hang",
+		Script: "sleep 100",
+	}
+
+	var stdout, stderr bytes.Buffer
+	done := make(chan struct{})
+	var res *driver.StepResult
+	var stepErr error
+
+	go func() {
+		res, stepErr = drv.ExecuteStep(ctx, step, &stdout, &stderr)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Succeeded in breaking out
+	case <-time.After(3 * time.Second):
+		t.Fatal("ExecuteStep deadlocked on cancelled context")
+	}
+
+	require.Error(t, stepErr)
+	assert.True(t, conn.closeCalled.Load(), "expected attachResp.Conn.Close() to be called on context cancel")
+	if res != nil {
+		assert.NotEqual(t, 0, res.ExitCode)
+	}
 }

@@ -148,14 +148,20 @@ func (d *Driver) PrepareJob(ctx context.Context, job *driver.JobContext) error {
 		return fmt.Errorf("create container: %w", err)
 	}
 
-	if err := d.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-		return fmt.Errorf("start container: %w", err)
-	}
-
 	d.mu.Lock()
 	d.containerID = resp.ID
 	d.jobCtx = job
 	d.mu.Unlock()
+
+	if err := d.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		_ = d.cli.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{
+			Force:         true,
+			RemoveVolumes: true,
+		})
+		cancel()
+		return fmt.Errorf("start container: %w", err)
+	}
 
 	return nil
 }
@@ -273,11 +279,24 @@ func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout,
 		step.OnProcessStart(1, 1)
 	}
 
+	stopWatcher := make(chan struct{})
+	defer close(stopWatcher)
+	go func() {
+		select {
+		case <-ctx.Done():
+			attachResp.Close()
+		case <-stopWatcher:
+		}
+	}()
+
 	// Demultiplex container stdout and stderr streams
 	_, _ = stdcopy.StdCopy(stdout, stderr, attachResp.Reader)
 
 	inspectResp, err := d.cli.ContainerExecInspect(ctx, execResp.ID)
 	if err != nil {
+		if ctx.Err() != nil {
+			return &driver.StepResult{ExitCode: 1, Error: ctx.Err()}, ctx.Err()
+		}
 		return nil, fmt.Errorf("container exec inspect: %w", err)
 	}
 
@@ -294,6 +313,12 @@ func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout,
 	var stepErr error
 	if exitCode != 0 {
 		stepErr = fmt.Errorf("command failed with exit code %d", exitCode)
+	}
+	if ctx.Err() != nil {
+		stepErr = ctx.Err()
+		if exitCode == 0 {
+			exitCode = 1
+		}
 	}
 
 	return &driver.StepResult{

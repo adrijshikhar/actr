@@ -1618,3 +1618,81 @@ func TestCoordinator_ResolveDriver(t *testing.T) {
 		t.Errorf("expected 'nil driver', got %q", err.Error())
 	}
 }
+
+func TestCoordinator_ExecuteJob_PrepareJobFailure_ReturnsCompleteJobRequestFailure(t *testing.T) {
+	workDir := t.TempDir()
+	mock := &mockDriver{
+		prepareFunc: func(ctx context.Context, job *driver.JobContext) error {
+			return errors.New("docker pull rate limit exceeded")
+		},
+	}
+	coord := NewCoordinator(mock, nil, workDir)
+
+	job := &protocol.JobSpecification{
+		JobID:   "job-fail-prep",
+		PlanID:  "plan-fail-prep",
+		JobName: "Fail Prep Job",
+		Steps: []protocol.JobStep{
+			{ID: "step-1", Name: "Echo", Type: "script", Script: "echo should not run"},
+		},
+	}
+
+	completeReq, err := coord.ExecuteJob(context.Background(), job, "", "")
+	if err == nil {
+		t.Fatal("expected error from ExecuteJob when PrepareJob fails, got nil")
+	}
+	if completeReq == nil {
+		t.Fatal("expected non-nil CompleteJobRequest when PrepareJob fails, got nil")
+	}
+	if completeReq.JobID != "job-fail-prep" {
+		t.Errorf("expected JobID 'job-fail-prep', got %q", completeReq.JobID)
+	}
+	if completeReq.PlanID != "plan-fail-prep" {
+		t.Errorf("expected PlanID 'plan-fail-prep', got %q", completeReq.PlanID)
+	}
+	if completeReq.Conclusion != "failure" {
+		t.Errorf("expected Conclusion 'failure', got %q", completeReq.Conclusion)
+	}
+	if completeReq.Outputs == nil {
+		t.Error("expected non-nil Outputs map")
+	}
+}
+
+func TestCoordinator_ExecuteJob_TimeoutEnforced(t *testing.T) {
+	workDir := t.TempDir()
+	mock := &mockDriver{
+		executeFunc: func(ctx context.Context, step *driver.StepSpec, stdout, stderr io.Writer) (*driver.StepResult, error) {
+			select {
+			case <-time.After(1 * time.Second):
+				return &driver.StepResult{ExitCode: 0}, nil
+			case <-ctx.Done():
+				return &driver.StepResult{ExitCode: 1, Error: ctx.Err()}, ctx.Err()
+			}
+		},
+	}
+
+	limits := &config.LimitsConfig{
+		Timeout: 50 * time.Millisecond,
+	}
+	coord := NewCoordinator(mock, nil, workDir).WithLimits(limits)
+
+	job := &protocol.JobSpecification{
+		JobID:   "job-timeout",
+		PlanID:  "plan-timeout",
+		JobName: "Timeout Job",
+		Steps: []protocol.JobStep{
+			{ID: "step-long", Name: "Long step", Script: "sleep 10"},
+		},
+	}
+
+	completeReq, err := coord.ExecuteJob(context.Background(), job, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error from ExecuteJob: %v", err)
+	}
+	if completeReq == nil {
+		t.Fatal("expected non-nil CompleteJobRequest")
+	}
+	if completeReq.Conclusion != "cancelled" {
+		t.Errorf("expected Conclusion 'cancelled' on timeout, got %q", completeReq.Conclusion)
+	}
+}
