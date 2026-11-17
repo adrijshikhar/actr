@@ -18,6 +18,9 @@ import (
 
 var validIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_\-\.]+$`)
 
+// ErrCorruptedIndex indicates that index.json exists but failed to unmarshal.
+var ErrCorruptedIndex = errors.New("corrupted index catalog")
+
 // sanitizeID verifies that id contains only alphanumeric characters, underscores,
 // hyphens, and dots, is not empty, does not contain "..", and is not ".".
 func sanitizeID(id string) (string, error) {
@@ -107,6 +110,7 @@ func NewDiskStore(baseDir string) (*DiskStore, error) {
 	if err := os.MkdirAll(baseDir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create base directory %s: %w", baseDir, err)
 	}
+	_ = os.Chmod(baseDir, 0700)
 
 	indexPath := filepath.Join(baseDir, "index.json")
 	if _, err := os.Stat(indexPath); os.IsNotExist(err) {
@@ -156,9 +160,11 @@ func (s *DiskStore) StartRun(job *monitor.JobInfo, limits *config.LimitsConfig, 
 				Version: 1,
 				Runs:    []*RunSummary{},
 			}
-		} else {
+		} else if errors.Is(err, ErrCorruptedIndex) {
 			_ = s.backupCorruptIndex(indexPath)
 			return fmt.Errorf("failed to load index catalog: %w", err)
+		} else {
+			return fmt.Errorf("failed to read index catalog: %w", err)
 		}
 	}
 
@@ -279,9 +285,11 @@ func (s *DiskStore) FinishRun(jobID string, status monitor.StepStatus, metrics *
 				Version: 1,
 				Runs:    []*RunSummary{},
 			}
-		} else {
+		} else if errors.Is(err, ErrCorruptedIndex) {
 			_ = s.backupCorruptIndex(indexPath)
 			return fmt.Errorf("failed to load index catalog: %w", err)
+		} else {
+			return fmt.Errorf("failed to read index catalog: %w", err)
 		}
 	}
 
@@ -474,7 +482,7 @@ func (s *DiskStore) loadIndexLocked() (*IndexCatalog, error) {
 
 	var catalog IndexCatalog
 	if err := json.Unmarshal(data, &catalog); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", ErrCorruptedIndex, err)
 	}
 	if catalog.Runs == nil {
 		catalog.Runs = []*RunSummary{}
@@ -485,6 +493,12 @@ func (s *DiskStore) loadIndexLocked() (*IndexCatalog, error) {
 
 func (s *DiskStore) sortRuns(runs []*RunSummary) {
 	sort.Slice(runs, func(i, j int) bool {
+		if runs[i] == nil {
+			return false
+		}
+		if runs[j] == nil {
+			return true
+		}
 		if runs[i].StartedAt.Equal(runs[j].StartedAt) {
 			return runs[i].ID > runs[j].ID
 		}
