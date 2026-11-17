@@ -2222,3 +2222,354 @@ func TestDynamicToolchainIngestion(t *testing.T) {
 		}
 	})
 }
+
+func TestIngestStateFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "state.txt")
+	content := "KEY1=VAL1\nKEY2<<EOF\nline1\nline2\nEOF\nKEY3=VAL3\n"
+	if err := os.WriteFile(stateFile, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := IngestStateFile(stateFile)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if state["KEY1"] != "VAL1" {
+		t.Errorf("expected KEY1=VAL1, got %q", state["KEY1"])
+	}
+	if state["KEY2"] != "line1\nline2" {
+		t.Errorf("expected KEY2 to be 'line1\\nline2', got %q", state["KEY2"])
+	}
+	if state["KEY3"] != "VAL3" {
+		t.Errorf("expected KEY3=VAL3, got %q", state["KEY3"])
+	}
+
+	info, err := os.Stat(stateFile)
+	if err != nil {
+		t.Fatalf("failed to stat state file: %v", err)
+	}
+	if info.Size() != 0 {
+		t.Errorf("expected state file to be truncated to 0 bytes, got %d", info.Size())
+	}
+}
+
+func TestPostStepExecution(t *testing.T) {
+	detector := action.NewHostNodeDetector("")
+	if _, err := detector.Detect(context.Background()); err != nil {
+		t.Skipf("Node.js runtime not found on host, skipping: %v", err)
+	}
+
+	t.Run("LIFO post-step hook execution order", func(t *testing.T) {
+		workDir := t.TempDir()
+		orderLog := filepath.Join(workDir, "execution_order.log")
+
+		// Create Action 1 with post script
+		action1Dir := filepath.Join(workDir, "action1")
+		if err := os.MkdirAll(action1Dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(action1Dir, "action.yml"), []byte(`
+name: "Action One"
+runs:
+  using: "node20"
+  main: "main.js"
+  post: "post.js"
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(action1Dir, "main.js"), []byte(`
+const fs = require('fs');
+fs.appendFileSync(process.env.ORDER_LOG, 'main-1\n');
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(action1Dir, "post.js"), []byte(`
+const fs = require('fs');
+fs.appendFileSync(process.env.ORDER_LOG, 'post-1\n');
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create Action 2 with post script
+		action2Dir := filepath.Join(workDir, "action2")
+		if err := os.MkdirAll(action2Dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(action2Dir, "action.yml"), []byte(`
+name: "Action Two"
+runs:
+  using: "node20"
+  main: "main.js"
+  post: "post.js"
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(action2Dir, "main.js"), []byte(`
+const fs = require('fs');
+fs.appendFileSync(process.env.ORDER_LOG, 'main-2\n');
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(action2Dir, "post.js"), []byte(`
+const fs = require('fs');
+fs.appendFileSync(process.env.ORDER_LOG, 'post-2\n');
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		mock := &mockDriver{}
+		coord := NewCoordinator(mock, nil, workDir).WithActionResolver(&mockActionResolver{
+			resolveFn: func(ctx context.Context, ref *protocol.StepReference) (string, error) {
+				if ref.Name == "actions/action1" {
+					return action1Dir, nil
+				}
+				if ref.Name == "actions/action2" {
+					return action2Dir, nil
+				}
+				return "", errors.New("not found")
+			},
+		})
+
+		job := &protocol.JobSpecification{
+			JobID:   "job-lifo",
+			JobName: "LIFO Job",
+			Variables: map[string]string{
+				"ORDER_LOG": orderLog,
+			},
+			Steps: []protocol.JobStep{
+				{
+					ID:   "step-1",
+					Name: "First Action",
+					Type: "uses",
+					Reference: &protocol.StepReference{
+						Name:    "actions/action1",
+						Version: "v1",
+					},
+				},
+				{
+					ID:   "step-2",
+					Name: "Second Action",
+					Type: "uses",
+					Reference: &protocol.StepReference{
+						Name:    "actions/action2",
+						Version: "v1",
+					},
+				},
+			},
+		}
+
+		completeReq, err := coord.ExecuteJob(context.Background(), job, "", "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if completeReq.Conclusion != "success" {
+			t.Fatalf("expected success, got %q", completeReq.Conclusion)
+		}
+
+		data, err := os.ReadFile(orderLog)
+		if err != nil {
+			t.Fatalf("failed to read order log: %v", err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		expected := []string{"main-1", "main-2", "post-2", "post-1"}
+		if len(lines) != len(expected) {
+			t.Fatalf("expected %d entries %v, got %d %v", len(expected), expected, len(lines), lines)
+		}
+		for i, exp := range expected {
+			if lines[i] != exp {
+				t.Errorf("at index %d: expected %q, got %q", i, exp, lines[i])
+			}
+		}
+	})
+
+	t.Run("Execution under cancelled job context", func(t *testing.T) {
+		workDir := t.TempDir()
+		postLog := filepath.Join(workDir, "cancelled_post.log")
+
+		actionDir := filepath.Join(workDir, "action-cancel")
+		if err := os.MkdirAll(actionDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(actionDir, "action.yml"), []byte(`
+name: "Cancel Action"
+runs:
+  using: "node20"
+  main: "main.js"
+  post: "post.js"
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(actionDir, "main.js"), []byte(`
+console.log("main ran successfully");
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(actionDir, "post.js"), []byte(`
+const fs = require('fs');
+fs.writeFileSync(process.env.POST_LOG, 'post-ran-despite-cancel\n');
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+
+		mock := &mockDriver{
+			executeFunc: func(stepCtx context.Context, spec *driver.StepSpec, stdout, stderr io.Writer) (*driver.StepResult, error) {
+				// Cancel context when step 2 starts
+				cancel()
+				<-stepCtx.Done()
+				return &driver.StepResult{ExitCode: 1, Error: stepCtx.Err()}, stepCtx.Err()
+			},
+		}
+
+		coord := NewCoordinator(mock, nil, workDir).WithActionResolver(&mockActionResolver{
+			resolveFn: func(ctx context.Context, ref *protocol.StepReference) (string, error) {
+				if ref.Name == "actions/cancel" {
+					return actionDir, nil
+				}
+				return "", errors.New("not found")
+			},
+		})
+
+		job := &protocol.JobSpecification{
+			JobID:   "job-cancel",
+			JobName: "Cancel Job",
+			Variables: map[string]string{
+				"POST_LOG": postLog,
+			},
+			Steps: []protocol.JobStep{
+				{
+					ID:   "step-1",
+					Name: "Action step",
+					Type: "uses",
+					Reference: &protocol.StepReference{
+						Name:    "actions/cancel",
+						Version: "v1",
+					},
+				},
+				{
+					ID:     "step-2",
+					Name:   "Long step to be cancelled",
+					Type:   "script",
+					Script: "sleep 10",
+				},
+			},
+		}
+
+		completeReq, err := coord.ExecuteJob(ctx, job, "", "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if completeReq.Conclusion != "cancelled" {
+			t.Fatalf("expected conclusion 'cancelled', got %q", completeReq.Conclusion)
+		}
+
+		// Post hook MUST have run despite cancellation
+		data, err := os.ReadFile(postLog)
+		if err != nil {
+			t.Fatalf("post hook did not run, failed to read log: %v", err)
+		}
+		if strings.TrimSpace(string(data)) != "post-ran-despite-cancel" {
+			t.Fatalf("expected 'post-ran-despite-cancel', got %q", string(data))
+		}
+	})
+
+	t.Run("STATE injection into post step environment", func(t *testing.T) {
+		workDir := t.TempDir()
+		stateOutputLog := filepath.Join(workDir, "state_output.log")
+
+		actionDir := filepath.Join(workDir, "action-state")
+		if err := os.MkdirAll(actionDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(actionDir, "action.yml"), []byte(`
+name: "State Action"
+runs:
+  using: "node20"
+  main: "main.js"
+  post: "post.js"
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(actionDir, "main.js"), []byte(`
+const fs = require('fs');
+// Single line state
+fs.appendFileSync(process.env.GITHUB_STATE, 'auth_token=secret_token_123\n');
+fs.appendFileSync(process.env.GITHUB_STATE, 'my key=spaced value\n');
+// Multiline delimiter state
+fs.appendFileSync(process.env.GITHUB_STATE, 'cert<<EOF\nline1\nline2\nEOF\n');
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(actionDir, "post.js"), []byte(`
+const fs = require('fs');
+const token = process.env['STATE_AUTH_TOKEN'] || '';
+const spaced = process.env['STATE_MY_KEY'] || '';
+const cert = process.env['STATE_CERT'] || '';
+const out = JSON.stringify({
+  token: token,
+  spaced: spaced,
+  cert: cert
+});
+fs.writeFileSync(process.env.STATE_OUT_LOG, out);
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		mock := &mockDriver{}
+		coord := NewCoordinator(mock, nil, workDir).WithActionResolver(&mockActionResolver{
+			resolveFn: func(ctx context.Context, ref *protocol.StepReference) (string, error) {
+				if ref.Name == "actions/state" {
+					return actionDir, nil
+				}
+				return "", errors.New("not found")
+			},
+		})
+
+		job := &protocol.JobSpecification{
+			JobID:   "job-state",
+			JobName: "State Job",
+			Variables: map[string]string{
+				"STATE_OUT_LOG": stateOutputLog,
+			},
+			Steps: []protocol.JobStep{
+				{
+					ID:   "step-state",
+					Name: "State step",
+					Type: "uses",
+					Reference: &protocol.StepReference{
+						Name:    "actions/state",
+						Version: "v1",
+					},
+				},
+			},
+		}
+
+		completeReq, err := coord.ExecuteJob(context.Background(), job, "", "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if completeReq.Conclusion != "success" {
+			t.Fatalf("expected success, got %q", completeReq.Conclusion)
+		}
+
+		data, err := os.ReadFile(stateOutputLog)
+		if err != nil {
+			t.Fatalf("failed to read state output log: %v", err)
+		}
+		var parsed map[string]string
+		if err := json.Unmarshal(data, &parsed); err != nil {
+			t.Fatalf("failed to parse json output: %v, raw: %s", err, string(data))
+		}
+		if parsed["token"] != "secret_token_123" {
+			t.Errorf("expected token 'secret_token_123', got %q", parsed["token"])
+		}
+		if parsed["spaced"] != "spaced value" {
+			t.Errorf("expected spaced 'spaced value', got %q", parsed["spaced"])
+		}
+		if parsed["cert"] != "line1\nline2" {
+			t.Errorf("expected cert 'line1\\nline2', got %q", parsed["cert"])
+		}
+	})
+}

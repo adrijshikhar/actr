@@ -46,6 +46,16 @@ type Coordinator struct {
 	mu                sync.RWMutex
 }
 
+// PostStepHook represents a queued teardown hook for an action step.
+type PostStepHook struct {
+	StepID     string
+	StepName   string
+	ActionDir  string
+	PostScript string
+	Env        map[string]string
+	State      map[string]string
+}
+
 // NewCoordinator creates a new Coordinator with the provided driver, RunServiceClient, and base working directory.
 func NewCoordinator(d driver.Driver, runClient *protocol.RunServiceClient, workDir string) *Coordinator {
 	if workDir == "" {
@@ -582,6 +592,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	stepResults := make([]protocol.StepResult, 0, len(job.Steps))
 	outputs := make(map[string]string)
 	conclusion = "success"
+	var postHooks []PostStepHook
 
 	stdout := c.stdout
 	if stdout == nil {
@@ -717,10 +728,11 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 
 		var res *driver.StepResult
 		var stepErr error
+		var actCtx *action.ActionContext
 
 		if isActionStep(step) {
 			ref := getStepReference(step)
-			actCtx := &action.ActionContext{
+			actCtx = &action.ActionContext{
 				StepID:         stepID,
 				Inputs:         step.Inputs,
 				Env:            stepEnv,
@@ -780,6 +792,36 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		}
 
 		// Step succeeded: parse environment, output, and path files
+		if isActionStep(step) {
+			stepState, err := IngestStateFile(statePath)
+			if err != nil {
+				c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusFailed)
+				stepResults = append(stepResults, protocol.StepResult{
+					ID:         stepID,
+					Conclusion: "failure",
+					ExitCode:   1,
+				})
+				cleanupStepFiles()
+				conclusion = "failure"
+				break
+			}
+			if actCtx != nil && actCtx.Manifest != nil && strings.TrimSpace(actCtx.Manifest.Runs.Post) != "" {
+				postScript := actCtx.Manifest.Runs.Post
+				hookEnv := make(map[string]string, len(stepEnv))
+				for k, v := range stepEnv {
+					hookEnv[k] = v
+				}
+				postHooks = append(postHooks, PostStepHook{
+					StepID:     stepID,
+					StepName:   stepDisplayName,
+					ActionDir:  actCtx.ActionDir,
+					PostScript: postScript,
+					Env:        hookEnv,
+					State:      stepState,
+				})
+			}
+		}
+
 		if err := IngestEnvFile(envPath, cumulativeEnv); err != nil {
 			c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusFailed)
 			stepResults = append(stepResults, protocol.StepResult{
@@ -847,6 +889,15 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		})
 
 		cleanupStepFiles()
+	}
+
+	// Teardown block: execute post-step hooks in reverse order (LIFO) with decoupled context
+	if len(postHooks) > 0 {
+		if postErr := c.executePostHooks(ctx, jobID, postHooks, stepLogger, jobMasker); postErr != nil {
+			if conclusion == "success" {
+				conclusion = "failure"
+			}
+		}
 	}
 
 	return &protocol.CompleteJobRequest{
@@ -1388,5 +1439,190 @@ func IngestEnvFile(filePath string, currentEnv map[string]string) error {
 		}
 	}
 
+	return nil
+}
+
+// IngestStateFile parses KEY=VAL and delimiter syntax from state file.
+func IngestStateFile(filePath string) (map[string]string, error) {
+	if filePath == "" {
+		return make(map[string]string), nil
+	}
+
+	state, err := ParseCommandFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := os.Truncate(filePath, 0); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	if state == nil {
+		state = make(map[string]string)
+	}
+	return state, nil
+}
+
+// ExecutePostHooks executes post-step hooks in reverse order (LIFO) with a decoupled context.
+func (c *Coordinator) ExecutePostHooks(ctx context.Context, jobID string, postHooks []PostStepHook) error {
+	return c.executePostHooks(ctx, jobID, postHooks, nil, nil)
+}
+
+// executePostHooks executes all queued post-step hooks in reverse order (LIFO).
+// It decouples from the job context using context.WithoutCancel with a 5-minute timeout.
+func (c *Coordinator) executePostHooks(ctx context.Context, jobID string, postHooks []PostStepHook, stepLogger *StepLogger, jobMasker *SecretMasker) error {
+	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
+	defer postCancel()
+
+	detector := c.getNodeDetector()
+	nodePath, err := detector.Detect(postCtx)
+	if err != nil {
+		c.NotifyJobStepLog(jobID, "", fmt.Sprintf("Error detecting Node runtime for post hooks: %v", err))
+		return err
+	}
+
+	var firstErr error
+	for i := len(postHooks) - 1; i >= 0; i-- {
+		hook := postHooks[i]
+		if err := c.executeSinglePostHook(postCtx, jobID, hook, nodePath, stepLogger, jobMasker); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
+func (c *Coordinator) executeSinglePostHook(ctx context.Context, jobID string, hook PostStepHook, nodePath string, stepLogger *StepLogger, jobMasker *SecretMasker) error {
+	postEnv := make(map[string]string, len(hook.Env)+len(hook.State)+10)
+	for k, v := range hook.Env {
+		postEnv[k] = v
+	}
+
+	for k, v := range hook.State {
+		upperKey := "STATE_" + strings.ToUpper(strings.ReplaceAll(k, " ", "_"))
+		postEnv[upperKey] = v
+		if _, exists := postEnv["STATE_"+k]; !exists {
+			postEnv["STATE_"+k] = v
+		}
+	}
+
+	scriptPath := hook.PostScript
+	if !filepath.IsAbs(scriptPath) && hook.ActionDir != "" {
+		scriptPath = filepath.Join(hook.ActionDir, scriptPath)
+	}
+
+	workspaceDir := postEnv["GITHUB_WORKSPACE"]
+	if workspaceDir == "" {
+		workspaceDir = hook.ActionDir
+	}
+	tempDir := postEnv["RUNNER_TEMP"]
+
+	actCtx := &action.ActionContext{
+		StepID:       hook.StepID,
+		ActionDir:    hook.ActionDir,
+		Env:          postEnv,
+		WorkspaceDir: workspaceDir,
+		TempDir:      tempDir,
+	}
+
+	if hook.ActionDir != "" {
+		if manifest, err := action.ParseManifestFile(hook.ActionDir); err == nil {
+			actCtx.Manifest = manifest
+		}
+	}
+
+	if tempDir != "" {
+		if sf, err := os.CreateTemp(tempDir, fmt.Sprintf("post_state_%s_*.txt", hook.StepID)); err == nil {
+			actCtx.StatePath = sf.Name()
+			_ = sf.Close()
+			defer func() { _ = os.Remove(actCtx.StatePath) }()
+		}
+		if of, err := os.CreateTemp(tempDir, fmt.Sprintf("post_out_%s_*.txt", hook.StepID)); err == nil {
+			actCtx.OutputFilePath = of.Name()
+			_ = of.Close()
+			defer func() { _ = os.Remove(actCtx.OutputFilePath) }()
+		}
+		if ef, err := os.CreateTemp(tempDir, fmt.Sprintf("post_env_%s_*.txt", hook.StepID)); err == nil {
+			actCtx.EnvFilePath = ef.Name()
+			_ = ef.Close()
+			defer func() { _ = os.Remove(actCtx.EnvFilePath) }()
+		}
+		if pf, err := os.CreateTemp(tempDir, fmt.Sprintf("post_path_%s_*.txt", hook.StepID)); err == nil {
+			actCtx.PathFilePath = pf.Name()
+			_ = pf.Close()
+			defer func() { _ = os.Remove(actCtx.PathFilePath) }()
+		}
+	}
+
+	stdout := c.stdout
+	if stdout == nil {
+		stdout = os.Stdout
+	}
+	stderr := c.stderr
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+
+	stepDisplayName := hook.StepName
+	if stepDisplayName == "" {
+		stepDisplayName = hook.StepID
+	}
+	stepDisplayName = "Post " + stepDisplayName
+
+	if jobMasker == nil {
+		if stepLogger != nil {
+			jobMasker = stepLogger.Masker()
+		} else {
+			jobMasker = NewSecretMasker()
+		}
+	}
+
+	var stepOutWriter *StepWriter
+	var stepErrWriter *StepWriter
+
+	if stepLogger != nil {
+		stepLogger.LogStepStart(stepDisplayName, fmt.Sprintf("Post action %s", hook.PostScript))
+		stepOutWriter = stepLogger.NewWriter("stdout")
+		stepErrWriter = stepLogger.NewWriter("stderr")
+		stepOutWriter.WithCallback(func(line string) {
+			c.NotifyJobStepLog(jobID, hook.StepID, line)
+		})
+		stepErrWriter.WithCallback(func(line string) {
+			c.NotifyJobStepLog(jobID, hook.StepID, line)
+		})
+		stdout = stepOutWriter
+		stderr = stepErrWriter
+	} else {
+		lineOutWriter := NewLineWriter(func(line string) {
+			c.NotifyJobStepLog(jobID, hook.StepID, line)
+		}).WithMasker(jobMasker)
+		lineErrWriter := NewLineWriter(func(line string) {
+			c.NotifyJobStepLog(jobID, hook.StepID, line)
+		}).WithMasker(jobMasker)
+		stdout = io.MultiWriter(stdout, lineOutWriter)
+		stderr = io.MultiWriter(stderr, lineErrWriter)
+		stepOutWriter = lineOutWriter
+		stepErrWriter = lineErrWriter
+	}
+
+	startTime := time.Now()
+	execErr := action.ExecuteNodeAction(ctx, nodePath, scriptPath, actCtx, stdout, stderr)
+	if stepOutWriter != nil {
+		stepOutWriter.Flush()
+	}
+	if stepErrWriter != nil {
+		stepErrWriter.Flush()
+	}
+	duration := time.Since(startTime)
+	success := execErr == nil
+	if stepLogger != nil {
+		stepLogger.LogStepEnd(stepDisplayName, success, duration)
+	}
+
+	if execErr != nil {
+		c.NotifyJobStepLog(jobID, hook.StepID, fmt.Sprintf("Error executing post step %s: %v", hook.StepID, execErr))
+		return execErr
+	}
 	return nil
 }
