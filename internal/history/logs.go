@@ -4,13 +4,23 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/adrijshikhar/actr/internal/monitor"
 )
+
+type stepStats struct {
+	bytes atomic.Int64
+	lines atomic.Int64
+}
 
 // getStepLock returns or initializes the per-step RWMutex for synchronizing concurrent access.
 func (s *DiskStore) getStepLock(jobID, stepID string) *sync.RWMutex {
@@ -21,7 +31,7 @@ func (s *DiskStore) getStepLock(jobID, stepID string) *sync.RWMutex {
 
 // AppendStepLog appends a log line to <baseDir>/<jobID>/steps/<stepID>.log, ensuring parent directory
 // exists, line has newline termination, and step metadata statistics (LogBytes, LogLines) are updated
-// if the step is tracked in meta.json.
+// in memory without blocking disk fsync.
 func (s *DiskStore) AppendStepLog(jobID, stepID, line string) error {
 	logPath, err := s.stepLogPath(jobID, stepID)
 	if err != nil {
@@ -65,7 +75,111 @@ func (s *DiskStore) AppendStepLog(jobID, stepID, line string) error {
 	}
 	lock.Unlock()
 
-	s.updateStepMeta(jobID, stepID, byteCount, lineCount)
+	// In-memory tracking of step line counts and byte counts during streaming
+	key := jobID + "/" + stepID
+	val, _ := s.stepStats.LoadOrStore(key, &stepStats{})
+	stat := val.(*stepStats)
+	stat.bytes.Add(byteCount)
+	stat.lines.Add(int64(lineCount))
+
+	return nil
+}
+
+// FinishStep finalizes an individual step in meta.json with the provided conclusion,
+// exit code, and finish timestamp, flushes accumulated in-memory log statistics,
+// and cleans up step locks and stats.
+func (s *DiskStore) FinishStep(jobID, stepID, conclusion string, exitCode int, finishedAt time.Time) error {
+	if jobID == "" {
+		return errors.New("empty job ID")
+	}
+	if stepID == "" {
+		return errors.New("empty step ID")
+	}
+
+	runDir, err := s.runDir(jobID)
+	if err != nil {
+		return fmt.Errorf("invalid job ID %q: %w", jobID, err)
+	}
+	cleanStepID, err := sanitizeID(stepID)
+	if err != nil {
+		return fmt.Errorf("invalid step ID %q: %w", stepID, err)
+	}
+
+	key := jobID + "/" + cleanStepID
+
+	// Acquire stepLock to ensure any in-flight append completes
+	lock := s.getStepLock(jobID, cleanStepID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	metaPath := filepath.Join(runDir, "meta.json")
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		return fmt.Errorf("failed to read run metadata for job %s: %w", jobID, err)
+	}
+
+	var meta RunMetadata
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return fmt.Errorf("failed to unmarshal run metadata for job %s: %w", jobID, err)
+	}
+
+	var target *StepMetadata
+	for _, st := range meta.Steps {
+		if st != nil && st.ID == cleanStepID {
+			target = st
+			break
+		}
+	}
+
+	if target == nil {
+		target = &StepMetadata{
+			ID:     cleanStepID,
+			Name:   cleanStepID,
+			Number: len(meta.Steps) + 1,
+		}
+		meta.Steps = append(meta.Steps, target)
+	}
+
+	status := monitor.StepStatus(conclusion)
+	if status == "" {
+		if exitCode != 0 {
+			status = monitor.StatusFailed
+		} else {
+			status = monitor.StatusSuccess
+		}
+	}
+	target.Status = status
+	target.ExitCode = exitCode
+
+	if finishedAt.IsZero() {
+		finishedAt = time.Now().UTC()
+	}
+	target.EndedAt = finishedAt
+	if !target.StartedAt.IsZero() {
+		dur := int64(target.EndedAt.Sub(target.StartedAt).Seconds())
+		if dur < 0 {
+			dur = 0
+		}
+		target.DurationSec = dur
+	}
+
+	// Flush accumulated in-memory stats
+	if val, ok := s.stepStats.LoadAndDelete(key); ok {
+		stat := val.(*stepStats)
+		target.LogBytes += stat.bytes.Load()
+		target.LogLines += int(stat.lines.Load())
+	}
+
+	// Remove step lock entry from map
+	s.stepLocks.Delete(key)
+
+	if err := writeJSONAtomic(metaPath, &meta); err != nil {
+		return fmt.Errorf("failed to update run metadata for job %s: %w", jobID, err)
+	}
+
 	return nil
 }
 
@@ -120,40 +234,4 @@ func (s *DiskStore) GetStepLogReader(jobID, stepID string) (io.ReadCloser, error
 		return nil, err
 	}
 	return f, nil
-}
-
-// updateStepMeta atomically updates LogBytes and LogLines for stepID in meta.json if it exists.
-func (s *DiskStore) updateStepMeta(jobID, stepID string, byteCount int64, lineCount int) {
-	runDir, err := s.runDir(jobID)
-	if err != nil {
-		return
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	metaPath := filepath.Join(runDir, "meta.json")
-	data, err := os.ReadFile(metaPath)
-	if err != nil {
-		return
-	}
-
-	var meta RunMetadata
-	if err := json.Unmarshal(data, &meta); err != nil {
-		return
-	}
-
-	updated := false
-	for _, st := range meta.Steps {
-		if st != nil && st.ID == stepID {
-			st.LogBytes += byteCount
-			st.LogLines += lineCount
-			updated = true
-			break
-		}
-	}
-
-	if updated {
-		_ = writeJSONAtomic(metaPath, &meta)
-	}
 }

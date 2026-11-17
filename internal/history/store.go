@@ -41,6 +41,7 @@ type DiskStore struct {
 	baseDir   string
 	mu        sync.RWMutex
 	stepLocks sync.Map
+	stepStats sync.Map
 }
 
 var _ Store = (*DiskStore)(nil)
@@ -317,6 +318,35 @@ func (s *DiskStore) FinishRun(jobID string, status monitor.StepStatus, metrics *
 		}
 	}
 
+	// Flush any in-memory step stats that haven't been finalized via FinishStep
+	for _, st := range meta.Steps {
+		if st == nil {
+			continue
+		}
+		key := jobID + "/" + st.ID
+		if val, ok := s.stepStats.LoadAndDelete(key); ok {
+			stat := val.(*stepStats)
+			st.LogBytes += stat.bytes.Load()
+			st.LogLines += int(stat.lines.Load())
+		}
+		s.stepLocks.Delete(key)
+	}
+
+	// Clean up any remaining step locks or stats for this job
+	prefix := jobID + "/"
+	s.stepLocks.Range(func(k, _ any) bool {
+		if ks, ok := k.(string); ok && strings.HasPrefix(ks, prefix) {
+			s.stepLocks.Delete(k)
+		}
+		return true
+	})
+	s.stepStats.Range(func(k, _ any) bool {
+		if ks, ok := k.(string); ok && strings.HasPrefix(ks, prefix) {
+			s.stepStats.Delete(k)
+		}
+		return true
+	})
+
 	if err := writeJSONAtomic(metaPath, &meta); err != nil {
 		return fmt.Errorf("failed to update run metadata for job %s: %w", jobID, err)
 	}
@@ -420,6 +450,18 @@ func (s *DiskStore) GetRun(jobID string) (*RunMetadata, error) {
 		return nil, fmt.Errorf("failed to unmarshal run metadata: %w", err)
 	}
 
+	for _, st := range meta.Steps {
+		if st == nil {
+			continue
+		}
+		key := jobID + "/" + st.ID
+		if val, ok := s.stepStats.Load(key); ok {
+			stat := val.(*stepStats)
+			st.LogBytes += stat.bytes.Load()
+			st.LogLines += int(stat.lines.Load())
+		}
+	}
+
 	return &meta, nil
 }
 
@@ -500,4 +542,24 @@ func writeJSONAtomic(targetPath string, v any) error {
 
 	cleanup = false
 	return nil
+}
+
+// StepLockCount returns the current count of allocated step locks in memory (for testing and diagnostics).
+func (s *DiskStore) StepLockCount() int {
+	count := 0
+	s.stepLocks.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	return count
+}
+
+// StepStatsCount returns the current count of active step stat trackers in memory (for testing and diagnostics).
+func (s *DiskStore) StepStatsCount() int {
+	count := 0
+	s.stepStats.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	return count
 }

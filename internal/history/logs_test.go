@@ -1,6 +1,7 @@
 package history_test
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -258,4 +259,169 @@ func TestDiskStore_StepLog_UpdatesMetadata(t *testing.T) {
 	meta, err = store.GetRun(jobID)
 	require.NoError(t, err)
 	require.Len(t, meta.Steps, 2)
+}
+
+func TestDiskStore_AppendStepLog_DecoupledFromDiskFsync(t *testing.T) {
+	tempDir := t.TempDir()
+	store, err := history.NewDiskStore(tempDir)
+	require.NoError(t, err)
+
+	jobID := "job-decoupled"
+	stepID := "step-compile"
+	now := time.Now().UTC()
+
+	job := &monitor.JobInfo{
+		ID:        jobID,
+		Name:      "test-decoupled",
+		Status:    monitor.StatusRunning,
+		StartedAt: now,
+		Steps: []*monitor.StepInfo{
+			{
+				ID:        stepID,
+				Name:      "Compile",
+				Number:    1,
+				Status:    monitor.StatusRunning,
+				StartedAt: now,
+			},
+		},
+	}
+	require.NoError(t, store.StartRun(job, nil, "docker"))
+
+	metaFilePath := filepath.Join(tempDir, jobID, "meta.json")
+	require.FileExists(t, metaFilePath)
+
+	// Append 10 log lines
+	var totalBytes int64
+	for i := 1; i <= 10; i++ {
+		line := fmt.Sprintf("Building module %d...\n", i)
+		totalBytes += int64(len(line))
+		require.NoError(t, store.AppendStepLog(jobID, stepID, line))
+	}
+
+	// Read meta.json DIRECTLY from disk without going through GetRun
+	rawDiskMeta, err := os.ReadFile(metaFilePath)
+	require.NoError(t, err)
+
+	var diskMeta monitor.RunMetadata
+	require.NoError(t, json.Unmarshal(rawDiskMeta, &diskMeta))
+	require.Len(t, diskMeta.Steps, 1)
+
+	// Crucial check: On disk, meta.json was NOT rewritten on each AppendStepLog call.
+	// LogBytes and LogLines remain 0 on disk until FinishStep or FinishRun is executed.
+	assert.Equal(t, int64(0), diskMeta.Steps[0].LogBytes, "disk meta.json must not be modified during hot log streaming")
+	assert.Equal(t, 0, diskMeta.Steps[0].LogLines, "disk meta.json must not be modified during hot log streaming")
+
+	// GetRun returns real-time in-memory counts
+	inMemoryMeta, err := store.GetRun(jobID)
+	require.NoError(t, err)
+	assert.Equal(t, totalBytes, inMemoryMeta.Steps[0].LogBytes)
+	assert.Equal(t, 10, inMemoryMeta.Steps[0].LogLines)
+
+	// Finalize step with FinishStep
+	finishedAt := now.Add(5 * time.Second)
+	err = store.FinishStep(jobID, stepID, string(monitor.StatusSuccess), 0, finishedAt)
+	require.NoError(t, err)
+
+	// Now read meta.json from disk again - it must be finalized with exact stats
+	rawDiskMetaAfter, err := os.ReadFile(metaFilePath)
+	require.NoError(t, err)
+	var diskMetaAfter monitor.RunMetadata
+	require.NoError(t, json.Unmarshal(rawDiskMetaAfter, &diskMetaAfter))
+	require.Len(t, diskMetaAfter.Steps, 1)
+
+	assert.Equal(t, monitor.StatusSuccess, diskMetaAfter.Steps[0].Status)
+	assert.Equal(t, 0, diskMetaAfter.Steps[0].ExitCode)
+	assert.Equal(t, totalBytes, diskMetaAfter.Steps[0].LogBytes)
+	assert.Equal(t, 10, diskMetaAfter.Steps[0].LogLines)
+	assert.Equal(t, int64(5), diskMetaAfter.Steps[0].DurationSec)
+}
+
+func TestDiskStore_FinishStep_Detailed(t *testing.T) {
+	tempDir := t.TempDir()
+	store, err := history.NewDiskStore(tempDir)
+	require.NoError(t, err)
+
+	jobID := "job-finish-step"
+	stepID := "step-test-run"
+	now := time.Now().UTC()
+
+	job := &monitor.JobInfo{
+		ID:        jobID,
+		Name:      "test-run",
+		Status:    monitor.StatusRunning,
+		StartedAt: now,
+		Steps: []*monitor.StepInfo{
+			{
+				ID:        stepID,
+				Name:      "Run Tests",
+				Number:    1,
+				Status:    monitor.StatusRunning,
+				StartedAt: now,
+			},
+		},
+	}
+	require.NoError(t, store.StartRun(job, nil, "docker"))
+
+	// Stream log line
+	line := "FAIL: test_case_failure\n"
+	require.NoError(t, store.AppendStepLog(jobID, stepID, line))
+
+	// Finish step with failed conclusion and exit code 1
+	finishedAt := now.Add(12 * time.Second)
+	err = store.FinishStep(jobID, stepID, "failed", 1, finishedAt)
+	require.NoError(t, err)
+
+	meta, err := store.GetRun(jobID)
+	require.NoError(t, err)
+	require.Len(t, meta.Steps, 1)
+
+	step := meta.Steps[0]
+	assert.Equal(t, monitor.StatusFailed, step.Status)
+	assert.Equal(t, 1, step.ExitCode)
+	assert.Equal(t, int64(12), step.DurationSec)
+	assert.Equal(t, int64(len(line)), step.LogBytes)
+	assert.Equal(t, 1, step.LogLines)
+
+	// Validation on invalid inputs
+	assert.Error(t, store.FinishStep("", stepID, "success", 0, time.Now()))
+	assert.Error(t, store.FinishStep(jobID, "", "success", 0, time.Now()))
+	assert.Error(t, store.FinishStep("../invalid", stepID, "success", 0, time.Now()))
+}
+
+func TestDiskStore_StepLocks_CleanedUp(t *testing.T) {
+	tempDir := t.TempDir()
+	store, err := history.NewDiskStore(tempDir)
+	require.NoError(t, err)
+
+	jobID := "job-cleanup"
+	now := time.Now().UTC()
+
+	job := &monitor.JobInfo{
+		ID:        jobID,
+		Name:      "test-cleanup",
+		Status:    monitor.StatusRunning,
+		StartedAt: now,
+		Steps: []*monitor.StepInfo{
+			{ID: "step-1", Name: "Step 1", Number: 1, Status: monitor.StatusRunning, StartedAt: now},
+			{ID: "step-2", Name: "Step 2", Number: 2, Status: monitor.StatusRunning, StartedAt: now},
+		},
+	}
+	require.NoError(t, store.StartRun(job, nil, "docker"))
+
+	// Append to step-1 and step-2
+	require.NoError(t, store.AppendStepLog(jobID, "step-1", "log from step 1\n"))
+	require.NoError(t, store.AppendStepLog(jobID, "step-2", "log from step 2\n"))
+
+	assert.Equal(t, 2, store.StepLockCount(), "expected 2 active step locks")
+	assert.Equal(t, 2, store.StepStatsCount(), "expected 2 active step stats")
+
+	// Finish step-1
+	require.NoError(t, store.FinishStep(jobID, "step-1", "success", 0, time.Now()))
+	assert.Equal(t, 1, store.StepLockCount(), "expected 1 active step lock after step-1 finished")
+	assert.Equal(t, 1, store.StepStatsCount(), "expected 1 active step stats after step-1 finished")
+
+	// Finish entire run (should clean up step-2 and any remaining locks/stats)
+	require.NoError(t, store.FinishRun(jobID, monitor.StatusSuccess, nil))
+	assert.Equal(t, 0, store.StepLockCount(), "all step locks should be cleaned up after run finish")
+	assert.Equal(t, 0, store.StepStatsCount(), "all step stats should be cleaned up after run finish")
 }

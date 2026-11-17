@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -11,6 +12,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/adrijshikhar/actr/internal/config"
 )
 
 // Server provides an IPC server over a Unix domain socket for real-time
@@ -28,9 +31,10 @@ type Server struct {
 	stepLogs     map[string]*RingBuffer
 	telemetry    *TelemetrySample
 	historyStore HistoryStore
-	maxRuns      int
-	maxDiskBytes int64
-	peakMetrics  map[string]*RunMetricsSummary
+	maxRuns           int
+	maxDiskBytes      int64
+	peakMetrics       map[string]*RunMetricsSummary
+	lastTelemetryTime map[string]time.Time
 
 	subMu       sync.Mutex
 	subscribers map[chan Event]struct{}
@@ -40,16 +44,17 @@ type Server struct {
 // NewServer initializes a new Server.
 func NewServer(sockPath string, runnerName string) *Server {
 	return &Server{
-		sockPath:     sockPath,
-		runnerName:   runnerName,
-		jobs:         make(map[string]*JobInfo),
-		recentJobs:   make([]*JobInfo, 0),
-		activeJobs:   make([]*JobInfo, 0),
-		stepLogs:     make(map[string]*RingBuffer),
-		subscribers:  make(map[chan Event]struct{}),
-		maxRuns:      50,
-		maxDiskBytes: 200 * 1024 * 1024,
-		peakMetrics:  make(map[string]*RunMetricsSummary),
+		sockPath:          sockPath,
+		runnerName:        runnerName,
+		jobs:              make(map[string]*JobInfo),
+		recentJobs:        make([]*JobInfo, 0),
+		activeJobs:        make([]*JobInfo, 0),
+		stepLogs:          make(map[string]*RingBuffer),
+		subscribers:       make(map[chan Event]struct{}),
+		maxRuns:           50,
+		maxDiskBytes:      200 * 1024 * 1024,
+		peakMetrics:       make(map[string]*RunMetricsSummary),
+		lastTelemetryTime: make(map[string]time.Time),
 	}
 }
 
@@ -356,7 +361,36 @@ func (s *Server) Publish(ev Event) {
 		broadcastEv.Step = &sCopy
 	}
 
+	var (
+		store HistoryStore
+
+		doStartRun  bool
+		startJob    *JobInfo
+		startLimits *config.LimitsConfig
+		startDriver string
+
+		doFinishStep   bool
+		stepJobID      string
+		stepFinishID   string
+		stepConclusion string
+		stepFinishedAt time.Time
+
+		doAppendLog bool
+		logJobID    string
+		logStepID   string
+		logLine     string
+
+		doFinishRun   bool
+		finishJobID   string
+		finishStatus  StepStatus
+		finishMetrics *RunMetricsSummary
+		finishMaxRuns int
+		finishMaxDisk int64
+	)
+
 	s.mu.Lock()
+	store = s.historyStore
+
 	switch ev.Type {
 	case EventJobStart:
 		jobID := ev.JobID
@@ -395,12 +429,17 @@ func (s *Server) Publish(ev Event) {
 				s.activeJobs = append(s.activeJobs, job)
 			}
 			s.peakMetrics[jobID] = &RunMetricsSummary{}
-			if s.historyStore != nil {
+			if store != nil {
 				driver := ev.Driver
 				if driver == "" {
 					driver = "docker"
 				}
-				_ = s.historyStore.StartRun(job, ev.Limits, driver)
+				doStartRun = true
+				jCopy := *job
+				jCopy.Steps = append([]*StepInfo(nil), job.Steps...)
+				startJob = &jCopy
+				startLimits = ev.Limits
+				startDriver = driver
 			}
 		}
 	case EventJobFinish:
@@ -464,27 +503,27 @@ func (s *Server) Publish(ev Event) {
 			peakMetrics = metrics
 			delete(s.peakMetrics, jobID)
 		}
-		if s.historyStore != nil && jobID != "" {
-			finishStatus := StatusSuccess
-			if jobToSave != nil && jobToSave.Status != "" {
-				finishStatus = jobToSave.Status
-			} else if ev.Job != nil && ev.Job.Status != "" {
-				finishStatus = ev.Job.Status
-			}
-			_ = s.historyStore.FinishRun(jobID, finishStatus, peakMetrics)
+		delete(s.lastTelemetryTime, jobID)
 
-			maxRuns := s.maxRuns
-			if maxRuns <= 0 {
-				maxRuns = 50
+		if store != nil && jobID != "" {
+			fStatus := StatusSuccess
+			if jobToSave != nil && jobToSave.Status != "" {
+				fStatus = jobToSave.Status
+			} else if ev.Job != nil && ev.Job.Status != "" {
+				fStatus = ev.Job.Status
 			}
-			maxDiskBytes := s.maxDiskBytes
-			if maxDiskBytes <= 0 {
-				maxDiskBytes = 200 * 1024 * 1024
+			doFinishRun = true
+			finishJobID = jobID
+			finishStatus = fStatus
+			finishMetrics = peakMetrics
+			finishMaxRuns = s.maxRuns
+			if finishMaxRuns <= 0 {
+				finishMaxRuns = 50
 			}
-			hStore := s.historyStore
-			go func() {
-				_, _ = hStore.Prune(maxRuns, maxDiskBytes)
-			}()
+			finishMaxDisk = s.maxDiskBytes
+			if finishMaxDisk <= 0 {
+				finishMaxDisk = 200 * 1024 * 1024
+			}
 		}
 	case EventStepStart, EventStepFinish:
 		if ev.Step != nil && ev.JobID != "" {
@@ -518,6 +557,14 @@ func (s *Server) Publish(ev Event) {
 			if !found {
 				job.Steps = append(job.Steps, &stepClone)
 			}
+
+			if ev.Type == EventStepFinish && store != nil {
+				doFinishStep = true
+				stepJobID = ev.JobID
+				stepFinishID = ev.Step.ID
+				stepConclusion = string(ev.Step.Status)
+				stepFinishedAt = ev.Step.EndedAt
+			}
 		}
 	case EventStepLog:
 		if ev.StepID != "" {
@@ -529,13 +576,16 @@ func (s *Server) Publish(ev Event) {
 			}
 			rb.Append(ev.LogLine)
 
-			if s.historyStore != nil {
+			if store != nil {
 				targetJobID := ev.JobID
 				if targetJobID == "" && len(s.activeJobs) == 1 {
 					targetJobID = s.activeJobs[0].ID
 				}
 				if targetJobID != "" {
-					_ = s.historyStore.AppendStepLog(targetJobID, ev.StepID, ev.LogLine)
+					doAppendLog = true
+					logJobID = targetJobID
+					logStepID = ev.StepID
+					logLine = ev.LogLine
 				}
 			}
 		}
@@ -562,31 +612,62 @@ func (s *Server) Publish(ev Event) {
 				if ev.Telemetry.StepRSSBytes > peak.PeakRSSBytes {
 					peak.PeakRSSBytes = ev.Telemetry.StepRSSBytes
 				}
+
+				// Calculate elapsed delta time in seconds
+				deltaSeconds := 1.0
+				if !ev.Telemetry.Timestamp.IsZero() {
+					deltaSeconds = 0.5 // default 500ms sampling interval
+					if lastTime, ok := s.lastTelemetryTime[jID]; ok && !lastTime.IsZero() {
+						diff := ev.Telemetry.Timestamp.Sub(lastTime).Seconds()
+						if diff > 0 && diff < 60 {
+							deltaSeconds = diff
+						}
+					}
+					s.lastTelemetryTime[jID] = ev.Telemetry.Timestamp
+				}
+
 				if ev.Telemetry.NetRxBytes > 0 {
 					if ev.Telemetry.NetRxBytes > peak.TotalNetRxBytes {
 						peak.TotalNetRxBytes = ev.Telemetry.NetRxBytes
 					}
 				} else if ev.Telemetry.NetRxRate > 0 {
-					peak.TotalNetRxBytes += ev.Telemetry.NetRxRate
+					peak.TotalNetRxBytes += uint64(math.Round(float64(ev.Telemetry.NetRxRate) * deltaSeconds))
 				}
 				if ev.Telemetry.NetTxBytes > 0 {
 					if ev.Telemetry.NetTxBytes > peak.TotalNetTxBytes {
 						peak.TotalNetTxBytes = ev.Telemetry.NetTxBytes
 					}
 				} else if ev.Telemetry.NetTxRate > 0 {
-					peak.TotalNetTxBytes += ev.Telemetry.NetTxRate
+					peak.TotalNetTxBytes += uint64(math.Round(float64(ev.Telemetry.NetTxRate) * deltaSeconds))
 				}
 				if ev.Telemetry.DiskWrittenBytes > 0 {
 					if ev.Telemetry.DiskWrittenBytes > peak.TotalDiskWrittenBytes {
 						peak.TotalDiskWrittenBytes = ev.Telemetry.DiskWrittenBytes
 					}
 				} else if ev.Telemetry.DiskWriteRate > 0 {
-					peak.TotalDiskWrittenBytes += ev.Telemetry.DiskWriteRate
+					peak.TotalDiskWrittenBytes += uint64(math.Round(float64(ev.Telemetry.DiskWriteRate) * deltaSeconds))
 				}
 			}
 		}
 	}
 	s.mu.Unlock()
+
+	// Execute Disk Operations OUTSIDE s.mu.Lock()
+	if doStartRun {
+		_ = store.StartRun(startJob, startLimits, startDriver)
+	}
+	if doFinishStep {
+		_ = store.FinishStep(stepJobID, stepFinishID, stepConclusion, 0, stepFinishedAt)
+	}
+	if doAppendLog {
+		_ = store.AppendStepLog(logJobID, logStepID, logLine)
+	}
+	if doFinishRun {
+		_ = store.FinishRun(finishJobID, finishStatus, finishMetrics)
+		go func() {
+			_, _ = store.Prune(finishMaxRuns, finishMaxDisk)
+		}()
+	}
 
 	s.subMu.Lock()
 	defer s.subMu.Unlock()
