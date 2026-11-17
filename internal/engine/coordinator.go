@@ -689,12 +689,38 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		}
 
 		// Step succeeded: parse environment, output, and path files
-		newEnv, _ := ParseEnvAndOutputFile(envPath)
+		newEnv, err := ParseEnvAndOutputFile(envPath)
+		if err != nil {
+			c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusFailed)
+			stepResults = append(stepResults, protocol.StepResult{
+				ID:         stepID,
+				Conclusion: "failure",
+				ExitCode:   1,
+			})
+			_ = os.Remove(envPath)
+			_ = os.Remove(outputPath)
+			_ = os.Remove(pathFilePath)
+			conclusion = "failure"
+			break
+		}
 		for k, v := range newEnv {
 			cumulativeEnv[k] = v
 		}
 
-		newOutputs, _ := ParseEnvAndOutputFile(outputPath)
+		newOutputs, err := ParseEnvAndOutputFile(outputPath)
+		if err != nil {
+			c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusFailed)
+			stepResults = append(stepResults, protocol.StepResult{
+				ID:         stepID,
+				Conclusion: "failure",
+				ExitCode:   1,
+			})
+			_ = os.Remove(envPath)
+			_ = os.Remove(outputPath)
+			_ = os.Remove(pathFilePath)
+			conclusion = "failure"
+			break
+		}
 		stepOutputsMap := make(map[string]any)
 		for k, v := range newOutputs {
 			outputs[k] = v
@@ -710,7 +736,20 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			stepsMap[step.Name] = map[string]any{"outputs": stepOutputsMap}
 		}
 
-		newPaths, _ := ParsePathFile(pathFilePath)
+		newPaths, err := ParsePathFile(pathFilePath)
+		if err != nil {
+			c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusFailed)
+			stepResults = append(stepResults, protocol.StepResult{
+				ID:         stepID,
+				Conclusion: "failure",
+				ExitCode:   1,
+			})
+			_ = os.Remove(envPath)
+			_ = os.Remove(outputPath)
+			_ = os.Remove(pathFilePath)
+			conclusion = "failure"
+			break
+		}
 		if len(newPaths) > 0 {
 			pathPrefix := strings.Join(newPaths, string(filepath.ListSeparator))
 			pathKey := "PATH"
@@ -921,7 +960,7 @@ func generateCheckoutScript(step protocol.JobStep, env map[string]string) string
 	if step.Inputs != nil {
 		repo = step.Inputs["repository"]
 	}
-	if repo == "" {
+	if repo == "" && env != nil {
 		repo = env["GITHUB_REPOSITORY"]
 	}
 	ref := ""
@@ -933,15 +972,21 @@ func generateCheckoutScript(step protocol.JobStep, env map[string]string) string
 		subPath = step.Inputs["path"]
 	}
 
-	return fmt.Sprintf(`set -e
+	if env != nil {
+		env["ACTR_CHECKOUT_REPO"] = repo
+		env["ACTR_CHECKOUT_REF"] = ref
+		env["ACTR_CHECKOUT_PATH"] = subPath
+	}
+
+	return `set -e
 TARGET_DIR="${GITHUB_WORKSPACE}"
-if [ -n "%s" ]; then
-    TARGET_DIR="${GITHUB_WORKSPACE}/%s"
+if [ -n "$ACTR_CHECKOUT_PATH" ]; then
+    TARGET_DIR="${GITHUB_WORKSPACE}/$ACTR_CHECKOUT_PATH"
 fi
 mkdir -p "$TARGET_DIR"
 cd "$TARGET_DIR"
 
-REPO_NAME="%s"
+REPO_NAME="$ACTR_CHECKOUT_REPO"
 if [ -z "$REPO_NAME" ]; then
     REPO_NAME="${GITHUB_REPOSITORY}"
 fi
@@ -960,7 +1005,7 @@ if [ ! -d ".git" ]; then
     git remote set-url origin "https://github.com/${REPO_NAME}.git" 2>/dev/null || true
 fi
 
-TARGET_REF="%s"
+TARGET_REF="$ACTR_CHECKOUT_REF"
 if [ -z "$TARGET_REF" ]; then
     TARGET_REF="${GITHUB_SHA}"
 fi
@@ -969,9 +1014,10 @@ if [ -z "$TARGET_REF" ]; then
 fi
 
 if [ -n "$TARGET_REF" ]; then
-    git checkout -f "$TARGET_REF" 2>/dev/null || true
+    git fetch --depth=1 origin "$TARGET_REF" || git fetch origin
+    git checkout -f "$TARGET_REF"
 fi
-`, subPath, subPath, repo, ref)
+`
 }
 
 func parseContextData(v any) any {

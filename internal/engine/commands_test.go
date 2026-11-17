@@ -3,6 +3,7 @@ package engine
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -144,5 +145,67 @@ func TestParsePreservesWhitespace(t *testing.T) {
 	expected := "  value with spaces  "
 	if vars["KEY"] != expected {
 		t.Errorf("expected %q, got: %q", expected, vars["KEY"])
+	}
+}
+
+func TestParseCommandFile_EqualsBeforeHeredoc(t *testing.T) {
+	tmpDir := t.TempDir()
+	envPath := filepath.Join(tmpDir, "env")
+
+	content := "CMD=cat <<EOF\nANOTHER=value\n"
+	if err := os.WriteFile(envPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	vars, err := ParseCommandFile(envPath)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	if vars["CMD"] != "cat <<EOF" {
+		t.Errorf("expected CMD='cat <<EOF', got: %q", vars["CMD"])
+	}
+	if vars["ANOTHER"] != "value" {
+		t.Errorf("expected ANOTHER='value', got: %q", vars["ANOTHER"])
+	}
+}
+
+func TestParseCommandFile_LargeLine128KB(t *testing.T) {
+	tmpDir := t.TempDir()
+	envPath := filepath.Join(tmpDir, "env")
+
+	largeVal := strings.Repeat("A", 128*1024)
+	content := "LARGE_KEY=" + largeVal + "\n"
+	if err := os.WriteFile(envPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	vars, err := ParseCommandFile(envPath)
+	if err != nil {
+		t.Fatalf("expected successful parse of 128KB line, got err: %v", err)
+	}
+
+	if len(vars["LARGE_KEY"]) != 128*1024 {
+		t.Errorf("expected 128KB value length, got %d", len(vars["LARGE_KEY"]))
+	}
+}
+
+func TestParsePathFile_LargeLine128KB(t *testing.T) {
+	tmpDir := t.TempDir()
+	pathFile := filepath.Join(tmpDir, "path")
+
+	largePath := "/usr/local/" + strings.Repeat("a", 128*1024)
+	content := largePath + "\n"
+	if err := os.WriteFile(pathFile, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	paths, err := ParsePathFile(pathFile)
+	if err != nil {
+		t.Fatalf("expected successful parse of 128KB path, got err: %v", err)
+	}
+
+	if len(paths) != 1 || paths[0] != largePath {
+		t.Errorf("expected 1 path with length %d, got %d", len(largePath), len(paths[0]))
 	}
 }

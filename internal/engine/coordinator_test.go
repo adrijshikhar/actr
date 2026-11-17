@@ -1208,8 +1208,17 @@ func TestCoordinator_GitHubVariablesAndCheckoutSynthesis(t *testing.T) {
 	}
 
 	checkoutStep := d.stepsRun[0]
-	if !strings.Contains(checkoutStep.Script, "git clone") || !strings.Contains(checkoutStep.Script, "adrijshikhar/cxstatusline") {
-		t.Errorf("checkout step script missing git clone logic: %s", checkoutStep.Script)
+	if !strings.Contains(checkoutStep.Script, "git clone") || !strings.Contains(checkoutStep.Script, "$ACTR_CHECKOUT_REPO") {
+		t.Errorf("checkout step script missing parameterized git clone logic: %s", checkoutStep.Script)
+	}
+	if strings.Contains(checkoutStep.Script, "git checkout -f \"$TARGET_REF\" 2>/dev/null || true") {
+		t.Errorf("checkout step script should not contain '|| true' on checkout: %s", checkoutStep.Script)
+	}
+	if !strings.Contains(checkoutStep.Script, "git fetch --depth=1 origin \"$TARGET_REF\" || git fetch origin") {
+		t.Errorf("checkout step script should fetch target ref explicitly: %s", checkoutStep.Script)
+	}
+	if checkoutStep.Environment["ACTR_CHECKOUT_REPO"] != "adrijshikhar/cxstatusline" {
+		t.Errorf("expected ACTR_CHECKOUT_REPO 'adrijshikhar/cxstatusline', got %q", checkoutStep.Environment["ACTR_CHECKOUT_REPO"])
 	}
 	if checkoutStep.Environment["GITHUB_REPOSITORY"] != "adrijshikhar/cxstatusline" {
 		t.Errorf("expected GITHUB_REPOSITORY 'adrijshikhar/cxstatusline', got %q", checkoutStep.Environment["GITHUB_REPOSITORY"])
@@ -1227,6 +1236,114 @@ func TestCoordinator_GitHubVariablesAndCheckoutSynthesis(t *testing.T) {
 	// Verify PATH was enriched
 	if !strings.Contains(checkoutStep.Environment["PATH"], "/usr/bin") {
 		t.Errorf("PATH does not contain /usr/bin: %s", checkoutStep.Environment["PATH"])
+	}
+}
+
+func TestCoordinator_CheckoutScriptParameterization_SafeInputs(t *testing.T) {
+	step := protocol.JobStep{
+		ID:   "checkout",
+		Name: "actions/checkout",
+		Inputs: map[string]string{
+			"repository": "owner/repo; rm -rf /",
+			"ref":        "feature/branch$(whoami)",
+			"path":       "sub/dir`id`",
+		},
+	}
+	env := make(map[string]string)
+
+	script := generateCheckoutScript(step, env)
+
+	// User inputs must NOT be interpolated into the script text
+	if strings.Contains(script, "rm -rf") {
+		t.Errorf("dangerous repo input leaked into script string: %s", script)
+	}
+	if strings.Contains(script, "whoami") {
+		t.Errorf("dangerous ref input leaked into script string: %s", script)
+	}
+	if strings.Contains(script, "sub/dir`id`") {
+		t.Errorf("dangerous path input leaked into script string: %s", script)
+	}
+
+	// Must be passed via environment variables
+	if env["ACTR_CHECKOUT_REPO"] != "owner/repo; rm -rf /" {
+		t.Errorf("expected repo in ACTR_CHECKOUT_REPO, got %q", env["ACTR_CHECKOUT_REPO"])
+	}
+	if env["ACTR_CHECKOUT_REF"] != "feature/branch$(whoami)" {
+		t.Errorf("expected ref in ACTR_CHECKOUT_REF, got %q", env["ACTR_CHECKOUT_REF"])
+	}
+	if env["ACTR_CHECKOUT_PATH"] != "sub/dir`id`" {
+		t.Errorf("expected path in ACTR_CHECKOUT_PATH, got %q", env["ACTR_CHECKOUT_PATH"])
+	}
+
+	// Verify checkout line does not have || true
+	for _, line := range strings.Split(script, "\n") {
+		if strings.Contains(line, "checkout") && strings.Contains(line, "|| true") {
+			t.Errorf("checkout command must not ignore errors with || true: %s", line)
+		}
+	}
+}
+
+func TestCoordinator_CommandFileParseError_FailsStep(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Mock driver that writes a line exceeding 10MB to GITHUB_ENV
+	mock := &mockDriver{
+		executeFunc: func(ctx context.Context, step *driver.StepSpec, stdout, stderr io.Writer) (*driver.StepResult, error) {
+			envPath := step.Environment["GITHUB_ENV"]
+			// Write a line larger than 10MB to trigger scanner.Buffer error (bufio.ErrTooLong)
+			f, err := os.OpenFile(envPath, os.O_APPEND|os.O_WRONLY, 0644)
+			if err != nil {
+				return nil, err
+			}
+			defer f.Close()
+
+			largeLine := strings.Repeat("X", 11*1024*1024) + "\n"
+			if _, err := f.WriteString(largeLine); err != nil {
+				return nil, err
+			}
+			return &driver.StepResult{ExitCode: 0}, nil
+		},
+	}
+
+	coord := NewCoordinator(mock, nil, filepath.Join(tmpDir, "work"))
+
+	job := &protocol.JobSpecification{
+		JobID:   "job-parse-err",
+		JobName: "Parse Error Job",
+		Steps: []protocol.JobStep{
+			{
+				ID:     "step-1",
+				Name:   "Step writing huge env",
+				Type:   "script",
+				Script: "echo huge",
+			},
+			{
+				ID:     "step-2",
+				Name:   "Step that should not run",
+				Type:   "script",
+				Script: "echo skipped",
+			},
+		},
+	}
+
+	res, err := coord.ExecuteJob(context.Background(), job, "", "")
+	if err != nil {
+		t.Fatalf("unexpected coordinator error: %v", err)
+	}
+
+	if res.Conclusion != "failure" {
+		t.Errorf("expected job conclusion 'failure' on parse error, got %q", res.Conclusion)
+	}
+
+	if len(res.StepResults) != 1 {
+		t.Fatalf("expected 1 step result before break, got %d", len(res.StepResults))
+	}
+
+	if res.StepResults[0].Conclusion != "failure" {
+		t.Errorf("expected step conclusion 'failure', got %q", res.StepResults[0].Conclusion)
+	}
+	if res.StepResults[0].ExitCode != 1 {
+		t.Errorf("expected step exit code 1, got %d", res.StepResults[0].ExitCode)
 	}
 }
 
