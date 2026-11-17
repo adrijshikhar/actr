@@ -54,6 +54,7 @@ type PostStepHook struct {
 	PostScript string
 	Env        map[string]string
 	State      map[string]string
+	Inputs     map[string]string
 }
 
 // NewCoordinator creates a new Coordinator with the provided driver, RunServiceClient, and base working directory.
@@ -730,11 +731,19 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		var stepErr error
 		var actCtx *action.ActionContext
 
+		var evaluatedInputs map[string]string
+		if step.Inputs != nil {
+			evaluatedInputs = make(map[string]string, len(step.Inputs))
+			for k, v := range step.Inputs {
+				evaluatedInputs[k] = evaluateExpression(v, parsedContext)
+			}
+		}
+
 		if isActionStep(step) {
 			ref := getStepReference(step)
 			actCtx = &action.ActionContext{
 				StepID:         stepID,
-				Inputs:         step.Inputs,
+				Inputs:         evaluatedInputs,
 				Env:            stepEnv,
 				WorkspaceDir:   stepWorkDir,
 				TempDir:        runnerTemp,
@@ -744,6 +753,25 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 				OutputFilePath: outputPath,
 			}
 			res, _, stepErr = c.executeActionStep(ctx, jobID, stepID, stepDisplayName, ref, actCtx, stepLogger, jobMasker)
+
+			// Ingest state file and queue post-step hook if manifest defines runs.post
+			stepState, _ := IngestStateFile(statePath)
+			if actCtx != nil && actCtx.Manifest != nil && strings.TrimSpace(actCtx.Manifest.Runs.Post) != "" {
+				postScript := actCtx.Manifest.Runs.Post
+				hookEnv := make(map[string]string, len(stepEnv))
+				for k, v := range stepEnv {
+					hookEnv[k] = v
+				}
+				postHooks = append(postHooks, PostStepHook{
+					StepID:     stepID,
+					StepName:   stepDisplayName,
+					ActionDir:  actCtx.ActionDir,
+					PostScript: postScript,
+					Env:        hookEnv,
+					State:      stepState,
+					Inputs:     evaluatedInputs,
+				})
+			}
 		} else {
 			stepScript := step.Script
 			if stepScript == "" && isCheckoutStep(step) {
@@ -792,36 +820,6 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		}
 
 		// Step succeeded: parse environment, output, and path files
-		if isActionStep(step) {
-			stepState, err := IngestStateFile(statePath)
-			if err != nil {
-				c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusFailed)
-				stepResults = append(stepResults, protocol.StepResult{
-					ID:         stepID,
-					Conclusion: "failure",
-					ExitCode:   1,
-				})
-				cleanupStepFiles()
-				conclusion = "failure"
-				break
-			}
-			if actCtx != nil && actCtx.Manifest != nil && strings.TrimSpace(actCtx.Manifest.Runs.Post) != "" {
-				postScript := actCtx.Manifest.Runs.Post
-				hookEnv := make(map[string]string, len(stepEnv))
-				for k, v := range stepEnv {
-					hookEnv[k] = v
-				}
-				postHooks = append(postHooks, PostStepHook{
-					StepID:     stepID,
-					StepName:   stepDisplayName,
-					ActionDir:  actCtx.ActionDir,
-					PostScript: postScript,
-					Env:        hookEnv,
-					State:      stepState,
-				})
-			}
-		}
-
 		if err := IngestEnvFile(envPath, cumulativeEnv); err != nil {
 			c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusFailed)
 			stepResults = append(stepResults, protocol.StepResult{
@@ -1124,13 +1122,21 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 }
 
 func isActionStep(step protocol.JobStep) bool {
-	if step.Reference != nil {
-		return true
+	if isCheckoutStep(step) {
+		return false
 	}
-	if step.Type == "uses" {
-		if isCheckoutStep(step) {
+	if strings.TrimSpace(step.Script) != "" {
+		return false
+	}
+	if step.Reference != nil {
+		if step.Reference.Type == "script" {
 			return false
 		}
+		if step.Reference.Type == "repository" || step.Reference.Name != "" {
+			return true
+		}
+	}
+	if step.Type == "uses" {
 		ref := getStepReference(step)
 		return ref != nil && strings.Contains(ref.Name, "/")
 	}
@@ -1138,7 +1144,7 @@ func isActionStep(step protocol.JobStep) bool {
 }
 
 func getStepReference(step protocol.JobStep) *protocol.StepReference {
-	if step.Reference != nil {
+	if step.Reference != nil && (step.Reference.Type == "repository" || step.Reference.Name != "") {
 		return step.Reference
 	}
 	target := ""
@@ -1521,6 +1527,7 @@ func (c *Coordinator) executeSinglePostHook(ctx context.Context, jobID string, h
 	actCtx := &action.ActionContext{
 		StepID:       hook.StepID,
 		ActionDir:    hook.ActionDir,
+		Inputs:       hook.Inputs,
 		Env:          postEnv,
 		WorkspaceDir: workspaceDir,
 		TempDir:      tempDir,

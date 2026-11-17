@@ -527,7 +527,7 @@ func (j *JobSpecification) UnmarshalJSON(data []byte) error {
 			}
 
 			var ref *StepReference
-			if s.Reference != nil {
+			if s.Reference != nil && (s.Reference.Type == "repository" || (s.Reference.Type != "script" && s.Reference.Name != "")) {
 				refVersion := s.Reference.Version
 				refValue := s.Reference.Ref
 				if refValue == "" && refVersion != "" {

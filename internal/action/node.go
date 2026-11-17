@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
+	"strings"
 )
 
 // NodeDetector defines an interface for detecting a Node.js executable.
@@ -63,12 +65,12 @@ func (d *HostNodeDetector) Detect(ctx context.Context) (string, error) {
 	if homeDir != "" {
 		// fnm: ~/.local/state/fnm_multishells/*/bin/node
 		fnmMatches, _ := filepath.Glob(filepath.Join(homeDir, ".local", "state", "fnm_multishells", "*", "bin", "node"))
-		sort.Sort(sort.Reverse(sort.StringSlice(fnmMatches)))
+		sortNodeVersionPaths(fnmMatches)
 		candidates = append(candidates, fnmMatches...)
 
 		// nvm: ~/.nvm/versions/node/*/bin/node
 		nvmMatches, _ := filepath.Glob(filepath.Join(homeDir, ".nvm", "versions", "node", "*", "bin", "node"))
-		sort.Sort(sort.Reverse(sort.StringSlice(nvmMatches)))
+		sortNodeVersionPaths(nvmMatches)
 		candidates = append(candidates, nvmMatches...)
 
 		// asdf: ~/.asdf/shims/node
@@ -130,4 +132,29 @@ func verifyNodeBinary(ctx context.Context, path string) error {
 		return fmt.Errorf("node binary at %s failed verification (--version): %w", path, err)
 	}
 	return nil
+}
+
+// sortNodeVersionPaths sorts Node paths by extracting version numbers descending.
+func sortNodeVersionPaths(paths []string) {
+	sort.Slice(paths, func(i, j int) bool {
+		vi := extractVersionNumbers(paths[i])
+		vj := extractVersionNumbers(paths[j])
+		for k := 0; k < 3; k++ {
+			if vi[k] != vj[k] {
+				return vi[k] > vj[k]
+			}
+		}
+		return paths[i] > paths[j]
+	})
+}
+
+func extractVersionNumbers(p string) [3]int {
+	var nums [3]int
+	dir := filepath.Base(filepath.Dir(filepath.Dir(p)))
+	trimmed := strings.TrimPrefix(dir, "v")
+	parts := strings.Split(trimmed, ".")
+	for i := 0; i < len(parts) && i < 3; i++ {
+		nums[i], _ = strconv.Atoi(parts[i])
+	}
+	return nums
 }

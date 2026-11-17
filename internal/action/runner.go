@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // ActionContext encapsulates the execution environment and metadata for an action step.
@@ -108,6 +109,11 @@ func ExecuteNodeAction(ctx context.Context, nodePath string, scriptPath string, 
 
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
+	setProcessGroup(cmd)
+	cmd.Cancel = func() error {
+		return killProcessGroup(cmd)
+	}
+	cmd.WaitDelay = 5 * time.Second
 
 	// Layer host environment with built action environment
 	cmd.Env = os.Environ()

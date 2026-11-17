@@ -83,10 +83,20 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 	var subpath string
 	if len(cleanParts) > 2 {
 		subpath = filepath.Join(cleanParts[2:]...)
+	}
+	if trimmedPath := strings.TrimSpace(ref.Path); trimmedPath != "" {
+		if subpath != "" {
+			subpath = filepath.Join(subpath, trimmedPath)
+		} else {
+			subpath = trimmedPath
+		}
+	}
+	if subpath != "" {
 		cleanSub := filepath.Clean(subpath)
 		if strings.HasPrefix(cleanSub, "..") || filepath.IsAbs(cleanSub) {
 			return "", ErrPathTraversal
 		}
+		subpath = cleanSub
 	}
 
 	version := strings.TrimSpace(ref.Ref)
@@ -178,10 +188,14 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 
 	tr := tar.NewReader(gz)
 
-	cleanDest := filepath.Clean(destDir)
 	_ = os.RemoveAll(destDir)
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create destination directory: %w", err)
+	}
+
+	cleanDest := filepath.Clean(destDir)
+	if evalDest, err := filepath.EvalSymlinks(cleanDest); err == nil {
+		cleanDest = filepath.Clean(evalDest)
 	}
 
 	var success bool
@@ -193,6 +207,14 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 
 	// Zero-allocation streaming buffer reused across files
 	buf := make([]byte, 32*1024)
+	const (
+		maxArchiveEntries    = 20000
+		maxTotalArchiveBytes = 500 * 1024 * 1024 // 500MB
+		maxSingleFileSize    = 100 * 1024 * 1024 // 100MB
+	)
+	var totalEntries int
+	var totalBytes int64
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return "", err
@@ -204,6 +226,11 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 		}
 		if err != nil {
 			return "", fmt.Errorf("archive read error: %w", err)
+		}
+
+		totalEntries++
+		if totalEntries > maxArchiveEntries {
+			return "", fmt.Errorf("archive exceeds entry limit of %d entries", maxArchiveEntries)
 		}
 
 		if hdr.Typeflag == tar.TypeXHeader || hdr.Typeflag == tar.TypeXGlobalHeader {
@@ -249,16 +276,26 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 			return "", ErrPathTraversal
 		}
 
+		// Verify parent directory does not escape through a symlink chain
+		parentDir := filepath.Dir(cleanTarget)
+		if err := os.MkdirAll(parentDir, 0755); err != nil {
+			return "", fmt.Errorf("failed to create directory %s: %w", parentDir, err)
+		}
+		evalParent, err := filepath.EvalSymlinks(parentDir)
+		if err != nil {
+			return "", fmt.Errorf("failed to evaluate parent directory symlinks: %w", err)
+		}
+		cleanEvalParent := filepath.Clean(evalParent)
+		if !strings.HasPrefix(cleanEvalParent, cleanDest+string(filepath.Separator)) && cleanEvalParent != cleanDest {
+			return "", fmt.Errorf("%w: target directory %s escapes destination through symlink", ErrPathTraversal, parentDir)
+		}
+
 		switch hdr.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(cleanTarget, 0755); err != nil {
 				return "", fmt.Errorf("failed to create directory %s: %w", cleanTarget, err)
 			}
 		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(cleanTarget), 0755); err != nil {
-				return "", fmt.Errorf("failed to create directory %s: %w", filepath.Dir(cleanTarget), err)
-			}
-
 			if fi, err := os.Lstat(cleanTarget); err == nil && fi.Mode()&os.ModeSymlink != 0 {
 				_ = os.Remove(cleanTarget)
 			}
@@ -273,7 +310,14 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 				return "", fmt.Errorf("failed to create file %s: %w", cleanTarget, err)
 			}
 
-			if _, err := io.CopyBuffer(out, tr, buf); err != nil {
+			limitedReader := io.LimitReader(tr, maxSingleFileSize)
+			n, err := io.CopyBuffer(out, limitedReader, buf)
+			totalBytes += n
+			if totalBytes > maxTotalArchiveBytes {
+				_ = out.Close()
+				return "", fmt.Errorf("archive exceeds total size limit of 500MB")
+			}
+			if err != nil {
 				_ = out.Close()
 				return "", fmt.Errorf("failed to write file %s: %w", cleanTarget, err)
 			}
@@ -296,34 +340,30 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 				return "", fmt.Errorf("%w: symlink %s targets %s outside destination %s", ErrPathTraversal, hdr.Name, hdr.Linkname, cleanDest)
 			}
 
-			if err := os.MkdirAll(filepath.Dir(cleanTarget), 0755); err != nil {
-				return "", fmt.Errorf("failed to create directory %s: %w", filepath.Dir(cleanTarget), err)
-			}
-
 			_ = os.Remove(cleanTarget)
 			if err := os.Symlink(hdr.Linkname, cleanTarget); err != nil {
 				return "", fmt.Errorf("failed to create symlink %s -> %s: %w", cleanTarget, hdr.Linkname, err)
 			}
 
 		case tar.TypeLink:
-			var resolvedLinkTarget string
-			if filepath.IsAbs(hdr.Linkname) {
-				resolvedLinkTarget = filepath.Clean(hdr.Linkname)
-			} else {
-				resolvedLinkTarget = filepath.Clean(filepath.Join(filepath.Dir(cleanTarget), hdr.Linkname))
+			cleanLink := filepath.Clean(hdr.Linkname)
+			if strings.HasPrefix(cleanLink, "..") || filepath.IsAbs(cleanLink) {
+				return "", fmt.Errorf("%w: hard link %s targets outside destination", ErrPathTraversal, hdr.Name)
 			}
+			parts := strings.Split(cleanLink, string(filepath.Separator))
+			if len(parts) > 1 {
+				cleanLink = filepath.Join(parts[1:]...)
+			}
+			resolvedLinkTarget := filepath.Join(cleanDest, cleanLink)
+			cleanResolvedLink := filepath.Clean(resolvedLinkTarget)
 
-			if !strings.HasPrefix(resolvedLinkTarget, cleanDest+string(filepath.Separator)) && resolvedLinkTarget != cleanDest {
+			if !strings.HasPrefix(cleanResolvedLink, cleanDest+string(filepath.Separator)) && cleanResolvedLink != cleanDest {
 				return "", fmt.Errorf("%w: hard link %s targets outside destination", ErrPathTraversal, hdr.Name)
 			}
 
-			if err := os.MkdirAll(filepath.Dir(cleanTarget), 0755); err != nil {
-				return "", fmt.Errorf("failed to create directory %s: %w", filepath.Dir(cleanTarget), err)
-			}
-
 			_ = os.Remove(cleanTarget)
-			if err := os.Link(resolvedLinkTarget, cleanTarget); err != nil {
-				return "", fmt.Errorf("failed to create hard link %s -> %s: %w", cleanTarget, resolvedLinkTarget, err)
+			if err := os.Link(cleanResolvedLink, cleanTarget); err != nil {
+				return "", fmt.Errorf("failed to create hard link %s -> %s: %w", cleanTarget, cleanResolvedLink, err)
 			}
 
 		default:
