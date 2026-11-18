@@ -1,12 +1,185 @@
-# actr — Wiki & Technical Reference Guide
+# actr — Wiki & Adoption Guide
 
-Welcome to the **actr** Wiki. This technical reference covers GitHub Actions workflow integration conventions, the runner runtime architecture, Marketplace Actions execution, environment emulation, and operational troubleshooting.
+Welcome to the **actr** Wiki and Adoption Guide. This reference documents how to install, register, adopt, and operate `actr` as a high-performance native self-hosted runner daemon for GitHub Actions workflows.
 
 ---
 
-## 1. CI Workflow Integration & `runs-on` Label Conventions
+## Table of Contents
+1. [The 5-Minute Adoption Path](#1-the-5-minute-adoption-path)
+2. [CI Workflow Integration & `runs-on` Conventions](#2-ci-workflow-integration--runs-on-conventions)
+3. [Architecture & Runtime Engine](#3-architecture--runtime-engine)
+4. [Marketplace Actions & Node Runtime Engine](#4-marketplace-actions--node-runtime-engine)
+5. [Workflow Command Files & Toolchain Ingestion](#5-workflow-command-files--toolchain-ingestion)
+6. [Post-Step Lifecycle Coordination](#6-post-step-lifecycle-coordination)
+7. [Local Run & Log Persistence Layout](#7-local-run--log-persistence-layout)
+8. [Day-2 Operations & Service Management](#8-day-2-operations--service-management)
+9. [Troubleshooting & FAQ](#9-troubleshooting--faq)
 
-The primary design goal of `actr` is **seamless, single-line CI integration**: any standard GitHub Actions workflow file (`.github/workflows/*.yml`) can be routed to an `actr` runner simply by updating its `runs-on` target, without changing any steps, scripts, actions, or credentials.
+---
+
+## 1. The 5-Minute Adoption Path
+
+Adopting `actr` requires **zero changes to your existing CI steps, scripts, or Marketplace actions**. You only need to install `actr`, register your machine as a runner, and update the `runs-on` field in your workflow YAML.
+
+### Step 1: Install `actr`
+
+Choose your preferred installation method:
+
+#### Option A: Homebrew Tap (macOS & Linux, Recommended)
+```bash
+brew tap adrijshikhar/tap
+brew install --cask actr
+```
+
+#### Option B: Standalone Installer (macOS & Linux)
+Runs automated SHA256 checksum verification and installs the static binary to `/usr/local/bin` (or `~/.local/bin`), with automatic shell completions for Zsh, Bash, and Fish:
+```bash
+curl -fsSL https://raw.githubusercontent.com/adrijshikhar/actr/main/install.sh | sh
+```
+
+#### Option C: Pre-Compiled Binary Download
+Download the static tarball for your platform from [GitHub Releases](https://github.com/adrijshikhar/actr/releases/latest):
+```bash
+# Example for macOS Apple Silicon
+curl -LO https://github.com/adrijshikhar/actr/releases/latest/download/actr_darwin_arm64.tar.gz
+tar -xzf actr_darwin_arm64.tar.gz
+sudo mv actr /usr/local/bin/
+```
+
+---
+
+### Step 2: Pre-Flight Verification (`actr doctor`)
+
+Run `actr doctor` to ensure your environment has the necessary prerequisites:
+
+```bash
+actr doctor
+```
+
+**Expected output:**
+```text
+[✓] OS & Architecture: darwin/arm64
+[✓] Git: git version 2.54.0
+[✓] Node.js (for JS actions): v26.12.1
+```
+
+- **OS & Architecture**: Confirms OS (`darwin`/`linux`) and CPU (`arm64`/`amd64`).
+- **Git**: Required for repository checkout and remote tracking.
+- **Node.js**: Required to execute JavaScript Marketplace Actions (`actions/setup-go`, `actions/setup-node`, `pnpm/action-setup`, etc.). If not found in standard PATH, `actr` will automatically discover Node under `fnm`, `nvm`, `asdf`, `mise`, or Homebrew.
+
+---
+
+### Step 3: Register the Runner (`actr register`)
+
+`actr` provides zero-click registration that automatically detects your repository and obtains registration tokens via the GitHub CLI (`gh`).
+
+#### Interactive Mode (Recommended for Developers)
+Inside any local clone of your repository, run:
+```bash
+actr register
+```
+`actr` will:
+1. Detect your repository URL from `git remote get-url origin`.
+2. Query `gh` for an ephemeral runner registration token (prompting for browser authentication if `gh` is unauthenticated).
+3. Assign default system labels (`self-hosted`, `macOS` or `Linux`, `ARM64` or `X64`).
+4. Save credentials safely into `~/.actr/` (`0600` file permissions).
+5. Prompt to install and start the background OS service.
+
+#### Non-Interactive / Headless Mode (For CI, Servers, or Automation)
+```bash
+actr register \
+  --url https://github.com/your-org/your-repo \
+  --token <GITHUB_RUNNER_REGISTRATION_TOKEN> \
+  --name my-workstation \
+  --labels "self-hosted,macOS,ARM64"
+```
+> *Tip:* You can generate a registration token manually in GitHub: **Repository Settings → Actions → Runners → "New self-hosted runner"**.
+
+---
+
+### Step 4: Install & Start the Background Service
+
+`actr` runs as an unattended background service using your operating system's native service supervisor (`launchd` on macOS, `systemd` on Linux).
+
+```bash
+# 1. Install the service definition
+actr service install
+
+# 2. Start the runner daemon
+actr service start
+
+# 3. Verify it is running and listening for jobs
+actr service status
+```
+
+**Expected status output:**
+```text
+Service status: running (PID 13960)
+Listening for Jobs
+```
+
+The daemon runs continuously in the background, surviving logouts and automatically starting on system boot.
+
+---
+
+### Step 5: Adopt in Your CI Workflow (The "1-Line Change")
+
+Open your workflow file (e.g. `.github/workflows/ci.yml`). Change only the `runs-on` line to target your `actr` runner:
+
+#### Before (GitHub Cloud Runner):
+```yaml
+jobs:
+  build-and-test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - run: go test -v ./...
+```
+
+#### After (Routing to `actr`):
+```yaml
+jobs:
+  build-and-test:
+    runs-on: [self-hosted, macOS]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - run: go test -v ./...
+```
+
+Push this change to a branch and open a Pull Request. GitHub will immediately route the job to your `actr` runner!
+
+---
+
+### Step 6: Live Monitoring & Tactical TUI (`actr monitor`)
+
+Attach to the background daemon anytime using `actr monitor` without interrupting running jobs:
+
+```bash
+actr monitor
+```
+
+The interactive TUI provides complete situational awareness:
+- **Explorer Tree**: Navigate hierarchically across `Workflow` → `Matrix` → `Job` → `Steps`.
+- **Live Telemetry**: Real-time CPU usage, RSS memory consumption, and execution duration.
+- **Streaming Logs**: ANSI-colored output streamed in real time.
+- **Keybindings**:
+  - `↑` / `k`, `↓` / `j`: Move up and down the step tree.
+  - `Enter` / `Space`: Expand or collapse step trees.
+  - `z`: **Zoom** — toggles log view to 100% full terminal width for viewing stack traces and compiler errors.
+  - `f`: Toggle auto-follow (tail) active step logs.
+  - `q`: Detach from the monitor (the runner daemon continues processing in the background).
+
+---
+
+## 2. CI Workflow Integration & `runs-on` Conventions
 
 ### Why `[self-hosted, macOS]` and Not `macos`?
 
@@ -57,7 +230,7 @@ GitHub Actions treats this as a logical **AND**: the runner must possess **all**
   runs-on: [self-hosted, macOS]
   ```
 
-#### 4. Multi-Platform Matrix Example
+#### 4. Dual-Target Matrix Example (Cloud + Local)
 To support both GitHub Cloud Linux runners and your local `actr` macOS runner in the same workflow matrix:
 
 ```yaml
@@ -83,7 +256,7 @@ jobs:
 
 ---
 
-## 2. Architecture & Runtime Engine
+## 3. Architecture & Runtime Engine
 
 `actr` is built from the ground up to replace the heavyweight official .NET CoreCLR runner (`~450 MB` disk, `~350 MB` idle RAM) with a single, statically compiled Go binary (`~11 MB` disk, `< 25 MB` idle RAM).
 
@@ -131,7 +304,7 @@ jobs:
 
 ---
 
-## 3. Marketplace Actions & Node Runtime Engine
+## 4. Marketplace Actions & Node Runtime Engine
 
 `actr` features a built-in Marketplace Actions engine that executes standard JavaScript/TypeScript actions (`using: 'node20'`, `using: 'node16'`) directly on the host using the local Node runtime.
 
@@ -182,7 +355,7 @@ The runner automatically injects the following standard environment variables in
 
 ---
 
-## 4. Workflow Command Files & Toolchain Ingestion
+## 5. Workflow Command Files & Toolchain Ingestion
 
 GitHub Actions communicate dynamically between steps using special filesystem command files. `actr` creates unique, isolated temp files for every step and automatically ingests them upon step completion:
 
@@ -195,7 +368,7 @@ GitHub Actions communicate dynamically between steps using special filesystem co
 
 ---
 
-## 5. Post-Step Lifecycle Coordination
+## 6. Post-Step Lifecycle Coordination
 
 Actions frequently require cleanup or caching after the job completes (e.g. `actions/setup-go` saving cache tarballs or `actions/upload-artifact` finalizing uploads).
 
@@ -211,7 +384,7 @@ Actions frequently require cleanup or caching after the job completes (e.g. `act
 
 ---
 
-## 6. Local Run & Log Persistence Layout
+## 7. Local Run & Log Persistence Layout
 
 `actr` stores past executions on disk under `~/.actr/runs/`:
 
@@ -233,19 +406,70 @@ retention:
   max_disk_mb: 200     # Prune oldest runs when disk usage exceeds 200 MB
 ```
 
+### Offline History Browsing
+Even when the `actr` daemon service is stopped, you can browse all previous runs and ANSI step logs using:
+```bash
+actr monitor
+```
+The monitor boots in **Offline Mode** (`◉ OFFLINE (HISTORY)`). When the background service starts again, it automatically connects and resumes live streaming.
+
 ---
 
-## 7. Troubleshooting & FAQ
+## 8. Day-2 Operations & Service Management
+
+### Service Lifecycle Commands
+```bash
+actr service status     # Check background service status and active PID
+actr service stop       # Stop the background runner daemon
+actr service start      # Start the background runner daemon
+actr service restart    # Restart daemon (or run: kill <PID> to trigger launchd restart)
+actr service uninstall  # Remove launchd/systemd service definition
+```
+
+### Upgrading `actr`
+To upgrade `actr` to the latest release:
+
+```bash
+# If installed via Homebrew:
+brew update && brew upgrade actr
+
+# If installed via install.sh:
+curl -fsSL https://raw.githubusercontent.com/adrijshikhar/actr/main/install.sh | sh
+```
+After upgrading the binary, restart the daemon:
+```bash
+actr service stop && actr service start
+```
+
+### Multi-Runner Workspaces
+If you run multiple distinct runners on the same machine (e.g. for different repositories or organizations), use the `--config-dir` flag to isolate their state:
+```bash
+actr register --config-dir ~/.actr-repo-b --url https://github.com/org/repo-b
+actr run --config-dir ~/.actr-repo-b
+```
+
+### Cleaning Up Disk Usage
+If you want to manually purge cached actions or downloaded toolchains:
+```bash
+rm -rf ~/.actr/_work/_actions/*     # Clear downloaded action cache
+rm -rf ~/.actr/_work/_tool/*        # Clear cached toolchains (Node/Go/Python)
+rm -rf ~/.actr/runs/*               # Clear historical logs
+```
+
+---
+
+## 9. Troubleshooting & FAQ
 
 ### Q: Why is my job stuck in "Queued" on GitHub?
-- **Check labels**: Ensure your workflow specifies `runs-on: [self-hosted, macOS]` with exact case matching (`macOS`, not `macos`).
-- **Check daemon status**: Run `actr service status` to verify the background daemon is active.
-- **Check runner online status**: Run `gh api repos/<owner>/<repo>/actions/runners` to confirm your runner reports `"status": "online"`.
+- **Verify Label Case**: Ensure your workflow specifies `runs-on: [self-hosted, macOS]` with exact case matching (`macOS`, not `macos`).
+- **Check Service**: Run `actr service status`. If stopped, run `actr service start`.
+- **Check GitHub API**: Run `gh api repos/<owner>/<repo>/actions/runners` and verify your runner reports `"status": "online"`.
 
-### Q: How do I test my workflows locally without committing to `main`?
-Create a feature branch in your repository, update `runs-on: [self-hosted, macOS]` in `.github/workflows/ci.yml`, and open a Pull Request. `actr` will acquire and execute the job automatically.
+### Q: Can I run both Docker and Host steps?
+Yes. By default, `actr` executes steps directly on the host using your native compilers and runtimes. When container steps are requested, `actr` seamlessly drives the local Docker daemon without requiring container overhead for simple host steps.
 
-### Q: Where are runner logs located?
-- Daemon background logs: `~/.actr/daemon.log`
-- Live interactive dashboard: `actr monitor`
-- Historical step logs: `~/.actr/runs/<job-id>/steps/`
+### Q: How do I view logs in real time from the command line?
+Run `actr monitor` for the rich TUI dashboard, or inspect the raw background daemon log at:
+```bash
+tail -f ~/.actr/daemon.log
+```
