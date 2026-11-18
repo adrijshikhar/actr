@@ -132,8 +132,8 @@ jobs:
   build-and-test:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
           cache: true
@@ -146,8 +146,8 @@ jobs:
   build-and-test:
     runs-on: [self-hosted, macOS]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
           cache: true
@@ -261,8 +261,8 @@ jobs:
             runner: [self-hosted, macOS]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
           cache: true
@@ -325,7 +325,7 @@ jobs:
 
 ### Action Resolution & Caching
 1. **Repository Tarball Download**:
-   When a step references `uses: actions/setup-go@v5`, `actr` requests the release tarball directly from GitHub codeload endpoints.
+   When a step references `uses: actions/setup-go@v7`, `actr` requests the release tarball directly from GitHub codeload endpoints.
 2. **Advisory Locking**:
    Downloads are protected by cross-platform advisory file locks (`<version>.lock`) using non-blocking kernel locks with context timeout polling (`ctx.Done()`). If multiple parallel matrix jobs request the same action simultaneously, only one downloads while others wait, eliminating multi-process race conditions.
 3. **Completion Markers**:
