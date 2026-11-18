@@ -71,11 +71,20 @@ type ActionManifest struct {
 	Runs        ActionRuns              `yaml:"runs"`
 }
 
+var (
+	// ErrEmptyManifest indicates an empty action manifest.
+	ErrEmptyManifest = errors.New("empty action manifest")
+	// ErrMissingRunsUsing indicates an action manifest missing runs.using.
+	ErrMissingRunsUsing = errors.New("invalid action manifest: runs.using is required")
+	// ErrManifestNotFound indicates no action.yml or action.yaml was found in the directory.
+	ErrManifestNotFound = errors.New("action manifest not found")
+)
+
 // ParseManifest parses raw YAML bytes into an ActionManifest.
 // It verifies that runs.using is specified.
 func ParseManifest(data []byte) (*ActionManifest, error) {
 	if len(strings.TrimSpace(string(data))) == 0 {
-		return nil, errors.New("empty action manifest")
+		return nil, ErrEmptyManifest
 	}
 
 	var manifest ActionManifest
@@ -84,7 +93,7 @@ func ParseManifest(data []byte) (*ActionManifest, error) {
 	}
 
 	if strings.TrimSpace(manifest.Runs.Using) == "" {
-		return nil, errors.New("invalid action manifest: runs.using is required")
+		return nil, ErrMissingRunsUsing
 	}
 
 	return &manifest, nil
@@ -107,5 +116,5 @@ func ParseManifestFile(dir string) (*ActionManifest, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("action manifest not found in directory: %s", dir)
+	return nil, fmt.Errorf("%w in directory: %s", ErrManifestNotFound, dir)
 }

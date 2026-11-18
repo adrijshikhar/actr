@@ -2573,3 +2573,86 @@ fs.writeFileSync(process.env.STATE_OUT_LOG, out);
 		}
 	})
 }
+
+func TestIngestEnvFile_BlocksForbiddenKeys(t *testing.T) {
+	tempDir := t.TempDir()
+	envFile := filepath.Join(tempDir, "github_env.txt")
+
+	envContent := `SAFE_VAR=hello_safe
+NODE_OPTIONS=--require /tmp/evil.js
+LD_PRELOAD=/tmp/evil.so
+DYLD_INSERT_LIBRARIES=/tmp/evil.dylib
+PATH=/tmp/evil_bin:/usr/bin
+GITHUB_ENV=/tmp/evil_env
+RUNNER_TEMP=/tmp/evil_temp
+ANOTHER_SAFE=world_123
+`
+	if err := os.WriteFile(envFile, []byte(envContent), 0644); err != nil {
+		t.Fatalf("failed to write test env file: %v", err)
+	}
+
+	cumulative := make(map[string]string)
+	if err := IngestEnvFile(envFile, cumulative); err != nil {
+		t.Fatalf("IngestEnvFile failed: %v", err)
+	}
+
+	// Safe variables must be preserved
+	if cumulative["SAFE_VAR"] != "hello_safe" {
+		t.Errorf("expected SAFE_VAR 'hello_safe', got %q", cumulative["SAFE_VAR"])
+	}
+	if cumulative["ANOTHER_SAFE"] != "world_123" {
+		t.Errorf("expected ANOTHER_SAFE 'world_123', got %q", cumulative["ANOTHER_SAFE"])
+	}
+
+	// Forbidden dangerous injection keys must be blocked
+	forbidden := []string{
+		"NODE_OPTIONS",
+		"LD_PRELOAD",
+		"DYLD_INSERT_LIBRARIES",
+		"PATH",
+		"GITHUB_ENV",
+		"RUNNER_TEMP",
+	}
+	for _, key := range forbidden {
+		if val, exists := cumulative[key]; exists {
+			t.Errorf("forbidden key %q was injected with value %q", key, val)
+		}
+	}
+}
+
+func TestResolveActionScriptPath_PathTraversalRejection(t *testing.T) {
+	tempDir := t.TempDir()
+	actionDir := filepath.Join(tempDir, "actions", "checkout")
+	if err := os.MkdirAll(actionDir, 0755); err != nil {
+		t.Fatalf("failed to create action dir: %v", err)
+	}
+
+	// Valid in-directory script
+	validRel := "dist/index.js"
+	cleanPath, err := resolveActionScriptPath(actionDir, validRel)
+	if err != nil {
+		t.Fatalf("unexpected error for valid path: %v", err)
+	}
+	expected := filepath.Join(actionDir, "dist", "index.js")
+	if cleanPath != expected {
+		t.Errorf("expected %q, got %q", expected, cleanPath)
+	}
+
+	// Traversal attacks escaping actionDir
+	escapes := []string{
+		"../../evil.js",
+		"../../../tmp/evil.js",
+		"dist/../../../../etc/passwd",
+	}
+	for _, esc := range escapes {
+		_, err := resolveActionScriptPath(actionDir, esc)
+		if err == nil {
+			t.Errorf("expected error for escaping path %q, got nil", esc)
+		}
+	}
+
+	// Empty path
+	if _, err := resolveActionScriptPath(actionDir, ""); err == nil {
+		t.Error("expected error for empty script path, got nil")
+	}
+}

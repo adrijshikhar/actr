@@ -674,7 +674,7 @@ type CompleteJobRequest struct {
 	StepResults []StepResult      `json:"stepResults,omitempty"`
 }
 
-func (r CompleteJobRequest) MarshalJSON() ([]byte, error) {
+func (r *CompleteJobRequest) MarshalJSON() ([]byte, error) {
 	type wireOutputVal struct {
 		Value    string `json:"value"`
 		IsSecret bool   `json:"isSecret,omitempty"`

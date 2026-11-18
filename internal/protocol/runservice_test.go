@@ -1104,4 +1104,3 @@ func TestParseAcquiredJob_StepReferencePreservation(t *testing.T) {
 	assert.Equal(t, "v3", s2.Reference.Ref)
 	assert.Equal(t, "uses", s2.Type)
 }
-

@@ -387,3 +387,42 @@ func TestActionResolver_ContextCanceled(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, context.Canceled))
 }
+
+func TestActionResolver_LockContentionContextCanceled(t *testing.T) {
+	tmpDir := t.TempDir()
+	resolver := action.NewActionResolver(tmpDir, http.DefaultClient)
+
+	ref := &protocol.StepReference{
+		Type: "repository",
+		Name: "actions/locked-action",
+		Ref:  "v1",
+	}
+
+	// Create and lock the file externally
+	lockDir := filepath.Join(tmpDir, "_actions", "actions", "locked-action")
+	require.NoError(t, os.MkdirAll(lockDir, 0755))
+	lockFile := filepath.Join(lockDir, "v1.lock")
+	f, err := os.OpenFile(lockFile, os.O_CREATE|os.O_RDWR, 0644)
+	require.NoError(t, err)
+	defer func() {
+		_ = f.Close()
+	}()
+
+	// Acquire lock on file to simulate a concurrent worker hanging
+	require.NoError(t, action.LockFileForTest(context.Background(), f))
+	defer func() {
+		_ = action.UnlockFileForTest(f)
+	}()
+
+	// Now try to resolve with a short timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err = resolver.Resolve(ctx, ref)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled), "expected context deadline/canceled error, got: %v", err)
+	assert.Less(t, elapsed, 1*time.Second, "lock acquisition did not respect context timeout")
+}

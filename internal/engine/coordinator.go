@@ -294,7 +294,7 @@ func newFailedCompleteJobRequest(job *protocol.JobSpecification) *protocol.Compl
 // ExecuteJob runs all steps of the given JobSpecification sequentially, maintaining cumulative
 // environment updates, aggregating step outputs, managing background lease renewal, and returning
 // the CompleteJobRequest summary.
-func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecification, runServiceURL, token string) (*protocol.CompleteJobRequest, error) {
+func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecification, runServiceURL, token string) (resp *protocol.CompleteJobRequest, err error) {
 	if job == nil {
 		return nil, errors.New("nil job specification")
 	}
@@ -622,11 +622,28 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	if job.JobToken != "" {
 		jobMasker.AddMask(job.JobToken)
 	}
+	if token != "" {
+		jobMasker.AddMask(token)
+	}
 
 	var stepLogger *StepLogger
 	if c.stepLoggerEnabled {
 		stepLogger = NewStepLogger(jobDisplayName, stdout, c.colorEnabled).WithMasker(jobMasker)
 	}
+
+	// Defer post-hooks teardown (LIFO) so that action cleanups run even on step setup failure or cancel
+	defer func() {
+		if len(postHooks) > 0 {
+			if postErr := c.executePostHooks(ctx, jobID, postHooks, stepLogger, jobMasker); postErr != nil {
+				if conclusion == "success" {
+					conclusion = "failure"
+				}
+			}
+		}
+		if resp != nil {
+			resp.Conclusion = conclusion
+		}
+	}()
 
 	for i, step := range job.Steps {
 		if err := ctx.Err(); err != nil {
@@ -908,15 +925,6 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		cleanupStepFiles()
 	}
 
-	// Teardown block: execute post-step hooks in reverse order (LIFO) with decoupled context
-	if len(postHooks) > 0 {
-		if postErr := c.executePostHooks(ctx, jobID, postHooks, stepLogger, jobMasker); postErr != nil {
-			if conclusion == "success" {
-				conclusion = "failure"
-			}
-		}
-	}
-
 	return &protocol.CompleteJobRequest{
 		PlanID:      job.PlanID,
 		JobID:       job.JobID,
@@ -995,7 +1003,11 @@ func (c *Coordinator) executeActionStep(ctx context.Context, jobID, stepID, step
 			return &driver.StepResult{ExitCode: 1, Error: err}, err
 		}
 
-		scriptPath := filepath.Join(actionDir, manifest.Runs.Main)
+		scriptPath, err := resolveActionScriptPath(actionDir, manifest.Runs.Main)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "Error resolving action script: %v\n", err)
+			return &driver.StepResult{ExitCode: 1, Error: err}, err
+		}
 		actCtx.ActionDir = actionDir
 		actCtx.Manifest = manifest
 
@@ -1262,6 +1274,11 @@ if [ -z "$REPO_NAME" ]; then
     exit 1
 fi
 
+if ! echo "$REPO_NAME" | grep -Eq '^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$'; then
+    echo "Error: invalid repository name format: $REPO_NAME" >&2
+    exit 1
+fi
+
 CLONE_URL="https://github.com/${REPO_NAME}.git"
 if [ -n "${GITHUB_TOKEN}" ]; then
     CLONE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_NAME}.git"
@@ -1442,8 +1459,27 @@ func IngestPathFile(filePath string, currentPath string) (string, error) {
 	return prefix + string(filepath.ListSeparator) + currentPath, nil
 }
 
+var forbiddenEnvKeys = map[string]bool{
+	"NODE_OPTIONS":          true,
+	"LD_PRELOAD":            true,
+	"LD_LIBRARY_PATH":       true,
+	"DYLD_INSERT_LIBRARIES": true,
+	"DYLD_LIBRARY_PATH":     true,
+	"PATH":                  true,
+	"RUNNER_TEMP":           true,
+	"RUNNER_TOOL_CACHE":     true,
+	"RUNNER_WORKSPACE":      true,
+	"GITHUB_ENV":            true,
+	"GITHUB_OUTPUT":         true,
+	"GITHUB_STATE":          true,
+	"GITHUB_PATH":           true,
+	"GITHUB_WORKSPACE":      true,
+	"GITHUB_ACTION_PATH":    true,
+}
+
 // IngestEnvFile reads key=value or multiline delimiter syntax from filePath,
-// merges them into currentEnv, and truncates the file.
+// merges them into currentEnv, and truncates the file. It drops dangerous environment
+// variables to prevent arbitrary code injection or hijacking subsequent actions.
 func IngestEnvFile(filePath string, currentEnv map[string]string) error {
 	if filePath == "" {
 		return nil
@@ -1460,6 +1496,9 @@ func IngestEnvFile(filePath string, currentEnv map[string]string) error {
 
 	if currentEnv != nil {
 		for k, v := range newVars {
+			if forbiddenEnvKeys[strings.ToUpper(strings.TrimSpace(k))] {
+				continue
+			}
 			currentEnv[k] = v
 		}
 	}
@@ -1518,6 +1557,20 @@ func (c *Coordinator) executePostHooks(ctx context.Context, jobID string, postHo
 	return firstErr
 }
 
+// resolveActionScriptPath safely resolves a relative script path within an action directory,
+// verifying that path traversal cannot escape the action directory boundary.
+func resolveActionScriptPath(actionDir, relPath string) (string, error) {
+	if strings.TrimSpace(relPath) == "" {
+		return "", errors.New("action script path cannot be empty")
+	}
+	cleanDir := filepath.Clean(actionDir)
+	cleanPath := filepath.Clean(filepath.Join(cleanDir, relPath))
+	if !strings.HasPrefix(cleanPath, cleanDir+string(filepath.Separator)) && cleanPath != cleanDir {
+		return "", fmt.Errorf("action script %q escapes action directory %s", relPath, actionDir)
+	}
+	return cleanPath, nil
+}
+
 func (c *Coordinator) executeSinglePostHook(ctx context.Context, jobID string, hook PostStepHook, nodePath string, stepLogger *StepLogger, jobMasker *SecretMasker) error {
 	postEnv := make(map[string]string, len(hook.Env)+len(hook.State)+10)
 	for k, v := range hook.Env {
@@ -1533,8 +1586,12 @@ func (c *Coordinator) executeSinglePostHook(ctx context.Context, jobID string, h
 	}
 
 	scriptPath := hook.PostScript
-	if !filepath.IsAbs(scriptPath) && hook.ActionDir != "" {
-		scriptPath = filepath.Join(hook.ActionDir, scriptPath)
+	if hook.ActionDir != "" {
+		resolved, err := resolveActionScriptPath(hook.ActionDir, scriptPath)
+		if err != nil {
+			return fmt.Errorf("invalid post hook script path: %w", err)
+		}
+		scriptPath = resolved
 	}
 
 	workspaceDir := postEnv["GITHUB_WORKSPACE"]

@@ -18,10 +18,15 @@ type NodeDetector interface {
 	Detect(ctx context.Context) (string, error)
 }
 
+// ErrNodeNotFound indicates that no valid Node.js binary was found on the host.
+var ErrNodeNotFound = errors.New("no valid Node.js runtime found on host (checked ACTR_NODE_PATH, PATH, version managers, and standard locations)")
+
 // HostNodeDetector discovers a suitable Node.js runtime on the host machine.
 type HostNodeDetector struct {
 	CustomPath string
 }
+
+var _ NodeDetector = (*HostNodeDetector)(nil)
 
 // NewHostNodeDetector creates a new HostNodeDetector with an optional custom path.
 func NewHostNodeDetector(customPath string) *HostNodeDetector {
@@ -103,7 +108,7 @@ func (d *HostNodeDetector) Detect(ctx context.Context) (string, error) {
 		}
 	}
 
-	return "", errors.New("no valid Node.js runtime found on host (checked ACTR_NODE_PATH, PATH, version managers, and standard locations)")
+	return "", ErrNodeNotFound
 }
 
 // verifyNodeBinary ensures that the candidate path exists, is executable,

@@ -121,8 +121,8 @@ func ExecuteNodeAction(ctx context.Context, nodePath string, scriptPath string, 
 	}
 	cmd.WaitDelay = 5 * time.Second
 
-	// Layer host environment with built action environment
-	cmd.Env = os.Environ()
+	// Layer sanitized host environment with built action environment
+	cmd.Env = SanitizeHostEnvironment(os.Environ())
 	if actCtx != nil {
 		actionEnv := BuildActionEnvironment(actCtx)
 		for k, v := range actionEnv {
@@ -131,4 +131,39 @@ func ExecuteNodeAction(ctx context.Context, nodePath string, scriptPath string, 
 	}
 
 	return cmd.Run()
+}
+
+// SanitizeHostEnvironment filters sensitive environment variables (such as host tokens,
+// SSH agent sockets, cloud provider credentials, and dynamic loader injection flags)
+// to prevent third-party marketplace actions from accessing host credentials.
+func SanitizeHostEnvironment(environ []string) []string {
+	sensitiveKeys := map[string]bool{
+		"GITHUB_TOKEN":              true,
+		"GH_TOKEN":                  true,
+		"AWS_ACCESS_KEY_ID":         true,
+		"AWS_SECRET_ACCESS_KEY":     true,
+		"AWS_SESSION_TOKEN":         true,
+		"AWS_SECURITY_TOKEN":        true,
+		"SSH_AUTH_SOCK":             true,
+		"NODE_OPTIONS":              true,
+		"LD_PRELOAD":                true,
+		"LD_LIBRARY_PATH":           true,
+		"DYLD_INSERT_LIBRARIES":     true,
+		"DYLD_LIBRARY_PATH":         true,
+		"HOMEBREW_GITHUB_API_TOKEN": true,
+	}
+
+	sanitized := make([]string, 0, len(environ))
+	for _, envVar := range environ {
+		idx := strings.IndexByte(envVar, '=')
+		if idx <= 0 {
+			continue
+		}
+		key := strings.ToUpper(envVar[:idx])
+		if sensitiveKeys[key] {
+			continue
+		}
+		sanitized = append(sanitized, envVar)
+	}
+	return sanitized
 }

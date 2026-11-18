@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/adrijshikhar/actr/internal/protocol"
@@ -35,6 +34,8 @@ type ActionResolver struct {
 	HTTPClient *http.Client
 	BaseURL    string // for testing; defaults to "https://codeload.github.com"
 }
+
+var _ Resolver = (*ActionResolver)(nil)
 
 // NewActionResolver creates a new ActionResolver instance with default options.
 func NewActionResolver(baseDir string, client *http.Client) *ActionResolver {
@@ -132,19 +133,19 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 		return "", fmt.Errorf("failed to create action directory %s: %w", lockDir, err)
 	}
 
-	lockFile := filepath.Join(r.BaseDir, "_actions", owner, repo, version+".lock")
-	lockF, err := os.OpenFile(lockFile, os.O_CREATE|os.O_RDWR, 0644)
+	lockFilePath := filepath.Join(r.BaseDir, "_actions", owner, repo, version+".lock")
+	lockF, err := os.OpenFile(lockFilePath, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
-		return "", fmt.Errorf("failed to open lock file %s: %w", lockFile, err)
+		return "", fmt.Errorf("failed to open lock file %s: %w", lockFilePath, err)
 	}
 	defer func() {
-		_ = syscall.Flock(int(lockF.Fd()), syscall.LOCK_UN)
+		_ = unlockFile(lockF)
 		_ = lockF.Close()
 	}()
 
-	// Acquire kernel-level exclusive advisory lock
-	if err := syscall.Flock(int(lockF.Fd()), syscall.LOCK_EX); err != nil {
-		return "", fmt.Errorf("failed to acquire advisory lock on %s: %w", lockFile, err)
+	// Acquire cross-platform exclusive advisory lock with context cancellation support
+	if err := lockFile(ctx, lockF); err != nil {
+		return "", fmt.Errorf("failed to acquire advisory lock on %s: %w", lockFilePath, err)
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -153,7 +154,7 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 
 	// Re-check markerFile after acquiring the lock (another process might have completed it)
 	if _, err := os.Stat(markerFile); err == nil {
-		return filepath.Join(destDir, subpath), nil
+		return filepath.Abs(filepath.Join(destDir, subpath))
 	}
 
 	baseURL := r.BaseURL
@@ -317,8 +318,12 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 				return "", fmt.Errorf("failed to create file %s: %w", cleanTarget, err)
 			}
 
-			limitedReader := io.LimitReader(tr, maxSingleFileSize)
+			limitedReader := io.LimitReader(tr, maxSingleFileSize+1)
 			n, err := io.CopyBuffer(out, limitedReader, buf)
+			if n > maxSingleFileSize {
+				_ = out.Close()
+				return "", fmt.Errorf("file %s exceeds maximum single file size limit of 100MB", hdr.Name)
+			}
 			totalBytes += n
 			if totalBytes > maxTotalArchiveBytes {
 				_ = out.Close()

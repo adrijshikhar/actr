@@ -132,8 +132,8 @@ jobs:
   build-and-test:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
           go-version-file: 'go.mod'
           cache: true
@@ -146,8 +146,8 @@ jobs:
   build-and-test:
     runs-on: [self-hosted, macOS]
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
           go-version-file: 'go.mod'
           cache: true
@@ -230,14 +230,29 @@ GitHub Actions treats this as a logical **AND**: the runner must possess **all**
   runs-on: [self-hosted, macOS]
   ```
 
+> [!WARNING]
+> **Security Notice for Public Repositories & Forks:**  
+> Because `actr` executes workflows directly on the host machine, never allow untrusted public pull requests from forks to execute on a self-hosted runner. For public repositories, route public fork pull requests to GitHub-hosted cloud virtual machines (`macos-latest`), and reserve `[self-hosted, macOS]` strictly for internal branches, `main` branch pushes, or manual `workflow_dispatch` runs.
+
 #### 4. Dual-Target Matrix Example (Cloud + Local)
 To support both GitHub Cloud Linux runners and your local `actr` macOS runner in the same workflow matrix:
 
 ```yaml
 jobs:
   test:
-    name: Test (${{ matrix.os-name }})
+    name: Test (${{ matrix.platform }})
+    timeout-minutes: 25
+    runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Linux
+            runner: ubuntu-latest
+
+          # Public fork PRs run on safe cloud runners; trusted repo PRs or main pushes run on actr
+          - platform: macOS
+            runner: ${{ (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'workflow_dispatch' && inputs.use_actr)) && fromJSON('["self-hosted", "macOS"]') || 'macos-latest' }}
       matrix:
         include:
           - os-name: Linux
@@ -246,8 +261,8 @@ jobs:
             runner: [self-hosted, macOS]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
           go-version-file: 'go.mod'
           cache: true
@@ -310,9 +325,9 @@ jobs:
 
 ### Action Resolution & Caching
 1. **Repository Tarball Download**:
-   When a step references `uses: actions/setup-go@v7`, `actr` requests the release tarball directly from GitHub codeload endpoints.
-2. **Advisory Locking (`syscall.Flock`)**:
-   Downloads are protected by kernel-level file locks (`<version>.lock`). If multiple parallel matrix jobs request the same action simultaneously, only one downloads while others wait, eliminating multi-process race conditions.
+   When a step references `uses: actions/setup-go@v5`, `actr` requests the release tarball directly from GitHub codeload endpoints.
+2. **Advisory Locking**:
+   Downloads are protected by cross-platform advisory file locks (`<version>.lock`) using non-blocking kernel locks with context timeout polling (`ctx.Done()`). If multiple parallel matrix jobs request the same action simultaneously, only one downloads while others wait, eliminating multi-process race conditions.
 3. **Completion Markers**:
    Extracted actions are committed with a `<version>.completed` marker. Subsequent runs resolve in `< 1ms` directly from local cache at:
    ```text

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -246,4 +247,57 @@ func TestExecuteNodeAction_InvalidArgs(t *testing.T) {
 	cancel()
 	err = action.ExecuteNodeAction(canceledCtx, "node", "script.js", nil, nil, nil)
 	assert.ErrorIs(t, err, context.Canceled)
+}
+
+func TestSanitizeHostEnvironment(t *testing.T) {
+	inputEnv := []string{
+		"PATH=/usr/bin:/bin",
+		"USER=runner",
+		"HOME=/Users/runner",
+		"GITHUB_TOKEN=ghp_secret_host_token_12345",
+		"GH_TOKEN=ghp_secret_host_token_67890",
+		"AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+		"AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+		"AWS_SESSION_TOKEN=session_token_xyz",
+		"AWS_SECURITY_TOKEN=sec_token_xyz",
+		"SSH_AUTH_SOCK=/private/tmp/com.apple.launchd.xxx/Listeners",
+		"NODE_OPTIONS=--require /tmp/malicious.js",
+		"LD_PRELOAD=/tmp/evil.so",
+		"LD_LIBRARY_PATH=/tmp/evil_libs",
+		"DYLD_INSERT_LIBRARIES=/tmp/evil.dylib",
+		"DYLD_LIBRARY_PATH=/tmp/evil_dylibs",
+		"HOMEBREW_GITHUB_API_TOKEN=ghp_brew_token",
+		"CUSTOM_SAFE_VAR=hello_world",
+	}
+
+	sanitized := action.SanitizeHostEnvironment(inputEnv)
+
+	envMap := make(map[string]string)
+	for _, entry := range sanitized {
+		parts := strings.SplitN(entry, "=", 2)
+		if len(parts) == 2 {
+			envMap[parts[0]] = parts[1]
+		}
+	}
+
+	// Safe variables must remain
+	assert.Equal(t, "/usr/bin:/bin", envMap["PATH"])
+	assert.Equal(t, "runner", envMap["USER"])
+	assert.Equal(t, "/Users/runner", envMap["HOME"])
+	assert.Equal(t, "hello_world", envMap["CUSTOM_SAFE_VAR"])
+
+	// Sensitive host variables must be completely stripped
+	assert.NotContains(t, envMap, "GITHUB_TOKEN")
+	assert.NotContains(t, envMap, "GH_TOKEN")
+	assert.NotContains(t, envMap, "AWS_ACCESS_KEY_ID")
+	assert.NotContains(t, envMap, "AWS_SECRET_ACCESS_KEY")
+	assert.NotContains(t, envMap, "AWS_SESSION_TOKEN")
+	assert.NotContains(t, envMap, "AWS_SECURITY_TOKEN")
+	assert.NotContains(t, envMap, "SSH_AUTH_SOCK")
+	assert.NotContains(t, envMap, "NODE_OPTIONS")
+	assert.NotContains(t, envMap, "LD_PRELOAD")
+	assert.NotContains(t, envMap, "LD_LIBRARY_PATH")
+	assert.NotContains(t, envMap, "DYLD_INSERT_LIBRARIES")
+	assert.NotContains(t, envMap, "DYLD_LIBRARY_PATH")
+	assert.NotContains(t, envMap, "HOMEBREW_GITHUB_API_TOKEN")
 }
