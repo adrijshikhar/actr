@@ -49,8 +49,8 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	}
 
 	u := url.URL{
-		Scheme: "file",
-		Path:   filepath.ToSlash(dbPath),
+		Scheme:   "file",
+		Path:     filepath.ToSlash(dbPath),
 		RawQuery: "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)",
 	}
 	db, err := sql.Open("sqlite", u.String())
@@ -586,19 +586,19 @@ func (s *SQLiteStore) StartRun(job *monitor.JobInfo, limits *config.LimitsConfig
 	}
 
 	meta := &monitor.RunMetadata{
-		ID:          job.ID,
-		Name:        job.Name,
-		Workflow:    job.Workflow,
-		Repo:        job.Repo,
-		RepoAlias:   job.RepoAlias,
-		RepoURL:     job.RepoURL,
-		Owner:       job.Owner,
-		Status:      status,
-		StartedAt:   startedAt,
-		EndedAt:     job.EndedAt,
-		Driver:      driver,
-		Limits:      limits,
-		Steps:       steps,
+		ID:        job.ID,
+		Name:      job.Name,
+		Workflow:  job.Workflow,
+		Repo:      job.Repo,
+		RepoAlias: job.RepoAlias,
+		RepoURL:   job.RepoURL,
+		Owner:     job.Owner,
+		Status:    status,
+		StartedAt: startedAt,
+		EndedAt:   job.EndedAt,
+		Driver:    driver,
+		Limits:    limits,
+		Steps:     steps,
 	}
 
 	return s.RecordRun(meta)

@@ -115,10 +115,10 @@ func TestSQLiteHistory_TUI_EndToEndIntegration(t *testing.T) {
 		LogLine: "Setting up Go 1.27 environment...",
 	})
 	monServer.Publish(monitor.Event{
-		Type:    monitor.EventStepFinish,
-		JobID:   jobIDAimHist,
-		StepID:  "step-setup",
-		Step:    &monitor.StepInfo{ID: "step-setup", Status: monitor.StatusSuccess},
+		Type:   monitor.EventStepFinish,
+		JobID:  jobIDAimHist,
+		StepID: "step-setup",
+		Step:   &monitor.StepInfo{ID: "step-setup", Status: monitor.StatusSuccess},
 	})
 
 	monServer.Publish(monitor.Event{
@@ -145,10 +145,10 @@ func TestSQLiteHistory_TUI_EndToEndIntegration(t *testing.T) {
 		})
 	}
 	monServer.Publish(monitor.Event{
-		Type:    monitor.EventStepFinish,
-		JobID:   jobIDAimHist,
-		StepID:  "step-test",
-		Step:    &monitor.StepInfo{ID: "step-test", Status: monitor.StatusFailed},
+		Type:   monitor.EventStepFinish,
+		JobID:  jobIDAimHist,
+		StepID: "step-test",
+		Step:   &monitor.StepInfo{ID: "step-test", Status: monitor.StatusFailed},
 	})
 	monServer.Publish(monitor.Event{
 		Type:      monitor.EventJobFinish,
@@ -194,10 +194,10 @@ func TestSQLiteHistory_TUI_EndToEndIntegration(t *testing.T) {
 		})
 	}
 	monServer.Publish(monitor.Event{
-		Type:    monitor.EventStepFinish,
-		JobID:   jobIDCxHist,
-		StepID:  "step-pkg",
-		Step:    &monitor.StepInfo{ID: "step-pkg", Status: monitor.StatusSuccess},
+		Type:   monitor.EventStepFinish,
+		JobID:  jobIDCxHist,
+		StepID: "step-pkg",
+		Step:   &monitor.StepInfo{ID: "step-pkg", Status: monitor.StatusSuccess},
 	})
 	monServer.Publish(monitor.Event{
 		Type:      monitor.EventJobFinish,
@@ -491,4 +491,3 @@ func TestSQLiteHistory_TUI_EndToEndIntegration(t *testing.T) {
 	assert.Equal(t, tui.FocusTree, m.Focus())
 	assert.Equal(t, "repo:aim", m.Tree().SelectedNode().ID)
 }
-
