@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -26,8 +28,6 @@ var (
 var (
 	// ErrRunNotFound indicates that a requested run was not found in the SQLite store.
 	ErrRunNotFound = errors.New("history run not found")
-	// ErrStepNotFound indicates that a requested step was not found in the SQLite store.
-	ErrStepNotFound = errors.New("history step not found")
 )
 
 // SQLiteStore provides pure-Go SQLite persistence for run metadata and step logs.
@@ -47,11 +47,18 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("failed to create sqlite directory %s: %w", filepath.Dir(dbPath), err)
 	}
 
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)", dbPath)
-	db, err := sql.Open("sqlite", dsn)
+	u := url.URL{
+		Scheme: "file",
+		Path:   filepath.ToSlash(dbPath),
+		RawQuery: "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)",
+	}
+	db, err := sql.Open("sqlite", u.String())
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite database at %s: %w", dbPath, err)
 	}
+
+	// Restrict file permissions to user-only read/write
+	_ = os.Chmod(dbPath, 0600)
 
 	// Set single-connection pool to serialize writes and eliminate SQLITE_BUSY concurrency conflicts.
 	db.SetMaxOpenConns(1)
@@ -92,6 +99,7 @@ func (s *SQLiteStore) initSchema() error {
 		ended_at DATETIME,
 		duration_sec INTEGER NOT NULL DEFAULT 0,
 		driver TEXT NOT NULL DEFAULT '',
+		limits_json TEXT,
 		peak_cpu_percent REAL NOT NULL DEFAULT 0,
 		peak_rss_bytes INTEGER NOT NULL DEFAULT 0,
 		total_net_rx_bytes INTEGER NOT NULL DEFAULT 0,
@@ -133,6 +141,9 @@ func (s *SQLiteStore) initSchema() error {
 		return fmt.Errorf("exec schema ddl: %w", err)
 	}
 
+	// Backward-compatible schema migration if limits_json column is absent
+	_, _ = s.db.ExecContext(ctx, "ALTER TABLE runs ADD COLUMN limits_json TEXT;")
+
 	return nil
 }
 
@@ -163,13 +174,20 @@ func (s *SQLiteStore) RecordRun(meta *monitor.RunMetadata) error {
 
 	stepCount := len(meta.Steps)
 
+	var limitsJSON sql.NullString
+	if meta.Limits != nil {
+		if b, err := json.Marshal(meta.Limits); err == nil {
+			limitsJSON = sql.NullString{String: string(b), Valid: true}
+		}
+	}
+
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO runs (
 			id, repo_alias, repo_url, name, workflow, owner, repo, status,
-			started_at, ended_at, duration_sec, driver, peak_cpu_percent,
+			started_at, ended_at, duration_sec, driver, limits_json, peak_cpu_percent,
 			peak_rss_bytes, total_net_rx_bytes, total_net_tx_bytes,
 			total_disk_write_bytes, step_count
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			repo_alias = excluded.repo_alias,
 			repo_url = excluded.repo_url,
@@ -182,6 +200,7 @@ func (s *SQLiteStore) RecordRun(meta *monitor.RunMetadata) error {
 			ended_at = excluded.ended_at,
 			duration_sec = excluded.duration_sec,
 			driver = excluded.driver,
+			limits_json = excluded.limits_json,
 			peak_cpu_percent = excluded.peak_cpu_percent,
 			peak_rss_bytes = excluded.peak_rss_bytes,
 			total_net_rx_bytes = excluded.total_net_rx_bytes,
@@ -190,7 +209,7 @@ func (s *SQLiteStore) RecordRun(meta *monitor.RunMetadata) error {
 			step_count = excluded.step_count
 	`,
 		meta.ID, meta.RepoAlias, meta.RepoURL, meta.Name, meta.Workflow, meta.Owner, meta.Repo, meta.Status,
-		meta.StartedAt, endedAt, meta.DurationSec, meta.Driver, meta.MetricsSummary.PeakCPUPercent,
+		meta.StartedAt, endedAt, meta.DurationSec, meta.Driver, limitsJSON, meta.MetricsSummary.PeakCPUPercent,
 		meta.MetricsSummary.PeakRSSBytes, meta.MetricsSummary.TotalNetRxBytes, meta.MetricsSummary.TotalNetTxBytes,
 		meta.MetricsSummary.TotalDiskWrittenBytes, stepCount,
 	)
@@ -253,18 +272,19 @@ func (s *SQLiteStore) GetRun(jobID string) (*monitor.RunMetadata, error) {
 	ctx := context.Background()
 
 	var (
-		meta      monitor.RunMetadata
-		endedAt   sql.NullTime
-		peakCPU   float64
-		peakRSS   uint64
-		netRx     uint64
-		netTx     uint64
-		diskWrite uint64
+		meta       monitor.RunMetadata
+		endedAt    sql.NullTime
+		limitsJSON sql.NullString
+		peakCPU    float64
+		peakRSS    uint64
+		netRx      uint64
+		netTx      uint64
+		diskWrite  uint64
 	)
 
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, repo_alias, repo_url, name, workflow, owner, repo, status,
-		       started_at, ended_at, duration_sec, driver, peak_cpu_percent,
+		       started_at, ended_at, duration_sec, driver, limits_json, peak_cpu_percent,
 		       peak_rss_bytes, total_net_rx_bytes, total_net_tx_bytes, total_disk_write_bytes
 		FROM runs
 		WHERE id = ?
@@ -281,6 +301,7 @@ func (s *SQLiteStore) GetRun(jobID string) (*monitor.RunMetadata, error) {
 		&endedAt,
 		&meta.DurationSec,
 		&meta.Driver,
+		&limitsJSON,
 		&peakCPU,
 		&peakRSS,
 		&netRx,
@@ -296,6 +317,13 @@ func (s *SQLiteStore) GetRun(jobID string) (*monitor.RunMetadata, error) {
 
 	if endedAt.Valid {
 		meta.EndedAt = endedAt.Time
+	}
+
+	if limitsJSON.Valid && limitsJSON.String != "" {
+		var lim config.LimitsConfig
+		if err := json.Unmarshal([]byte(limitsJSON.String), &lim); err == nil {
+			meta.Limits = &lim
+		}
 	}
 
 	meta.MetricsSummary = monitor.RunMetricsSummary{
@@ -344,11 +372,14 @@ func (s *SQLiteStore) GetRun(jobID string) (*monitor.RunMetadata, error) {
 	for _, st := range steps {
 		var lineCount int
 		var byteCount int64
-		_ = s.db.QueryRowContext(ctx, `
-			SELECT COUNT(*), COALESCE(SUM(LENGTH(log_line) + 1), 0)
+		err := s.db.QueryRowContext(ctx, `
+			SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(log_line AS BLOB)) + 1), 0)
 			FROM step_logs
 			WHERE run_id = ? AND step_id = ?
 		`, jobID, st.ID).Scan(&lineCount, &byteCount)
+		if err != nil {
+			return nil, fmt.Errorf("scan log stats for step %s: %w", st.ID, err)
+		}
 		st.LogLines = lineCount
 		st.LogBytes = byteCount
 	}
@@ -428,7 +459,13 @@ func (s *SQLiteStore) AppendStepLogs(jobID, stepID string, lines []string) error
 
 	ctx := context.Background()
 
-	// Ensure step exists so foreign key doesn't fail if log is appended before step metadata
+	// Ensure run and step exist so foreign key doesn't fail if log is appended before run/step metadata
+	_, _ = s.db.ExecContext(ctx, `
+		INSERT INTO runs (id, status, started_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(id) DO NOTHING
+	`, jobID, monitor.StatusRunning, time.Now().UTC())
+
 	_, _ = s.db.ExecContext(ctx, `
 		INSERT INTO steps (id, run_id, step_index, name, status)
 		VALUES (?, ?, 0, ?, ?)
@@ -592,11 +629,16 @@ func (s *SQLiteStore) FinishStep(jobID, stepID, conclusion string, exitCode int,
 		}
 	}
 
+	var sAtParam sql.NullTime
+	if !sAt.IsZero() {
+		sAtParam = sql.NullTime{Time: sAt, Valid: true}
+	}
+
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE steps
-		SET status = ?, ended_at = ?, duration_sec = ?, exit_code = ?
+		SET status = ?, ended_at = ?, duration_sec = ?, exit_code = ?, started_at = COALESCE(started_at, ?)
 		WHERE run_id = ? AND id = ?
-	`, conclusion, finishedAt, dur, exitCode, jobID, stepID)
+	`, conclusion, finishedAt, dur, exitCode, sAtParam, jobID, stepID)
 	if err != nil {
 		return fmt.Errorf("finish step %s/%s: %w", jobID, stepID, err)
 	}
@@ -610,8 +652,9 @@ func (s *SQLiteStore) FinishStep(jobID, stepID, conclusion string, exitCode int,
 				status = excluded.status,
 				ended_at = excluded.ended_at,
 				duration_sec = excluded.duration_sec,
-				exit_code = excluded.exit_code
-		`, stepID, jobID, stepID, conclusion, sAt, finishedAt, dur, exitCode)
+				exit_code = excluded.exit_code,
+				started_at = COALESCE(steps.started_at, excluded.started_at)
+		`, stepID, jobID, stepID, conclusion, sAtParam, finishedAt, dur, exitCode)
 		if err != nil {
 			return fmt.Errorf("upsert finished step %s/%s: %w", jobID, stepID, err)
 		}
@@ -770,30 +813,66 @@ func (s *SQLiteStore) RecoverInterruptedRuns() (int, error) {
 	return len(interrupted), nil
 }
 
-// Prune removes oldest completed runs keeping only maxRuns (satisfies Pruner interface).
-func (s *SQLiteStore) Prune(maxRuns int, _ ...int64) (int, error) {
-	if maxRuns <= 0 {
-		return 0, nil
-	}
+// Prune removes oldest completed runs keeping only maxRuns and enforcing maxDiskBytes (satisfies Pruner interface).
+// Active runs (running, queued) are never pruned.
+func (s *SQLiteStore) Prune(maxRuns int, maxDiskBytes ...int64) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	ctx := context.Background()
-	res, err := s.db.ExecContext(ctx, `
-		DELETE FROM runs
-		WHERE id IN (
-			SELECT id FROM runs
-			ORDER BY started_at DESC
-			LIMIT -1 OFFSET ?
-		)
-	`, maxRuns)
-	if err != nil {
-		return 0, fmt.Errorf("prune runs: %w", err)
+	prunedCount := 0
+
+	// 1. Count pruning: remove oldest completed runs beyond maxRuns limit
+	if maxRuns > 0 {
+		res, err := s.db.ExecContext(ctx, `
+			DELETE FROM runs
+			WHERE id IN (
+				SELECT id FROM runs
+				WHERE status NOT IN ('running', 'queued') AND ended_at IS NOT NULL
+				ORDER BY started_at DESC
+				LIMIT -1 OFFSET ?
+			)
+		`, maxRuns)
+		if err != nil {
+			return 0, fmt.Errorf("prune runs by count: %w", err)
+		}
+		if rows, err := res.RowsAffected(); err == nil {
+			prunedCount += int(rows)
+		}
 	}
 
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("prune rows affected: %w", err)
+	// 2. Disk size retention: prune oldest completed runs until total log bytes <= maxDiskBytes[0]
+	if len(maxDiskBytes) > 0 && maxDiskBytes[0] > 0 {
+		diskLimit := maxDiskBytes[0]
+		for {
+			var totalBytes int64
+			err := s.db.QueryRowContext(ctx, `
+				SELECT COALESCE(SUM(LENGTH(CAST(log_line AS BLOB)) + 1), 0)
+				FROM step_logs
+			`).Scan(&totalBytes)
+			if err != nil || totalBytes <= diskLimit {
+				break
+			}
+
+			// Delete oldest completed run
+			var oldestID string
+			err = s.db.QueryRowContext(ctx, `
+				SELECT id FROM runs
+				WHERE status NOT IN ('running', 'queued') AND ended_at IS NOT NULL
+				ORDER BY started_at ASC
+				LIMIT 1
+			`).Scan(&oldestID)
+			if err != nil {
+				// No more completed runs to delete
+				break
+			}
+
+			if _, err := s.db.ExecContext(ctx, "DELETE FROM runs WHERE id = ?", oldestID); err != nil {
+				break
+			}
+			prunedCount++
+		}
 	}
-	return int(rows), nil
+
+	return prunedCount, nil
 }

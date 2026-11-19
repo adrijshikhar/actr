@@ -2031,7 +2031,7 @@ func TestDashboard_MouseTreeSelection(t *testing.T) {
 	m = newModel.(*DashboardModel)
 	assert.Equal(t, 3, m.Tree().Cursor)
 
-	// Double click: click again within 200ms -> toggles expand
+	// Double click: click again within 350ms -> toggles expand
 	newModel, _ = m.Update(tea.MouseMsg{
 		X:      15,
 		Y:      4,
@@ -2040,6 +2040,9 @@ func TestDashboard_MouseTreeSelection(t *testing.T) {
 	})
 	m = newModel.(*DashboardModel)
 	assert.False(t, jobNode.Expanded, "double clicking should collapse the node")
+
+	// Wait past the 350ms double-click window to verify chevron click independently
+	time.Sleep(400 * time.Millisecond)
 
 	// Chevron click on row 3: job-1 is depth 3 (indent = 6 spaces, chevron around X=7..9)
 	// Click chevron at X=7, Y=4
@@ -2317,5 +2320,3 @@ func TestDashboard_ToastNotificationLifecycle(t *testing.T) {
 	m = newModel.(*DashboardModel)
 	assert.Empty(t, m.ToastMsg(), "toast should be empty after clearToastMsg")
 }
-
-

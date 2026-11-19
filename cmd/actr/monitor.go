@@ -64,7 +64,7 @@ func newMonitorCmd() *cobra.Command {
 				}
 			} else {
 				dbPath := filepath.Join(cfgDir, "history.db")
-				if runsDirFlag != "" && !cmd.Flags().Changed("config-dir") {
+				if runsDirFlag != "" {
 					if strings.HasSuffix(runsDirFlag, ".db") {
 						dbPath = runsDirFlag
 					} else {
@@ -121,7 +121,7 @@ func newMonitorCmd() *cobra.Command {
 				// Offline mode fallback: load historical runs directly from sqlite store
 				if store == nil {
 					dbPath := filepath.Join(cfgDir, "history.db")
-					if runsDirFlag != "" && !cmd.Flags().Changed("config-dir") {
+					if runsDirFlag != "" {
 						if strings.HasSuffix(runsDirFlag, ".db") {
 							dbPath = runsDirFlag
 						} else {
@@ -155,7 +155,7 @@ func newMonitorCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&sockPath, "sock", "", "path to daemon unix socket")
 	cmd.Flags().StringVar(&configDirFlag, "config-dir", config.DefaultConfigDir(), "path to directory containing runner configuration and daemon socket")
-	cmd.Flags().StringVar(&runsDirFlag, "runs-dir", "", "path to runs history directory (defaults to <config-dir>/runs)")
+	cmd.Flags().StringVar(&runsDirFlag, "runs-dir", "", "path to runs history directory or database file (defaults to <config-dir>/history.db)")
 	cmd.Flags().BoolVar(&demoFlag, "demo", false, "launch monitor with simulated live workflow execution and telemetry")
 	_ = cmd.MarkFlagFilename("sock")
 	_ = cmd.MarkFlagDirname("config-dir")

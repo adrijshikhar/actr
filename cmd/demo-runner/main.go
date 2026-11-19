@@ -13,6 +13,13 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "demo-runner error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	sockPath := "/tmp/actr-demo.sock"
 	if len(os.Args) > 1 {
 		sockPath = filepath.Clean(os.Args[1])
@@ -27,11 +34,13 @@ func main() {
 	} else {
 		tmpDir, err := os.MkdirTemp("", "actr-demo-db-*")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to create demo temp dir: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("failed to create demo temp dir: %w", err)
 		}
 		cleanupDir = tmpDir
 		dbPath = filepath.Join(tmpDir, "demo_history.db")
+	}
+	if cleanupDir != "" {
+		defer func() { _ = os.RemoveAll(cleanupDir) }()
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -47,14 +56,10 @@ func main() {
 			fmt.Fprintf(os.Stderr, "warning: failed to seed history store: %v\n", err)
 		}
 	}
-	if cleanupDir != "" {
-		defer func() { _ = os.RemoveAll(cleanupDir) }()
-	}
 
 	server, err := demo.StartServerWithStore(ctx, sockPath, store)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to start demo server: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to start demo server: %w", err)
 	}
 	defer func() { _ = server.Stop() }()
 
@@ -64,4 +69,5 @@ func main() {
 
 	<-ctx.Done()
 	fmt.Println("\nShutting down demo runner...")
+	return nil
 }

@@ -737,5 +737,3 @@ func TestTreeWidget_ToggleExpandSelected(t *testing.T) {
 	var nilTree *TreeWidget
 	nilTree.ToggleExpandSelected() // should not panic
 }
-
-

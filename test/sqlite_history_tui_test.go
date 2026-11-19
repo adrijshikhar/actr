@@ -3,6 +3,8 @@ package test
 import (
 	"context"
 	"fmt"
+	"io"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -376,10 +378,10 @@ func TestSQLiteHistory_TUI_EndToEndIntegration(t *testing.T) {
 	foundJob := m.Tree().SelectFirst(func(n *tui.TreeNode) bool { return n.ID == jobIDAimHist })
 	require.True(t, foundJob, "historical job node should be selectable in tree")
 
-	// Trigger navigation update (move down from job node to step-test) to fetch historical logs via monitor socket
-	resModel, fetchCmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
-	m = resModel.(*tui.DashboardModel)
-	require.Equal(t, "step-test", m.Tree().SelectedNode().ID, "cursor should have moved to step-test")
+	// Select historical step-test to fetch historical logs via monitor socket
+	foundStep := m.Tree().SelectFirst(func(n *tui.TreeNode) bool { return n.ID == "step-test" })
+	require.True(t, foundStep, "historical step-test node should be selectable in tree")
+	fetchCmd := m.UpdateActiveStepLogs()
 	require.NotNil(t, fetchCmd, "selecting historical step must dispatch fetch command")
 
 	// Execute fetch command and apply historicalLogsLoadedMsg
@@ -449,6 +451,13 @@ func TestSQLiteHistory_TUI_EndToEndIntegration(t *testing.T) {
 	// -------------------------------------------------------------------------
 	// 8. Test Clipboard Copy (CopyText and 'c' Keyboard Shortcut)
 	// -------------------------------------------------------------------------
+	restoreWriter := tui.SetClipboardWriterForTest(io.Discard)
+	defer restoreWriter()
+	restoreCmd := tui.SetExecCommandForTest(func(name string, arg ...string) *exec.Cmd {
+		return exec.Command("true")
+	})
+	defer restoreCmd()
+
 	// 8a. Standalone CopyText helper test
 	copyInput := "actr clipboard end-to-end integration test payload"
 	err = tui.CopyText(copyInput)

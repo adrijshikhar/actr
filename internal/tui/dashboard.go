@@ -610,7 +610,10 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				newVal := m.treeSearchInput.Value()
 				if newVal != prevVal {
 					m.tree.RebuildWithFilter(newVal)
-					_ = m.updateActiveStepLogs()
+					fetchCmd := m.updateActiveStepLogs()
+					if fetchCmd != nil {
+						cmd = tea.Batch(cmd, fetchCmd)
+					}
 				}
 				return m, cmd
 			}
@@ -670,9 +673,23 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "c", "C":
 			logs := m.activeStepLogLines()
 			if len(logs) > 0 {
-				_ = CopyText(strings.Join(logs, "\n"))
+				cleanLogs := make([]string, len(logs))
+				for i, l := range logs {
+					cleanLogs[i] = ansi.Strip(l)
+				}
+				if err := CopyText(strings.Join(cleanLogs, "\n")); err != nil {
+					cmd := m.setToast("✖ Failed to copy to clipboard")
+					return m, cmd
+				}
 				cmd := m.setToast(fmt.Sprintf("✓ Copied %d lines to clipboard", len(logs)))
 				return m, cmd
+			}
+			return m, nil
+		case "tab":
+			if m.focus == FocusTree {
+				m.focus = FocusViewport
+			} else {
+				m.focus = FocusTree
 			}
 			return m, nil
 		case "ctrl+f":
@@ -702,6 +719,7 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "esc":
+			m.focus = FocusTree
 			if m.searchQuery != "" || len(m.searchMatches) > 0 {
 				m.logSearching = false
 				m.logSearchInput.Blur()
@@ -728,16 +746,19 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "k", "up":
+			m.focus = FocusTree
 			if !m.isZoomed {
 				m.tree.Up()
 				return m, m.updateActiveStepLogs()
 			}
 		case "j", "down":
+			m.focus = FocusTree
 			if !m.isZoomed {
 				m.tree.Down()
 				return m, m.updateActiveStepLogs()
 			}
 		case "enter", " ":
+			m.focus = FocusTree
 			if !m.isZoomed {
 				m.tree.Toggle()
 				if sel := m.tree.SelectedNode(); sel != nil && sel.NodeType == NodeRepo {
@@ -746,6 +767,7 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.updateActiveStepLogs()
 			}
 		case "h", "left":
+			m.focus = FocusTree
 			if !m.isZoomed {
 				m.tree.Collapse()
 				if sel := m.tree.SelectedNode(); sel != nil && sel.NodeType == NodeRepo {
@@ -754,6 +776,7 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.updateActiveStepLogs()
 			}
 		case "l", "right":
+			m.focus = FocusTree
 			if !m.isZoomed {
 				m.tree.Expand()
 				if sel := m.tree.SelectedNode(); sel != nil && sel.NodeType == NodeRepo {
@@ -823,9 +846,10 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Action == tea.MouseActionRelease {
 			if m.isSelecting {
 				m.isSelecting = false
+				didDrag := (m.dragStartLine != m.dragEndLine || m.dragStartX != msg.X || m.dragStartY != msg.Y)
 				lines := m.activeStepLogLines()
 				var cmd tea.Cmd
-				if len(lines) > 0 {
+				if didDrag && len(lines) > 0 {
 					minLine := m.dragStartLine
 					maxLine := m.dragEndLine
 					if minLine > maxLine {
@@ -838,10 +862,17 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						maxLine = len(lines) - 1
 					}
 					if minLine <= maxLine && minLine < len(lines) {
-						selected := strings.Join(lines[minLine:maxLine+1], "\n")
+						cleanLines := make([]string, 0, maxLine-minLine+1)
+						for _, l := range lines[minLine : maxLine+1] {
+							cleanLines = append(cleanLines, ansi.Strip(l))
+						}
+						selected := strings.Join(cleanLines, "\n")
 						if selected != "" {
-							_ = CopyText(selected)
-							cmd = m.setToast("✓ Copied selection to clipboard")
+							if err := CopyText(selected); err != nil {
+								cmd = m.setToast("✖ Failed to copy to clipboard")
+							} else {
+								cmd = m.setToast("✓ Copied selection to clipboard")
+							}
 						}
 					}
 				}
@@ -1491,6 +1522,23 @@ func (m *DashboardModel) syncHistoricalHUD() {
 	m.telemetry.ClearHistoricalRun()
 }
 
+func (m *DashboardModel) resolveJobRepoAlias(repoAlias, repo string) string {
+	if repoAlias != "" {
+		return repoAlias
+	}
+	if repo != "" {
+		if m.supervisorStatus != nil {
+			for _, s := range m.supervisorStatus.RepoSlots {
+				if repo == s.Alias || strings.HasSuffix(repo, "/"+s.Alias) {
+					return s.Alias
+				}
+			}
+		}
+		return repo
+	}
+	return "default"
+}
+
 func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 	label := formatRunnerRootLabel(snap.RunnerName)
 	root := &TreeNode{
@@ -1795,17 +1843,14 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 	histRepoJobs := make(map[string][]*monitor.JobInfo)
 	var histRepoAliases []string
 	seenAliases := make(map[string]bool)
-	seenHistIDs := make(map[string]bool)
+	snapHistIDs := make(map[string]bool)
 
 	for _, job := range snap.RecentJobs {
 		if job == nil {
 			continue
 		}
-		seenHistIDs[job.ID] = true
-		alias := job.RepoAlias
-		if alias == "" {
-			alias = "default"
-		}
+		snapHistIDs[job.ID] = true
+		alias := m.resolveJobRepoAlias(job.RepoAlias, job.Repo)
 		if !seenAliases[alias] {
 			seenAliases[alias] = true
 			histRepoAliases = append(histRepoAliases, alias)
@@ -1816,8 +1861,7 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 	// Also check preserved jobs from previous tree
 	for _, entry := range existingHistOrder {
 		jobID := entry.node.ID
-		if !seenHistIDs[jobID] {
-			seenHistIDs[jobID] = true
+		if !snapHistIDs[jobID] {
 			alias := entry.alias
 			if alias == "" {
 				alias = "default"
@@ -1874,16 +1918,10 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 		// Preserve any older jobs not in snapshot for this repo alias
 		for _, entry := range existingHistOrder {
 			if entry.alias == alias {
-				inJobs := false
-				for _, j := range histRepoJobs[alias] {
-					if j.ID == entry.node.ID {
-						inJobs = true
-						break
-					}
+				if snapHistIDs[entry.node.ID] {
+					continue
 				}
-				if !inJobs {
-					repoNode.AddChild(entry.node)
-				}
+				repoNode.AddChild(entry.node)
 			}
 		}
 
@@ -2005,13 +2043,7 @@ func (m *DashboardModel) handleJobStart(job *monitor.JobInfo) {
 
 	parentNode := live
 	if isMulti {
-		repoAlias := job.RepoAlias
-		if repoAlias == "" {
-			repoAlias = job.Repo
-		}
-		if repoAlias == "" {
-			repoAlias = "default"
-		}
+		repoAlias := m.resolveJobRepoAlias(job.RepoAlias, job.Repo)
 		repoID := "repo:" + repoAlias
 		var repoNode *TreeNode
 		for _, ch := range live.Children {
@@ -2184,20 +2216,13 @@ func (m *DashboardModel) handleJobFinish(jobID string, job *monitor.JobInfo) tea
 	}
 
 	// Group into repo node in HISTORICAL RUNS
-	alias := "default"
-	if job != nil && job.RepoAlias != "" {
-		alias = job.RepoAlias
-	} else if job != nil && job.Repo != "" {
-		alias = job.Repo
-	} else if target.Data != nil {
-		if ji, ok := target.Data.(*monitor.JobInfo); ok && ji != nil {
-			if ji.RepoAlias != "" {
-				alias = ji.RepoAlias
-			} else if ji.Repo != "" {
-				alias = ji.Repo
-			}
-		}
+	var rAlias, rRepo string
+	if job != nil {
+		rAlias, rRepo = job.RepoAlias, job.Repo
+	} else if ji, ok := target.Data.(*monitor.JobInfo); ok && ji != nil {
+		rAlias, rRepo = ji.RepoAlias, ji.Repo
 	}
+	alias := m.resolveJobRepoAlias(rAlias, rRepo)
 
 	histRepoID := "hist-repo:" + alias
 	var repoNode *TreeNode
@@ -2389,6 +2414,11 @@ func (m *DashboardModel) renderRepoState(sel *TreeNode) string {
 		}
 	}
 	return sb.String()
+}
+
+// UpdateActiveStepLogs triggers log loading for the currently selected step.
+func (m *DashboardModel) UpdateActiveStepLogs() tea.Cmd {
+	return m.updateActiveStepLogs()
 }
 
 func (m *DashboardModel) updateActiveStepLogs() tea.Cmd {
@@ -2808,27 +2838,19 @@ func highlightLine(line, query string, style lipgloss.Style) string {
 		return line
 	}
 	clean := ansi.Strip(line)
-	lowerClean := strings.ToLower(clean)
-	lowerQuery := strings.ToLower(query)
-	qLen := len(query)
-
-	if !strings.Contains(lowerClean, lowerQuery) {
-		return line
-	}
-
 	var sb strings.Builder
-	lastIdx := 0
-	for {
-		idx := strings.Index(lowerClean[lastIdx:], lowerQuery)
-		if idx == -1 {
-			sb.WriteString(clean[lastIdx:])
+	remaining := clean
+	for len(remaining) > 0 {
+		start, end := findCaseInsensitiveSubstr(remaining, query)
+		if start == -1 {
+			sb.WriteString(remaining)
 			break
 		}
-		matchStart := lastIdx + idx
-		matchEnd := matchStart + qLen
-		sb.WriteString(clean[lastIdx:matchStart])
-		sb.WriteString(style.Render(clean[matchStart:matchEnd]))
-		lastIdx = matchEnd
+		if start > 0 {
+			sb.WriteString(remaining[:start])
+		}
+		sb.WriteString(style.Render(remaining[start:end]))
+		remaining = remaining[end:]
 	}
 	return sb.String()
 }

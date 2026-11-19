@@ -136,32 +136,35 @@ func purgeLegacyJSONRuns(runsDir string) error {
 		return nil
 	}
 
+	var legacyPurged bool
+
 	indexPath := filepath.Join(runsDir, "index.json")
-	hasLegacyIndex := false
 	if _, err := os.Stat(indexPath); err == nil {
-		hasLegacyIndex = true
+		logger.Info("Removing legacy index.json", "path", indexPath)
+		_ = os.Remove(indexPath)
+		legacyPurged = true
 	}
 
-	hasLegacyRuns := false
 	entries, err := os.ReadDir(runsDir)
 	if err == nil {
 		for _, entry := range entries {
 			if entry.IsDir() {
 				metaPath := filepath.Join(runsDir, entry.Name(), "meta.json")
 				if _, err := os.Stat(metaPath); err == nil {
-					hasLegacyRuns = true
-					break
+					subDir := filepath.Join(runsDir, entry.Name())
+					logger.Info("Removing legacy JSON run directory", "path", subDir)
+					_ = os.RemoveAll(subDir)
+					legacyPurged = true
 				}
 			}
 		}
 	}
 
-	if hasLegacyIndex || hasLegacyRuns {
-		logger.Info("Purging legacy JSON runs directory", "path", runsDir)
-		if err := os.RemoveAll(runsDir); err != nil {
-			return fmt.Errorf("purge legacy runs dir %q: %w", runsDir, err)
-		}
+	// Clean up runsDir only if legacy artifacts were removed and directory is now empty
+	if legacyPurged {
+		_ = os.Remove(runsDir)
 	}
+
 	return nil
 }
 
@@ -279,7 +282,7 @@ func newRunCmd() *cobra.Command {
 
 				// Wire SQLite history store and retention to supervisor monitor server
 				dbPath := filepath.Join(cfgDir, "history.db")
-				if runsDirFlag != "" && !cmd.Flags().Changed("config-dir") {
+				if runsDirFlag != "" {
 					if strings.HasSuffix(runsDirFlag, ".db") {
 						dbPath = runsDirFlag
 					} else {
@@ -295,6 +298,11 @@ func newRunCmd() *cobra.Command {
 								logger.Error("failed to close sqlite history store", "error", err)
 							}
 						}()
+						if n, err := histStore.RecoverInterruptedRuns(); err != nil {
+							logger.Warn("failed to recover interrupted runs", "error", err)
+						} else if n > 0 {
+							logger.Info("recovered interrupted runs from prior crash", "count", n)
+						}
 						srv.WithHistoryStore(histStore)
 						maxRuns := 50
 						var maxDiskBytes int64 = 500 * 1024 * 1024
@@ -490,7 +498,7 @@ func newRunCmd() *cobra.Command {
 
 			monServer := monitor.NewServer(filepath.Join(cfgDir, "daemon.sock"), cfg.AgentName)
 			dbPath := filepath.Join(cfgDir, "history.db")
-			if runsDirFlag != "" && !cmd.Flags().Changed("config-dir") {
+			if runsDirFlag != "" {
 				if strings.HasSuffix(runsDirFlag, ".db") {
 					dbPath = runsDirFlag
 				} else {
@@ -505,6 +513,11 @@ func newRunCmd() *cobra.Command {
 						logger.Error("failed to close sqlite history store", "error", err)
 					}
 				}()
+				if n, err := histStore.RecoverInterruptedRuns(); err != nil {
+					logger.Warn("failed to recover interrupted runs", "error", err)
+				} else if n > 0 {
+					logger.Info("recovered interrupted runs from prior crash", "count", n)
+				}
 				monServer.WithHistoryStore(histStore)
 				maxRuns := 50
 				var maxDiskBytes int64 = 200 * 1024 * 1024

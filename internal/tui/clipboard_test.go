@@ -124,10 +124,10 @@ func TestCopyText_GracefulFailure(t *testing.T) {
 		return exec.Command("/path/to/definitely/nonexistent/pbcopy/tool")
 	}
 
-	// Should not panic and should return nil gracefully
+	// Should not panic and should return an error when both OSC 52 and pbcopy fail
 	err := CopyText("fallback ignore test")
-	if err != nil {
-		t.Fatalf("expected nil error on missing tool, got %v", err)
+	if err == nil {
+		t.Fatalf("expected error on missing pbcopy and nil writer, got nil")
 	}
 }
 

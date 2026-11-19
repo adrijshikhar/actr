@@ -2,6 +2,7 @@ package tui
 
 import (
 	"strings"
+	"unicode"
 
 	"github.com/adrijshikhar/actr/internal/monitor"
 	"github.com/charmbracelet/lipgloss"
@@ -104,7 +105,17 @@ type TreeWidget struct {
 	Cursor        int
 	rows          []FlatRow
 	filter        string
-	savedExpanded map[*TreeNode]bool
+	savedExpanded map[string]bool
+}
+
+func nodeKey(n *TreeNode) string {
+	if n == nil {
+		return ""
+	}
+	if n.Parent != nil {
+		return n.Parent.ID + "/" + n.ID
+	}
+	return n.ID
 }
 
 var (
@@ -147,10 +158,16 @@ func (tw *TreeWidget) RebuildWithFilter(query string) {
 		return
 	}
 	trimmed := strings.TrimSpace(query)
+
+	selectedID := ""
+	if sel := tw.SelectedNode(); sel != nil {
+		selectedID = sel.ID
+	}
+
 	if trimmed == "" {
 		if tw.savedExpanded != nil && tw.Root != nil {
 			tw.Root.Walk(func(n *TreeNode) bool {
-				if exp, ok := tw.savedExpanded[n]; ok {
+				if exp, ok := tw.savedExpanded[nodeKey(n)]; ok {
 					n.Expanded = exp
 				}
 				return true
@@ -159,19 +176,46 @@ func (tw *TreeWidget) RebuildWithFilter(query string) {
 		}
 		tw.filter = ""
 		tw.Rebuild()
+		if selectedID != "" {
+			for i, r := range tw.rows {
+				if r.Node != nil && r.Node.ID == selectedID {
+					tw.Cursor = i
+					break
+				}
+			}
+		}
 		return
 	}
 
-	if tw.filter == "" && tw.Root != nil {
-		tw.savedExpanded = make(map[*TreeNode]bool)
+	if tw.savedExpanded == nil && tw.Root != nil {
+		tw.savedExpanded = make(map[string]bool)
 		tw.Root.Walk(func(n *TreeNode) bool {
-			tw.savedExpanded[n] = n.Expanded
+			tw.savedExpanded[nodeKey(n)] = n.Expanded
+			return true
+		})
+	}
+
+	// Only force-expand matching paths when query changes
+	if trimmed != tw.filter && tw.Root != nil {
+		tw.Root.Walk(func(n *TreeNode) bool {
+			if n.HasMatchingDescendant(trimmed) {
+				n.Expanded = true
+			}
 			return true
 		})
 	}
 
 	tw.filter = trimmed
 	tw.Rebuild()
+
+	if selectedID != "" {
+		for i, r := range tw.rows {
+			if r.Node != nil && r.Node.ID == selectedID {
+				tw.Cursor = i
+				break
+			}
+		}
+	}
 }
 
 // Matches returns whether this node matches query via label, ID, or status token.
@@ -195,30 +239,18 @@ func (n *TreeNode) Matches(query string) bool {
 	}
 
 	// 3. Match status token
-	statusStr := strings.ToLower(string(n.Status))
-	if statusStr != "" && strings.Contains(statusStr, q) {
-		return true
+	statusAliases := map[monitor.StepStatus][]string{
+		monitor.StatusFailed:  {"failed", "fail", "error", "err"},
+		monitor.StatusSuccess: {"success", "pass", "ok", "done"},
+		monitor.StatusRunning: {"running", "run", "active"},
+		monitor.StatusSkipped: {"skipped", "skip"},
+		monitor.StatusQueued:  {"queued", "queue"},
 	}
-	switch n.Status {
-	case monitor.StatusFailed:
-		if strings.Contains("failed fail error err", q) || q == "fail" || q == "failed" {
-			return true
-		}
-	case monitor.StatusSuccess:
-		if strings.Contains("success pass ok done", q) || q == "pass" || q == "ok" {
-			return true
-		}
-	case monitor.StatusRunning:
-		if strings.Contains("running run active", q) || q == "run" || q == "running" {
-			return true
-		}
-	case monitor.StatusSkipped:
-		if strings.Contains("skipped skip", q) || q == "skip" || q == "skipped" {
-			return true
-		}
-	case monitor.StatusQueued:
-		if strings.Contains("queued queue", q) || q == "queue" || q == "queued" {
-			return true
+	if aliases, ok := statusAliases[n.Status]; ok {
+		for _, a := range aliases {
+			if strings.HasPrefix(a, q) {
+				return true
+			}
 		}
 	}
 
@@ -241,6 +273,36 @@ func (n *TreeNode) HasMatchingDescendant(query string) bool {
 	return false
 }
 
+// findCaseInsensitiveSubstr returns the byte offsets [start, end) of the first
+// case-insensitive match of query in s, operating cleanly on Unicode runes to avoid
+// slicing errors caused by strings.ToLower byte-length differences.
+func findCaseInsensitiveSubstr(s, query string) (startByte, endByte int) {
+	if s == "" || query == "" {
+		return -1, -1
+	}
+	qRunes := []rune(strings.ToLower(query))
+	sRunes := []rune(s)
+	if len(qRunes) > len(sRunes) {
+		return -1, -1
+	}
+
+	for i := 0; i <= len(sRunes)-len(qRunes); i++ {
+		match := true
+		for j := 0; j < len(qRunes); j++ {
+			if unicode.ToLower(sRunes[i+j]) != qRunes[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			startByte = len(string(sRunes[:i]))
+			endByte = len(string(sRunes[:i+len(qRunes)]))
+			return startByte, endByte
+		}
+	}
+	return -1, -1
+}
+
 // highlightMatches highlights occurrences of query in text with lipgloss styling.
 func highlightMatches(text, query string, isSelected bool) string {
 	if query == "" || text == "" {
@@ -250,9 +312,6 @@ func highlightMatches(text, query string, isSelected bool) string {
 		return normalStyle.Render(text)
 	}
 
-	qLower := strings.ToLower(query)
-	tLower := strings.ToLower(text)
-
 	base := normalStyle
 	hl := highlightStyle
 	if isSelected {
@@ -261,23 +320,18 @@ func highlightMatches(text, query string, isSelected bool) string {
 	}
 
 	var sb strings.Builder
-	start := 0
-	for start < len(text) {
-		idx := strings.Index(tLower[start:], qLower)
-		if idx == -1 {
-			sb.WriteString(base.Render(text[start:]))
+	remaining := text
+	for len(remaining) > 0 {
+		start, end := findCaseInsensitiveSubstr(remaining, query)
+		if start == -1 {
+			sb.WriteString(base.Render(remaining))
 			break
 		}
-		matchStart := start + idx
-		matchEnd := matchStart + len(qLower)
-		if matchEnd > len(text) {
-			matchEnd = len(text)
+		if start > 0 {
+			sb.WriteString(base.Render(remaining[:start]))
 		}
-		if matchStart > start {
-			sb.WriteString(base.Render(text[start:matchStart]))
-		}
-		sb.WriteString(hl.Render(text[matchStart:matchEnd]))
-		start = matchEnd
+		sb.WriteString(hl.Render(remaining[start:end]))
+		remaining = remaining[end:]
 	}
 	return sb.String()
 }
@@ -323,10 +377,6 @@ func (tw *TreeWidget) flattenFiltered(node *TreeNode, depth int, query string) {
 		return
 	}
 
-	if hasDesc {
-		node.Expanded = true
-	}
-
 	node.Depth = depth
 	tw.rows = append(tw.rows, FlatRow{Node: node, Depth: depth})
 
@@ -336,7 +386,7 @@ func (tw *TreeWidget) flattenFiltered(node *TreeNode, depth int, query string) {
 				if ch.Parent == nil {
 					ch.Parent = node
 				}
-				if ch.Matches(query) || ch.HasMatchingDescendant(query) {
+				if matches || ch.Matches(query) || ch.HasMatchingDescendant(query) {
 					tw.flattenFiltered(ch, depth+1, query)
 				}
 			}

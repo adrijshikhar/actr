@@ -17,27 +17,45 @@ var (
 )
 
 // CopyText copies text to the system clipboard using OSC 52 escape sequences
-// with a fallback to macOS pbcopy when running on darwin. Missing tools or
-// execution errors are handled gracefully without panicking or failing.
+// with a fallback to macOS pbcopy when running on darwin.
 func CopyText(text string) error {
-	// 1. Emit OSC 52 escape sequence: \x1b]52;c;<base64>\x07
-	b64 := base64.StdEncoding.EncodeToString([]byte(text))
-	osc52 := fmt.Sprintf("\x1b]52;c;%s\x07", b64)
+	var oscErr error
 	if clipboardWriter != nil {
-		_, _ = fmt.Fprint(clipboardWriter, osc52)
+		b64 := base64.StdEncoding.EncodeToString([]byte(text))
+		osc52 := fmt.Sprintf("\x1b]52;c;%s\x07", b64)
+		_, oscErr = fmt.Fprint(clipboardWriter, osc52)
 	}
 
-	// 2. On macOS (darwin), pipe to pbcopy as a native fallback
 	if currentGOOS == "darwin" {
 		cmd := execCommand("pbcopy")
 		cmd.Stdin = strings.NewReader(text)
-		_ = cmd.Run()
+		if pbErr := cmd.Run(); pbErr != nil {
+			if oscErr != nil {
+				return fmt.Errorf("copy to clipboard failed: pbcopy: %w; osc52: %v", pbErr, oscErr)
+			}
+			return pbErr
+		}
+		return nil
 	}
 
-	return nil
+	return oscErr
 }
 
 // ClipboardCopy is an alias for CopyText.
 func ClipboardCopy(text string) error {
 	return CopyText(text)
+}
+
+// SetClipboardWriterForTest allows unit tests to stub clipboardWriter.
+func SetClipboardWriterForTest(w io.Writer) func() {
+	orig := clipboardWriter
+	clipboardWriter = w
+	return func() { clipboardWriter = orig }
+}
+
+// SetExecCommandForTest allows unit tests to stub execCommand.
+func SetExecCommandForTest(fn func(name string, arg ...string) *exec.Cmd) func() {
+	orig := execCommand
+	execCommand = fn
+	return func() { execCommand = orig }
 }
