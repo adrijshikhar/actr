@@ -15,6 +15,7 @@ import (
 	"github.com/adrijshikhar/actr/internal/monitor"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1730,5 +1731,236 @@ func TestDashboard_SidebarSearch(t *testing.T) {
 	m = newModel.(*DashboardModel)
 	assert.False(t, m.IsTreeSearching())
 	assert.Equal(t, "", m.Tree().Filter())
+}
+
+func TestDashboard_LogSearch_ActivationAndNavigation(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	newModel, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+	m = newModel.(*DashboardModel)
+
+	// Create 50 log lines with matches at lines 2, 25, and 45
+	lines := make([]string, 50)
+	for i := 0; i < 50; i++ {
+		lines[i] = fmt.Sprintf("line %02d: info output log", i)
+	}
+	lines[2] = "line 02: test_error: assertion failed in module_a"
+	lines[25] = "line 25: test_error: timeout in module_c"
+	lines[45] = "line 45: test_error: final summary with 2 failures"
+
+	snap := &monitor.Snapshot{
+		RunnerName: "actr",
+		ActiveJobs: []*monitor.JobInfo{
+			{
+				ID:     "job-1",
+				Name:   "Test Job",
+				Status: monitor.StatusRunning,
+				Steps: []*monitor.StepInfo{
+					{ID: "step-1", Name: "Run Tests", Status: monitor.StatusRunning},
+				},
+			},
+		},
+		StepLogs: map[string][]string{
+			"job-1/step-1": lines,
+		},
+	}
+	m.ApplySnapshot(snap)
+
+	found := m.Tree().SelectFirst(func(n *TreeNode) bool {
+		return n.ID == "step-1"
+	})
+	require.True(t, found, "step-1 should be selectable in tree")
+	m.updateActiveStepLogs()
+
+	// Initial assertions
+	assert.False(t, m.IsLogSearching())
+	assert.Equal(t, "", m.SearchQuery())
+	assert.Empty(t, m.SearchMatches())
+
+	// 1. Activate log search with Ctrl+F
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlF})
+	m = newModel.(*DashboardModel)
+	assert.True(t, m.IsLogSearching())
+	assert.Equal(t, FocusViewport, m.Focus())
+
+	view := m.View()
+	assert.Contains(t, view, "Find in logs:")
+	assert.Contains(t, view, "(No matches)")
+
+	// 2. Type "test_error"
+	query := "test_error"
+	for _, r := range query {
+		newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = newModel.(*DashboardModel)
+	}
+
+	assert.Equal(t, query, m.SearchQuery())
+	expectedMatches := []int{2, 25, 45}
+	assert.Equal(t, expectedMatches, m.SearchMatches())
+	assert.Equal(t, 0, m.CurrentMatchIdx())
+
+	view = m.View()
+	assert.Contains(t, view, "(Match 1 of 3)")
+
+	// 3. Press Enter to commit search and transition to match navigation
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = newModel.(*DashboardModel)
+	assert.False(t, m.IsLogSearching())
+	assert.Equal(t, query, m.SearchQuery())
+	assert.Equal(t, expectedMatches, m.SearchMatches())
+	assert.Contains(t, m.View(), "(Match 1 of 3)")
+
+	// 4. Navigate matches with 'n' and test scrolling
+	// Next -> match index 1 (line 25)
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = newModel.(*DashboardModel)
+	assert.Equal(t, 1, m.CurrentMatchIdx())
+	assert.Contains(t, m.View(), "(Match 2 of 3)")
+	assert.Greater(t, m.Viewport().YOffset, 0, "viewport should scroll down for match at line 25")
+
+	// Next -> match index 2 (line 45)
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = newModel.(*DashboardModel)
+	assert.Equal(t, 2, m.CurrentMatchIdx())
+	assert.Contains(t, m.View(), "(Match 3 of 3)")
+	assert.Greater(t, m.Viewport().YOffset, 20, "viewport should scroll further down for match at line 45")
+
+	// Next -> wraps to match index 0 (line 2)
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = newModel.(*DashboardModel)
+	assert.Equal(t, 0, m.CurrentMatchIdx())
+	assert.Contains(t, m.View(), "(Match 1 of 3)")
+	assert.Equal(t, 0, m.Viewport().YOffset, "viewport should scroll back to top for line 2")
+
+	// 5. Navigate backwards with 'N'
+	// Prev -> wraps to match index 2 (line 45)
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'N'}})
+	m = newModel.(*DashboardModel)
+	assert.Equal(t, 2, m.CurrentMatchIdx())
+	assert.Contains(t, m.View(), "(Match 3 of 3)")
+	assert.Greater(t, m.Viewport().YOffset, 20)
+
+	// Prev -> match index 1 (line 25)
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'N'}})
+	m = newModel.(*DashboardModel)
+	assert.Equal(t, 1, m.CurrentMatchIdx())
+	assert.Contains(t, m.View(), "(Match 2 of 3)")
+
+	// 6. Test streaming new log event while search active: adds match without breaking current index
+	newModel, _ = m.Update(EventMsg(monitor.Event{
+		Type:    monitor.EventStepLog,
+		JobID:   "job-1",
+		StepID:  "step-1",
+		LogLine: "line 50: test_error: appended stream log",
+	}))
+	m = newModel.(*DashboardModel)
+	assert.Equal(t, 1, m.CurrentMatchIdx())
+	assert.Equal(t, []int{2, 25, 45, 50}, m.SearchMatches())
+	assert.Contains(t, m.View(), "(Match 2 of 4)")
+
+	// 7. Dismiss search with Esc
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = newModel.(*DashboardModel)
+	assert.False(t, m.IsLogSearching())
+	assert.Equal(t, "", m.SearchQuery())
+	assert.Empty(t, m.SearchMatches())
+	assert.NotContains(t, m.View(), "Find in logs:")
+
+	// 8. Test activation via '/' when focus is FocusViewport
+	m.SetFocus(FocusViewport)
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = newModel.(*DashboardModel)
+	assert.True(t, m.IsLogSearching())
+	assert.Contains(t, m.View(), "Find in logs:")
+
+	// Dismiss with Esc while typing
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = newModel.(*DashboardModel)
+	assert.False(t, m.IsLogSearching())
+	assert.NotContains(t, m.View(), "Find in logs:")
+}
+
+func TestDashboard_LogSearch_Highlighting(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	t.Cleanup(func() {
+		lipgloss.SetColorProfile(termenv.Ascii)
+	})
+
+	m := NewDashboardModel("/tmp/test.sock")
+	newModel, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m = newModel.(*DashboardModel)
+
+	snap := &monitor.Snapshot{
+		RunnerName: "actr",
+		ActiveJobs: []*monitor.JobInfo{
+			{
+				ID:     "job-1",
+				Name:   "Test Job",
+				Status: monitor.StatusRunning,
+				Steps: []*monitor.StepInfo{
+					{ID: "step-1", Name: "Run Tests", Status: monitor.StatusRunning},
+				},
+			},
+		},
+		StepLogs: map[string][]string{
+			"job-1/step-1": {
+				"line 0: starting build",
+				"line 1: connection failure in db",
+				"line 2: retrying...",
+				"line 3: fatal failure in network",
+			},
+		},
+	}
+	m.ApplySnapshot(snap)
+
+	found := m.Tree().SelectFirst(func(n *TreeNode) bool {
+		return n.ID == "step-1"
+	})
+	require.True(t, found)
+	m.updateActiveStepLogs()
+
+	// Initial clean content should not contain search highlight ANSI sequences
+	initialView := m.Viewport().View()
+	assert.Contains(t, initialView, "connection failure in db")
+	assert.Contains(t, initialView, "fatal failure in network")
+
+	// Activate search and search for "failure"
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlF})
+	m = newModel.(*DashboardModel)
+	for _, r := range "failure" {
+		newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = newModel.(*DashboardModel)
+	}
+
+	// Active match on line 1, normal match on line 3
+	vpContent := m.Viewport().View()
+	assert.Contains(t, vpContent, "failure")
+
+	// Rendered active match uses activeMatchStyle (Background 208)
+	expectedActive := activeMatchStyle.Render("failure")
+	// Rendered normal match uses normalMatchStyle (Background 226)
+	expectedNormal := normalMatchStyle.Render("failure")
+
+	assert.Contains(t, vpContent, expectedActive, "active match line should have activeMatchStyle (orange/208)")
+	assert.Contains(t, vpContent, expectedNormal, "other match line should have normalMatchStyle (yellow/226)")
+
+	// Commit search and advance to next match with 'n'
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = newModel.(*DashboardModel)
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = newModel.(*DashboardModel)
+
+	vpContentAfterNext := m.Viewport().View()
+	assert.Contains(t, vpContentAfterNext, expectedActive)
+	assert.Contains(t, vpContentAfterNext, expectedNormal)
+
+	// Dismiss search with Esc: highlights removed
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = newModel.(*DashboardModel)
+
+	vpContentClean := m.Viewport().View()
+	assert.NotContains(t, vpContentClean, expectedActive)
+	assert.NotContains(t, vpContentClean, expectedNormal)
+	assert.Contains(t, vpContentClean, "connection failure in db")
+	assert.Contains(t, vpContentClean, "fatal failure in network")
 }
 

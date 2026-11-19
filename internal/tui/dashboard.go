@@ -77,6 +77,12 @@ type DashboardModel struct {
 	treeSearchInput textinput.Model
 	treeSearching   bool
 
+	logSearchInput  textinput.Model
+	logSearching    bool
+	searchQuery     string
+	searchMatches   []int
+	currentMatchIdx int
+
 	width        int
 	height       int
 	ready        bool
@@ -99,6 +105,11 @@ type DashboardModel struct {
 	events <-chan monitor.Event
 	errs   <-chan error
 }
+
+var (
+	normalMatchStyle = lipgloss.NewStyle().Background(lipgloss.Color("226")).Foreground(lipgloss.Color("0"))
+	activeMatchStyle = lipgloss.NewStyle().Background(lipgloss.Color("208")).Foreground(lipgloss.Color("0")).Bold(true)
+)
 
 // NewDashboardModel creates a new DashboardModel configured to connect to the given socket.
 func NewDashboardModel(sockPath string) *DashboardModel {
@@ -131,6 +142,14 @@ func NewDashboardModel(sockPath string) *DashboardModel {
 	ti.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF"))
 	ti.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#64748B"))
 
+	lti := textinput.New()
+	lti.Prompt = "Find in logs: "
+	lti.Placeholder = "[ query ]"
+	lti.CharLimit = 64
+	lti.PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#38BDF8")).Bold(true)
+	lti.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF"))
+	lti.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#64748B"))
+
 	return &DashboardModel{
 		sockPath:            sockPath,
 		client:              monitor.NewClient(sockPath),
@@ -144,6 +163,11 @@ func NewDashboardModel(sockPath string) *DashboardModel {
 		focus:               FocusTree,
 		treeSearchInput:     ti,
 		treeSearching:       false,
+		logSearchInput:      lti,
+		logSearching:        false,
+		searchQuery:         "",
+		searchMatches:       nil,
+		currentMatchIdx:     0,
 	}
 }
 
@@ -176,6 +200,68 @@ func (m *DashboardModel) TreeSearchInput() *textinput.Model {
 		return nil
 	}
 	return &m.treeSearchInput
+}
+
+// IsLogSearching returns whether the dashboard is currently in log search mode.
+func (m *DashboardModel) IsLogSearching() bool {
+	if m == nil {
+		return false
+	}
+	return m.logSearching
+}
+
+// LogSearchInput returns a pointer to the log search input model.
+func (m *DashboardModel) LogSearchInput() *textinput.Model {
+	if m == nil {
+		return nil
+	}
+	return &m.logSearchInput
+}
+
+// SearchQuery returns the active log search query string.
+func (m *DashboardModel) SearchQuery() string {
+	if m == nil {
+		return ""
+	}
+	return m.searchQuery
+}
+
+// SearchMatches returns the 0-indexed line numbers of matching lines in the active step logs.
+func (m *DashboardModel) SearchMatches() []int {
+	if m == nil {
+		return nil
+	}
+	return m.searchMatches
+}
+
+// CurrentMatchIdx returns the index in SearchMatches for the currently focused match.
+func (m *DashboardModel) CurrentMatchIdx() int {
+	if m == nil {
+		return 0
+	}
+	return m.currentMatchIdx
+}
+
+// NextMatch advances to the next search match and scrolls it into view.
+func (m *DashboardModel) NextMatch() {
+	if len(m.searchMatches) == 0 {
+		return
+	}
+	m.currentMatchIdx = (m.currentMatchIdx + 1) % len(m.searchMatches)
+	m.autoFollow = false
+	m.refreshHighlightedLogs()
+	m.scrollToMatch(m.searchMatches[m.currentMatchIdx])
+}
+
+// PrevMatch moves to the previous search match and scrolls it into view.
+func (m *DashboardModel) PrevMatch() {
+	if len(m.searchMatches) == 0 {
+		return
+	}
+	m.currentMatchIdx = (m.currentMatchIdx - 1 + len(m.searchMatches)) % len(m.searchMatches)
+	m.autoFollow = false
+	m.refreshHighlightedLogs()
+	m.scrollToMatch(m.searchMatches[m.currentMatchIdx])
 }
 
 // AutoFocusRunningStep enables auto-focusing the active running step on initial snapshot.
@@ -463,19 +549,90 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		if m.logSearching {
+			switch msg.Type {
+			case tea.KeyEsc:
+				m.logSearching = false
+				m.logSearchInput.Blur()
+				m.logSearchInput.SetValue("")
+				m.searchQuery = ""
+				m.searchMatches = nil
+				m.currentMatchIdx = 0
+				m.refreshHighlightedLogs()
+				return m, nil
+			case tea.KeyEnter:
+				m.logSearching = false
+				m.logSearchInput.Blur()
+				m.focus = FocusViewport
+				return m, nil
+			case tea.KeyCtrlC:
+				if m.cancel != nil {
+					m.cancel()
+				}
+				return m, tea.Quit
+			default:
+				var cmd tea.Cmd
+				prevVal := m.logSearchInput.Value()
+				m.logSearchInput, cmd = m.logSearchInput.Update(msg)
+				newVal := m.logSearchInput.Value()
+				if newVal != prevVal {
+					m.searchQuery = newVal
+					m.currentMatchIdx = 0
+					lines := m.activeStepLogLines()
+					m.updateSearchMatches(lines)
+					m.refreshHighlightedLogs()
+					if len(m.searchMatches) > 0 {
+						m.autoFollow = false
+						m.scrollToMatch(m.searchMatches[0])
+					}
+				}
+				return m, cmd
+			}
+		}
+
 		switch msg.String() {
 		case "q", "ctrl+c":
 			if m.cancel != nil {
 				m.cancel()
 			}
 			return m, tea.Quit
+		case "ctrl+f":
+			m.logSearching = true
+			m.focus = FocusViewport
+			cmd := m.logSearchInput.Focus()
+			return m, cmd
 		case "/":
+			if m.focus == FocusViewport || m.isZoomed {
+				m.logSearching = true
+				cmd := m.logSearchInput.Focus()
+				return m, cmd
+			}
 			if !m.isZoomed && m.focus == FocusTree {
 				m.treeSearching = true
 				cmd := m.treeSearchInput.Focus()
 				return m, cmd
 			}
+		case "n":
+			if len(m.searchMatches) > 0 {
+				m.NextMatch()
+				return m, nil
+			}
+		case "N":
+			if len(m.searchMatches) > 0 {
+				m.PrevMatch()
+				return m, nil
+			}
 		case "esc":
+			if m.searchQuery != "" || len(m.searchMatches) > 0 {
+				m.logSearching = false
+				m.logSearchInput.Blur()
+				m.logSearchInput.SetValue("")
+				m.searchQuery = ""
+				m.searchMatches = nil
+				m.currentMatchIdx = 0
+				m.refreshHighlightedLogs()
+				return m, nil
+			}
 			if m.tree != nil && (m.tree.Filter() != "" || m.treeSearchInput.Value() != "") {
 				m.treeSearchInput.SetValue("")
 				m.tree.RebuildWithFilter("")
@@ -656,7 +813,7 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.stepLogs[msg.stepID] = logs
 			sel := m.tree.SelectedNode()
 			if sel != nil && sel.ID == msg.stepID && (sel.Parent == nil || sel.Parent.ID == msg.runID) {
-				m.viewport.SetContent(strings.Join(logs, "\n"))
+				m.renderAndSetLogs(logs)
 				if m.autoFollow {
 					m.viewport.GotoBottom()
 				}
@@ -759,6 +916,14 @@ func (m *DashboardModel) updateSizes() {
 	if m.treeSearchInput.Width < 5 {
 		m.treeSearchInput.Width = 5
 	}
+	logInputW := rightWidth - 45
+	if logInputW < 10 {
+		logInputW = 10
+	}
+	if logInputW > 40 {
+		logInputW = 40
+	}
+	m.logSearchInput.Width = logInputW
 }
 
 func (m *DashboardModel) applySnapshot(snap *monitor.Snapshot) tea.Cmd {
@@ -1510,7 +1675,7 @@ func (m *DashboardModel) handleEvent(ev monitor.Event) tea.Cmd {
 				m.stepLogs[ev.StepID] = logs
 			}
 			if ev.StepID == m.activeStepID || key == m.activeStepID {
-				m.viewport.SetContent(strings.Join(logs, "\n"))
+				m.renderAndSetLogs(logs)
 				if m.autoFollow {
 					m.viewport.GotoBottom()
 				}
@@ -1997,7 +2162,7 @@ func (m *DashboardModel) updateActiveStepLogs() tea.Cmd {
 		}
 
 		if len(lines) > 0 {
-			m.viewport.SetContent(strings.Join(lines, "\n"))
+			m.renderAndSetLogs(lines)
 			if m.autoFollow {
 				m.viewport.GotoBottom()
 			}
@@ -2017,7 +2182,7 @@ func (m *DashboardModel) updateActiveStepLogs() tea.Cmd {
 					}
 					m.stepLogs[jobID+"/"+stepID] = fetched
 					m.stepLogs[stepID] = fetched
-					m.viewport.SetContent(strings.Join(fetched, "\n"))
+					m.renderAndSetLogs(fetched)
 					if m.autoFollow {
 						m.viewport.GotoBottom()
 					}
@@ -2052,9 +2217,8 @@ func (m *DashboardModel) View() string {
 	if m.isZoomed {
 		_, zoomWidth, targetOuterHeight, zoomHeight := m.calcDimensions()
 		_ = targetOuterHeight
-		m.viewport.Width = zoomWidth
-		m.viewport.Height = zoomHeight
-		content = borderStyle.Width(zoomWidth).Height(zoomHeight).Render(m.viewport.View())
+		logContent := m.renderLogViewport(zoomWidth, zoomHeight)
+		content = borderStyle.Width(zoomWidth).Height(zoomHeight).Render(logContent)
 	} else {
 		treeWidth, rightWidth, targetOuterHeight, logInnerHeight := m.calcDimensions()
 		_ = logInnerHeight
@@ -2096,10 +2260,8 @@ func (m *DashboardModel) View() string {
 		if actualLogInnerHeight < 1 {
 			actualLogInnerHeight = 1
 		}
-		m.viewport.Width = rightWidth
-		m.viewport.Height = actualLogInnerHeight
-
-		logBox := borderStyle.Width(rightWidth).Height(actualLogInnerHeight).Render(m.viewport.View())
+		logContent := m.renderLogViewport(rightWidth, actualLogInnerHeight)
+		logBox := borderStyle.Width(rightWidth).Height(actualLogInnerHeight).Render(logContent)
 		rightPane := lipgloss.JoinVertical(lipgloss.Left, telemBox, logBox)
 		content = lipgloss.JoinHorizontal(lipgloss.Top, treeBox, rightPane)
 	}
@@ -2132,6 +2294,8 @@ func (m *DashboardModel) renderFooter() string {
 	var leftStr string
 	if m.treeSearching {
 		leftStr = " Esc cancel • Enter select"
+	} else if m.logSearching {
+		leftStr = " Esc cancel • Enter navigate"
 	} else {
 		leftStr = leftNavText(m.width, m.lastErr)
 	}
@@ -2312,4 +2476,177 @@ func renderStepEmptyState(sel *TreeNode) string {
 	default:
 		return "\n  " + dimStyle.Render("○ Step is queued or waiting to execute.") + "\n  " + dimStyle.Render("Logs will stream here automatically when execution starts.")
 	}
+}
+
+func (m *DashboardModel) activeStepLogLines() []string {
+	if m == nil {
+		return nil
+	}
+	sel := m.tree.SelectedNode()
+	var lines []string
+	if sel != nil {
+		parentJob := sel.FindParentJob()
+		if sel.NodeType == NodeStep && parentJob != nil {
+			lines = m.stepLogs[parentJob.ID+"/"+sel.ID]
+			if len(lines) == 0 && !isHistoricalNode(sel) {
+				lines = m.stepLogs[sel.ID]
+			}
+		} else if parentJob != nil && sel != parentJob {
+			lines = m.stepLogs[parentJob.ID+"/"+sel.ID]
+			if len(lines) == 0 && !isHistoricalNode(sel) {
+				lines = m.stepLogs[sel.ID]
+			}
+		} else {
+			lines = m.stepLogs[sel.ID]
+		}
+	}
+	if len(lines) == 0 && m.activeStepID != "" {
+		lines = m.stepLogs[m.activeStepID]
+	}
+	return lines
+}
+
+func (m *DashboardModel) updateSearchMatches(lines []string) {
+	if m.searchQuery == "" {
+		m.searchMatches = nil
+		m.currentMatchIdx = 0
+		return
+	}
+	var matches []int
+	lowerQuery := strings.ToLower(m.searchQuery)
+	for i, line := range lines {
+		clean := ansi.Strip(line)
+		if strings.Contains(strings.ToLower(clean), lowerQuery) {
+			matches = append(matches, i)
+		}
+	}
+	m.searchMatches = matches
+	if len(matches) == 0 {
+		m.currentMatchIdx = 0
+	} else if m.currentMatchIdx >= len(matches) {
+		m.currentMatchIdx = len(matches) - 1
+	}
+}
+
+func highlightLine(line, query string, style lipgloss.Style) string {
+	if query == "" {
+		return line
+	}
+	clean := ansi.Strip(line)
+	lowerClean := strings.ToLower(clean)
+	lowerQuery := strings.ToLower(query)
+	qLen := len(query)
+
+	if !strings.Contains(lowerClean, lowerQuery) {
+		return line
+	}
+
+	var sb strings.Builder
+	lastIdx := 0
+	for {
+		idx := strings.Index(lowerClean[lastIdx:], lowerQuery)
+		if idx == -1 {
+			sb.WriteString(clean[lastIdx:])
+			break
+		}
+		matchStart := lastIdx + idx
+		matchEnd := matchStart + qLen
+		sb.WriteString(clean[lastIdx:matchStart])
+		sb.WriteString(style.Render(clean[matchStart:matchEnd]))
+		lastIdx = matchEnd
+	}
+	return sb.String()
+}
+
+func (m *DashboardModel) renderHighlightedLines(lines []string) string {
+	if m.searchQuery == "" {
+		return strings.Join(lines, "\n")
+	}
+
+	activeLine := -1
+	if len(m.searchMatches) > 0 && m.currentMatchIdx >= 0 && m.currentMatchIdx < len(m.searchMatches) {
+		activeLine = m.searchMatches[m.currentMatchIdx]
+	}
+
+	renderedLines := make([]string, len(lines))
+	for i, line := range lines {
+		if activeLine == i {
+			renderedLines[i] = highlightLine(line, m.searchQuery, activeMatchStyle)
+		} else {
+			renderedLines[i] = highlightLine(line, m.searchQuery, normalMatchStyle)
+		}
+	}
+	return strings.Join(renderedLines, "\n")
+}
+
+func (m *DashboardModel) renderAndSetLogs(lines []string) {
+	if len(lines) == 0 {
+		return
+	}
+	if m.searchQuery != "" {
+		m.updateSearchMatches(lines)
+		rendered := m.renderHighlightedLines(lines)
+		m.viewport.SetContent(rendered)
+	} else {
+		m.viewport.SetContent(strings.Join(lines, "\n"))
+	}
+}
+
+func (m *DashboardModel) refreshHighlightedLogs() {
+	lines := m.activeStepLogLines()
+	if len(lines) == 0 {
+		return
+	}
+	if m.searchQuery != "" {
+		rendered := m.renderHighlightedLines(lines)
+		m.viewport.SetContent(rendered)
+	} else {
+		m.viewport.SetContent(strings.Join(lines, "\n"))
+	}
+}
+
+func (m *DashboardModel) scrollToMatch(lineIdx int) {
+	if m.viewport.Height <= 0 {
+		m.viewport.SetYOffset(lineIdx)
+		return
+	}
+	targetY := lineIdx - m.viewport.Height/3
+	if targetY < 0 {
+		targetY = 0
+	}
+	m.viewport.SetYOffset(targetY)
+}
+
+func (m *DashboardModel) renderFindBar(width int) string {
+	var matchCounter string
+	if len(m.searchMatches) == 0 {
+		matchCounter = lipgloss.NewStyle().Foreground(lipgloss.Color("#F87171")).Render("(No matches)")
+	} else {
+		counterText := fmt.Sprintf("(Match %d of %d)", m.currentMatchIdx+1, len(m.searchMatches))
+		matchCounter = lipgloss.NewStyle().Foreground(lipgloss.Color("#38BDF8")).Bold(true).Render(counterText)
+	}
+
+	shortcuts := lipgloss.NewStyle().Foreground(lipgloss.Color("#64748B")).Render("[n: next, N: prev, Esc: dismiss]")
+	bar := fmt.Sprintf("%s %s %s", m.logSearchInput.View(), matchCounter, shortcuts)
+	if width > 0 && ansi.StringWidth(bar) > width {
+		bar = ansi.Truncate(bar, width, "")
+	}
+	return bar
+}
+
+func (m *DashboardModel) renderLogViewport(width, height int) string {
+	if m.logSearching || m.searchQuery != "" {
+		vpHeight := height - 1
+		if vpHeight < 1 {
+			vpHeight = 1
+		}
+		m.viewport.Width = width
+		m.viewport.Height = vpHeight
+		vpView := m.viewport.View()
+		findBar := m.renderFindBar(width)
+		return lipgloss.JoinVertical(lipgloss.Left, vpView, findBar)
+	}
+	m.viewport.Width = width
+	m.viewport.Height = height
+	return m.viewport.View()
 }
