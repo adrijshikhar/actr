@@ -1640,3 +1640,95 @@ func TestDashboard_NodeTraversalAndStepSelection(t *testing.T) {
 	assert.Contains(t, vp, "compiled successfully")
 	assert.Contains(t, vp, "exit code 0")
 }
+
+func TestDashboard_SidebarSearch(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	newModel, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m = newModel.(*DashboardModel)
+
+	// Build a snapshot with two repos: aim (with job containing smoke step) and cxstatusline
+	now := time.Now()
+	snap := &monitor.Snapshot{
+		RunnerName: "actr",
+		ActiveJobs: []*monitor.JobInfo{
+			{
+				ID:        "job-aim",
+				Name:      "CI Test",
+				RepoAlias: "aim",
+				Repo:      "aim",
+				Status:    monitor.StatusRunning,
+				StartedAt: now,
+				Steps: []*monitor.StepInfo{
+					{ID: "s1", Name: "Setup", Status: monitor.StatusSuccess},
+					{ID: "s2", Name: "Smoke Tests", Status: monitor.StatusRunning},
+				},
+			},
+			{
+				ID:        "job-cx",
+				Name:      "Lint Check",
+				RepoAlias: "cxstatusline",
+				Repo:      "cxstatusline",
+				Status:    monitor.StatusRunning,
+				StartedAt: now,
+				Steps: []*monitor.StepInfo{
+					{ID: "s3", Name: "Run Linter", Status: monitor.StatusSuccess},
+				},
+			},
+		},
+	}
+	m.ApplySnapshot(snap)
+
+	// Verify initial state
+	assert.False(t, m.IsTreeSearching())
+	assert.Equal(t, "", m.Tree().Filter())
+
+	// 1. Press '/' to activate search mode
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = newModel.(*DashboardModel)
+	assert.True(t, m.IsTreeSearching())
+	assert.Contains(t, m.View(), "Search:")
+
+	// 2. Type "smoke" into search input
+	for _, r := range "smoke" {
+		newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = newModel.(*DashboardModel)
+	}
+
+	assert.Equal(t, "smoke", m.Tree().Filter())
+	dashView := m.View()
+	assert.Contains(t, dashView, "Smoke Tests")
+	assert.NotContains(t, dashView, "cxstatusline")
+	assert.NotContains(t, dashView, "Run Linter")
+
+	// 3. Press Enter to commit search and return to tree navigation
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = newModel.(*DashboardModel)
+	assert.False(t, m.IsTreeSearching())
+	assert.Equal(t, "smoke", m.Tree().Filter())
+
+	// Navigate with down arrow among filtered rows
+	initialCursor := m.Tree().Cursor
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = newModel.(*DashboardModel)
+	assert.GreaterOrEqual(t, m.Tree().Cursor, initialCursor)
+
+	// 4. Press Esc to clear filter and restore full tree
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = newModel.(*DashboardModel)
+	assert.False(t, m.IsTreeSearching())
+	assert.Equal(t, "", m.Tree().Filter())
+
+	restoredView := m.View()
+	assert.Contains(t, restoredView, "cxstatusline")
+
+	// 5. Press '/' then immediately 'Esc' cancels search
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = newModel.(*DashboardModel)
+	assert.True(t, m.IsTreeSearching())
+
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = newModel.(*DashboardModel)
+	assert.False(t, m.IsTreeSearching())
+	assert.Equal(t, "", m.Tree().Filter())
+}
+

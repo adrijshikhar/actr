@@ -8,10 +8,19 @@ import (
 	"time"
 
 	"github.com/adrijshikhar/actr/internal/monitor"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+)
+
+// FocusPanel indicates which pane currently has keyboard focus.
+type FocusPanel int
+
+const (
+	FocusTree FocusPanel = iota
+	FocusViewport
 )
 
 // EventMsg wraps an incoming monitor.Event for the Bubbletea event loop.
@@ -64,6 +73,10 @@ type DashboardModel struct {
 	isZoomed   bool
 	autoFollow bool
 
+	focus           FocusPanel
+	treeSearchInput textinput.Model
+	treeSearching   bool
+
 	width        int
 	height       int
 	ready        bool
@@ -110,6 +123,14 @@ func NewDashboardModel(sockPath string) *DashboardModel {
 	root.AddChild(liveNode)
 	root.AddChild(histNode)
 
+	ti := textinput.New()
+	ti.Prompt = "Search: "
+	ti.Placeholder = "[ query ]"
+	ti.CharLimit = 64
+	ti.PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#38BDF8")).Bold(true)
+	ti.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF"))
+	ti.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#64748B"))
+
 	return &DashboardModel{
 		sockPath:            sockPath,
 		client:              monitor.NewClient(sockPath),
@@ -120,7 +141,41 @@ func NewDashboardModel(sockPath string) *DashboardModel {
 		stepLogs:            make(map[string][]string),
 		historicalSummaries: make(map[string]*HistoricalRunSummary),
 		seenRepoExpansion:   make(map[string]bool),
+		focus:               FocusTree,
+		treeSearchInput:     ti,
+		treeSearching:       false,
 	}
+}
+
+// Focus returns the currently focused panel.
+func (m *DashboardModel) Focus() FocusPanel {
+	if m == nil {
+		return FocusTree
+	}
+	return m.focus
+}
+
+// SetFocus sets the currently focused panel.
+func (m *DashboardModel) SetFocus(f FocusPanel) {
+	if m != nil {
+		m.focus = f
+	}
+}
+
+// IsTreeSearching returns whether the dashboard is currently in tree search mode.
+func (m *DashboardModel) IsTreeSearching() bool {
+	if m == nil {
+		return false
+	}
+	return m.treeSearching
+}
+
+// TreeSearchInput returns a pointer to the tree search input model.
+func (m *DashboardModel) TreeSearchInput() *textinput.Model {
+	if m == nil {
+		return nil
+	}
+	return &m.treeSearchInput
 }
 
 // AutoFocusRunningStep enables auto-focusing the active running step on initial snapshot.
@@ -378,12 +433,54 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ready = true
 
 	case tea.KeyMsg:
+		if m.treeSearching {
+			switch msg.Type {
+			case tea.KeyEsc:
+				m.treeSearching = false
+				m.treeSearchInput.Blur()
+				m.treeSearchInput.SetValue("")
+				m.tree.RebuildWithFilter("")
+				return m, m.updateActiveStepLogs()
+			case tea.KeyEnter:
+				m.treeSearching = false
+				m.treeSearchInput.Blur()
+				return m, m.updateActiveStepLogs()
+			case tea.KeyCtrlC:
+				if m.cancel != nil {
+					m.cancel()
+				}
+				return m, tea.Quit
+			default:
+				var cmd tea.Cmd
+				prevVal := m.treeSearchInput.Value()
+				m.treeSearchInput, cmd = m.treeSearchInput.Update(msg)
+				newVal := m.treeSearchInput.Value()
+				if newVal != prevVal {
+					m.tree.RebuildWithFilter(newVal)
+					_ = m.updateActiveStepLogs()
+				}
+				return m, cmd
+			}
+		}
+
 		switch msg.String() {
 		case "q", "ctrl+c":
 			if m.cancel != nil {
 				m.cancel()
 			}
 			return m, tea.Quit
+		case "/":
+			if !m.isZoomed && m.focus == FocusTree {
+				m.treeSearching = true
+				cmd := m.treeSearchInput.Focus()
+				return m, cmd
+			}
+		case "esc":
+			if m.tree != nil && (m.tree.Filter() != "" || m.treeSearchInput.Value() != "") {
+				m.treeSearchInput.SetValue("")
+				m.tree.RebuildWithFilter("")
+				return m, m.updateActiveStepLogs()
+			}
 		case "z":
 			m.isZoomed = !m.isZoomed
 			m.updateSizes()
@@ -655,9 +752,13 @@ func (m *DashboardModel) calcDimensions() (treeWidth, rightWidth, targetOuterHei
 }
 
 func (m *DashboardModel) updateSizes() {
-	_, rightWidth, _, logHeight := m.calcDimensions()
+	treeWidth, rightWidth, _, logHeight := m.calcDimensions()
 	m.viewport.Width = rightWidth
 	m.viewport.Height = logHeight
+	m.treeSearchInput.Width = treeWidth - 9
+	if m.treeSearchInput.Width < 5 {
+		m.treeSearchInput.Width = 5
+	}
 }
 
 func (m *DashboardModel) applySnapshot(snap *monitor.Snapshot) tea.Cmd {
@@ -1962,7 +2063,23 @@ func (m *DashboardModel) View() string {
 		if treeInnerHeight < 1 {
 			treeInnerHeight = 1
 		}
-		treeBox := borderStyle.Width(treeWidth).Height(treeInnerHeight).Render(m.tree.View(treeWidth))
+
+		var treeContent string
+		if m.treeSearching || m.treeSearchInput.Value() != "" {
+			m.treeSearchInput.Width = treeWidth - 9
+			if m.treeSearchInput.Width < 5 {
+				m.treeSearchInput.Width = 5
+			}
+			searchBar := m.treeSearchInput.View()
+			if ansi.StringWidth(searchBar) > treeWidth {
+				searchBar = ansi.Truncate(searchBar, treeWidth, "")
+			}
+			treeContent = searchBar + "\n" + m.tree.View(treeWidth)
+		} else {
+			treeContent = m.tree.View(treeWidth)
+		}
+
+		treeBox := borderStyle.Width(treeWidth).Height(treeInnerHeight).Render(treeContent)
 
 		telemWidth := rightWidth
 		var telemContent string
@@ -2012,7 +2129,12 @@ func leftNavText(width int, err error) string {
 }
 
 func (m *DashboardModel) renderFooter() string {
-	leftStr := leftNavText(m.width, m.lastErr)
+	var leftStr string
+	if m.treeSearching {
+		leftStr = " Esc cancel • Enter select"
+	} else {
+		leftStr = leftNavText(m.width, m.lastErr)
+	}
 	left := dimStyle.Render(leftStr)
 	leftW := lipgloss.Width(left)
 

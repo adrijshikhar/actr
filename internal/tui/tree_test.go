@@ -453,3 +453,157 @@ func TestTreeNode_FindParentJobAndRepo(t *testing.T) {
 		t.Fatalf("expected nil safety on FindParentJob and FindParentRepo")
 	}
 }
+
+func TestTreeWidget_FilterMatching(t *testing.T) {
+	root := &TreeNode{
+		ID:       "root",
+		Label:    "actr",
+		Expanded: true,
+		NodeType: NodeBranch,
+	}
+	liveNode := &TreeNode{
+		ID:       "live-runs",
+		Label:    "LIVE RUNS",
+		Expanded: true,
+		NodeType: NodeBranch,
+	}
+	root.AddChild(liveNode)
+
+	aimRepo := &TreeNode{
+		ID:       "repo:aim",
+		Label:    "aim (busy • 1/1 slots)",
+		Expanded: false,
+		NodeType: NodeRepo,
+	}
+	liveNode.AddChild(aimRepo)
+
+	job1 := &TreeNode{
+		ID:       "job-1",
+		Label:    "CI Test",
+		Expanded: false,
+		NodeType: NodeJob,
+	}
+	aimRepo.AddChild(job1)
+
+	step1 := &TreeNode{ID: "s1", Label: "Checkout", Status: monitor.StatusSuccess, NodeType: NodeStep}
+	step2 := &TreeNode{ID: "s2", Label: "Run smoke tests", Status: monitor.StatusRunning, NodeType: NodeStep}
+	job1.AddChild(step1).AddChild(step2)
+
+	otherRepo := &TreeNode{
+		ID:       "repo:cxstatusline",
+		Label:    "cxstatusline",
+		Expanded: true,
+		NodeType: NodeRepo,
+	}
+	liveNode.AddChild(otherRepo)
+
+	job2 := &TreeNode{
+		ID:       "job-2",
+		Label:    "Lint",
+		Expanded: true,
+		NodeType: NodeJob,
+	}
+	otherRepo.AddChild(job2)
+	step3 := &TreeNode{ID: "s3", Label: "golangci-lint", Status: monitor.StatusSuccess, NodeType: NodeStep}
+	job2.AddChild(step3)
+
+	tw := NewTreeWidget(root)
+	if len(tw.Rows()) == 0 {
+		t.Fatalf("expected non-empty initial rows")
+	}
+
+	// 1. Filter by "smoke"
+	tw.RebuildWithFilter("smoke")
+	rows := tw.Rows()
+
+	// Should contain root, live-runs, repo:aim, job-1, step2
+	var ids []string
+	for _, r := range rows {
+		ids = append(ids, r.Node.ID)
+	}
+
+	expectedIDs := []string{"root", "live-runs", "repo:aim", "job-1", "s2"}
+	if len(ids) != len(expectedIDs) {
+		t.Fatalf("expected filtered rows %v, got %v", expectedIDs, ids)
+	}
+	for i, id := range expectedIDs {
+		if ids[i] != id {
+			t.Errorf("row %d: expected %s, got %s", i, id, ids[i])
+		}
+	}
+
+	// Ancestors must be expanded
+	if !aimRepo.Expanded {
+		t.Errorf("expected repo:aim to be auto-expanded")
+	}
+	if !job1.Expanded {
+		t.Errorf("expected job-1 to be auto-expanded")
+	}
+
+	// View should contain "smoke" and not cxstatusline
+	view := tw.View(40)
+	if !strings.Contains(view, "smoke") {
+		t.Fatalf("expected view to contain 'smoke', got:\n%s", view)
+	}
+	if strings.Contains(view, "cxstatusline") {
+		t.Fatalf("expected view NOT to contain 'cxstatusline', got:\n%s", view)
+	}
+
+	// 2. Clear filter
+	tw.RebuildWithFilter("")
+	if tw.Filter() != "" {
+		t.Fatalf("expected empty filter after clear, got %q", tw.Filter())
+	}
+
+	// repo:aim was originally collapsed (Expanded = false); verify it is restored
+	if aimRepo.Expanded {
+		t.Errorf("expected repo:aim to be restored to collapsed after clearing filter")
+	}
+
+	// cxstatusline should be visible again
+	clearView := tw.View(40)
+	if !strings.Contains(clearView, "cxstatusline") {
+		t.Fatalf("expected view to contain 'cxstatusline' after clearing filter, got:\n%s", clearView)
+	}
+}
+
+func TestTreeWidget_StatusFilter(t *testing.T) {
+	root := &TreeNode{
+		ID:       "root",
+		Label:    "actr",
+		Expanded: true,
+		NodeType: NodeBranch,
+	}
+	job := &TreeNode{
+		ID:       "job-1",
+		Label:    "BuildJob",
+		Expanded: true,
+		NodeType: NodeJob,
+	}
+	root.AddChild(job)
+
+	stepPass := &TreeNode{ID: "s_ok", Label: "Compile", Status: monitor.StatusSuccess, NodeType: NodeStep}
+	stepFail := &TreeNode{ID: "s_err", Label: "Test", Status: monitor.StatusFailed, NodeType: NodeStep}
+	job.AddChild(stepPass).AddChild(stepFail)
+
+	tw := NewTreeWidget(root)
+
+	// Filter by "fail"
+	tw.RebuildWithFilter("fail")
+	rows := tw.Rows()
+
+	var ids []string
+	for _, r := range rows {
+		ids = append(ids, r.Node.ID)
+	}
+	expected := []string{"root", "job-1", "s_err"}
+	if len(ids) != len(expected) {
+		t.Fatalf("expected rows %v, got %v", expected, ids)
+	}
+	for i, id := range expected {
+		if ids[i] != id {
+			t.Errorf("row %d: expected %s, got %s", i, id, ids[i])
+		}
+	}
+}
+

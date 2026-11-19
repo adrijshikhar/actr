@@ -100,21 +100,187 @@ type FlatRow struct {
 
 // TreeWidget renders and navigates a hierarchical tree.
 type TreeWidget struct {
-	Root   *TreeNode
-	Cursor int
-	rows   []FlatRow
+	Root          *TreeNode
+	Cursor        int
+	rows          []FlatRow
+	filter        string
+	savedExpanded map[*TreeNode]bool
 }
 
 var (
-	selectionBg   = lipgloss.Color("#2563EB")
-	selectedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF")).Background(selectionBg)
-	normalStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#E2E8F0"))
-	greenStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#22C55E"))
-	redStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("#EF4444"))
-	runningStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#10B981")).Bold(true)
-	dimStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("#64748B"))
-	yellowStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#F59E0B"))
+	selectionBg            = lipgloss.Color("#2563EB")
+	selectedStyle          = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF")).Background(selectionBg)
+	normalStyle            = lipgloss.NewStyle().Foreground(lipgloss.Color("#E2E8F0"))
+	greenStyle             = lipgloss.NewStyle().Foreground(lipgloss.Color("#22C55E"))
+	redStyle               = lipgloss.NewStyle().Foreground(lipgloss.Color("#EF4444"))
+	runningStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("#10B981")).Bold(true)
+	dimStyle               = lipgloss.NewStyle().Foreground(lipgloss.Color("#64748B"))
+	yellowStyle            = lipgloss.NewStyle().Foreground(lipgloss.Color("#F59E0B"))
+	highlightStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("#F59E0B")).Bold(true)
+	highlightSelectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FDE047")).Background(selectionBg).Bold(true).Underline(true)
 )
+
+// Rows returns the currently flattened rows.
+func (tw *TreeWidget) Rows() []FlatRow {
+	if tw == nil {
+		return nil
+	}
+	return tw.rows
+}
+
+// Filter returns the active search query filter.
+func (tw *TreeWidget) Filter() string {
+	if tw == nil {
+		return ""
+	}
+	return tw.filter
+}
+
+// SetFilter sets the search filter query and rebuilds the tree.
+func (tw *TreeWidget) SetFilter(query string) {
+	tw.RebuildWithFilter(query)
+}
+
+// RebuildWithFilter filters visible nodes by query, auto-expanding matching paths.
+func (tw *TreeWidget) RebuildWithFilter(query string) {
+	if tw == nil {
+		return
+	}
+	trimmed := strings.TrimSpace(query)
+	if trimmed == "" {
+		if tw.savedExpanded != nil && tw.Root != nil {
+			tw.Root.Walk(func(n *TreeNode) bool {
+				if exp, ok := tw.savedExpanded[n]; ok {
+					n.Expanded = exp
+				}
+				return true
+			})
+			tw.savedExpanded = nil
+		}
+		tw.filter = ""
+		tw.Rebuild()
+		return
+	}
+
+	if tw.filter == "" && tw.Root != nil {
+		tw.savedExpanded = make(map[*TreeNode]bool)
+		tw.Root.Walk(func(n *TreeNode) bool {
+			tw.savedExpanded[n] = n.Expanded
+			return true
+		})
+	}
+
+	tw.filter = trimmed
+	tw.Rebuild()
+}
+
+// Matches returns whether this node matches query via label, ID, or status token.
+func (n *TreeNode) Matches(query string) bool {
+	if n == nil || query == "" {
+		return false
+	}
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return false
+	}
+
+	// 1. Match label
+	if strings.Contains(strings.ToLower(n.Label), q) {
+		return true
+	}
+
+	// 2. Match ID
+	if strings.Contains(strings.ToLower(n.ID), q) {
+		return true
+	}
+
+	// 3. Match status token
+	statusStr := strings.ToLower(string(n.Status))
+	if statusStr != "" && strings.Contains(statusStr, q) {
+		return true
+	}
+	switch n.Status {
+	case monitor.StatusFailed:
+		if strings.Contains("failed fail error err", q) || q == "fail" || q == "failed" {
+			return true
+		}
+	case monitor.StatusSuccess:
+		if strings.Contains("success pass ok done", q) || q == "pass" || q == "ok" {
+			return true
+		}
+	case monitor.StatusRunning:
+		if strings.Contains("running run active", q) || q == "run" || q == "running" {
+			return true
+		}
+	case monitor.StatusSkipped:
+		if strings.Contains("skipped skip", q) || q == "skip" || q == "skipped" {
+			return true
+		}
+	case monitor.StatusQueued:
+		if strings.Contains("queued queue", q) || q == "queue" || q == "queued" {
+			return true
+		}
+	}
+
+	return false
+}
+
+// HasMatchingDescendant returns true if any descendant of n matches query.
+func (n *TreeNode) HasMatchingDescendant(query string) bool {
+	if n == nil || query == "" {
+		return false
+	}
+	for _, ch := range n.Children {
+		if ch == nil {
+			continue
+		}
+		if ch.Matches(query) || ch.HasMatchingDescendant(query) {
+			return true
+		}
+	}
+	return false
+}
+
+// highlightMatches highlights occurrences of query in text with lipgloss styling.
+func highlightMatches(text, query string, isSelected bool) string {
+	if query == "" || text == "" {
+		if isSelected {
+			return selectedStyle.Render(text)
+		}
+		return normalStyle.Render(text)
+	}
+
+	qLower := strings.ToLower(query)
+	tLower := strings.ToLower(text)
+
+	base := normalStyle
+	hl := highlightStyle
+	if isSelected {
+		base = selectedStyle
+		hl = highlightSelectedStyle
+	}
+
+	var sb strings.Builder
+	start := 0
+	for start < len(text) {
+		idx := strings.Index(tLower[start:], qLower)
+		if idx == -1 {
+			sb.WriteString(base.Render(text[start:]))
+			break
+		}
+		matchStart := start + idx
+		matchEnd := matchStart + len(qLower)
+		if matchEnd > len(text) {
+			matchEnd = len(text)
+		}
+		if matchStart > start {
+			sb.WriteString(base.Render(text[start:matchStart]))
+		}
+		sb.WriteString(hl.Render(text[matchStart:matchEnd]))
+		start = matchEnd
+	}
+	return sb.String()
+}
 
 // NewTreeWidget constructs a new TreeWidget with the given root node.
 func NewTreeWidget(root *TreeNode) *TreeWidget {
@@ -127,7 +293,11 @@ func NewTreeWidget(root *TreeNode) *TreeWidget {
 func (tw *TreeWidget) Rebuild() {
 	tw.rows = nil
 	if tw.Root != nil {
-		tw.flatten(tw.Root, 0)
+		if tw.filter != "" {
+			tw.flattenFiltered(tw.Root, 0, tw.filter)
+		} else {
+			tw.flatten(tw.Root, 0)
+		}
 	}
 	if len(tw.rows) == 0 {
 		tw.Cursor = 0
@@ -138,6 +308,39 @@ func (tw *TreeWidget) Rebuild() {
 	}
 	if tw.Cursor < 0 {
 		tw.Cursor = 0
+	}
+}
+
+func (tw *TreeWidget) flattenFiltered(node *TreeNode, depth int, query string) {
+	if node == nil {
+		return
+	}
+
+	matches := node.Matches(query)
+	hasDesc := node.HasMatchingDescendant(query)
+
+	if !matches && !hasDesc {
+		return
+	}
+
+	if hasDesc {
+		node.Expanded = true
+	}
+
+	node.Depth = depth
+	tw.rows = append(tw.rows, FlatRow{Node: node, Depth: depth})
+
+	if node.Expanded && len(node.Children) > 0 {
+		for _, ch := range node.Children {
+			if ch != nil {
+				if ch.Parent == nil {
+					ch.Parent = node
+				}
+				if ch.Matches(query) || ch.HasMatchingDescendant(query) {
+					tw.flattenFiltered(ch, depth+1, query)
+				}
+			}
+		}
 	}
 }
 
@@ -298,6 +501,12 @@ func (tw *TreeWidget) View(width int) string {
 	if width <= 0 {
 		return ""
 	}
+	if len(tw.rows) == 0 {
+		if tw.filter != "" {
+			return dimStyle.Render("  (no matches)\n")
+		}
+		return ""
+	}
 
 	var b strings.Builder
 	for i, r := range tw.rows {
@@ -359,9 +568,17 @@ func (tw *TreeWidget) View(width int) string {
 			}
 		}
 
+		var renderedLabel string
+		if tw.filter != "" {
+			renderedLabel = highlightMatches(label, tw.filter, isSelected)
+		} else if isSelected {
+			renderedLabel = selectedStyle.Render(label)
+		} else {
+			renderedLabel = normalStyle.Render(label)
+		}
+
 		if isSelected {
 			renderedIndent := selectedStyle.Render(indent)
-			renderedLabel := selectedStyle.Render(label)
 			content := renderedIndent + glyph + renderedLabel
 
 			contentWidth := ansi.StringWidth(content)
@@ -372,7 +589,7 @@ func (tw *TreeWidget) View(width int) string {
 			}
 			b.WriteString(content)
 		} else {
-			line := normalStyle.Render(indent) + glyph + normalStyle.Render(label)
+			line := normalStyle.Render(indent) + glyph + renderedLabel
 			if ansi.StringWidth(line) > width {
 				line = ansi.Truncate(line, width, "")
 			}
