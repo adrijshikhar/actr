@@ -318,3 +318,100 @@ func TestSupervisor_NilConfigErrors(t *testing.T) {
 		t.Errorf("expected clean exit with canceled context, got %v", err)
 	}
 }
+
+func TestSupervisor_StopAndConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.SupervisorConfig{
+		Version: "1",
+		Global: config.GlobalConfig{
+			MaxConcurrentJobs: 2,
+		},
+		Repos: map[string]config.RepoConfig{
+			"repo-stop": {
+				URL:               "https://github.com/owner/repo-stop",
+				ConfigDir:         filepath.Join(tmpDir, "repos", "repo-stop"),
+				MaxConcurrentJobs: 1,
+			},
+		},
+	}
+
+	s, err := NewSupervisor(cfg, filepath.Join(tmpDir, "daemon.sock"))
+	if err != nil {
+		t.Fatalf("NewSupervisor failed: %v", err)
+	}
+
+	// Calling Stop when idle should be a no-op
+	if err := s.Stop(); err != nil {
+		t.Errorf("expected clean Stop when idle, got %v", err)
+	}
+
+	// Verify Config getter returns accurate copy
+	gotCfg := s.Config()
+	if gotCfg == nil || gotCfg.Global.MaxConcurrentJobs != 2 {
+		t.Fatalf("expected config with MaxConcurrentJobs 2, got %v", gotCfg)
+	}
+
+	startDone := make(chan error, 1)
+	go func() {
+		startDone <- s.Start(context.Background())
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Call s.Stop() explicitly while running
+	if err := s.Stop(); err != nil {
+		t.Errorf("Stop failed: %v", err)
+	}
+
+	select {
+	case err := <-startDone:
+		if err != nil {
+			t.Errorf("Start returned error after Stop: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("supervisor did not stop within deadline after Stop()")
+	}
+}
+
+func TestSupervisor_ReloadAtomicValidationFailure(t *testing.T) {
+	cfg := &config.SupervisorConfig{
+		Version: "1",
+		Global: config.GlobalConfig{
+			MaxConcurrentJobs: 2,
+		},
+		Repos: map[string]config.RepoConfig{
+			"repo-ok": {
+				URL: "https://github.com/owner/repo-ok",
+			},
+		},
+	}
+
+	s, err := NewSupervisor(cfg, "")
+	if err != nil {
+		t.Fatalf("NewSupervisor failed: %v", err)
+	}
+
+	// Reload with an invalid added repo (empty alias key)
+	badCfg := &config.SupervisorConfig{
+		Version: "1",
+		Global: config.GlobalConfig{
+			MaxConcurrentJobs: 10,
+		},
+		Repos: map[string]config.RepoConfig{
+			"repo-ok": cfg.Repos["repo-ok"],
+			"": {
+				URL: "https://github.com/owner/repo-invalid",
+			},
+		},
+	}
+
+	err = s.Reload(badCfg)
+	if err == nil {
+		t.Fatal("expected error reloading with invalid repo alias")
+	}
+
+	// Invariant: resMgr must NOT have resized to 10 if validation failed
+	if s.ResourceManager().MaxConcurrentJobs() != 2 {
+		t.Errorf("expected MaxConcurrentJobs to remain 2 after failed reload, got %d", s.ResourceManager().MaxConcurrentJobs())
+	}
+}

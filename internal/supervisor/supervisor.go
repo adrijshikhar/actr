@@ -104,6 +104,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	s.running = true
 
 	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
 	s.runCtx = runCtx
 	s.runCancel = runCancel
 
@@ -182,11 +183,12 @@ func (s *Supervisor) Reload(newCfg *config.SupervisorConfig) error {
 		return fmt.Errorf("nil config on reload")
 	}
 
-	if err := s.resMgr.Resize(newCfg.Global.MaxConcurrentJobs); err != nil {
-		return fmt.Errorf("resize resource manager: %w", err)
+	s.mu.Lock()
+	if s.running && s.runCtx != nil && s.runCtx.Err() != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("cannot reload supervisor while shutting down")
 	}
 
-	s.mu.Lock()
 	// Pre-instantiate workers for added repositories to fail early before mutations
 	addedWorkers := make(map[string]*RepoWorker)
 	for alias, repoCfg := range newCfg.Repos {
@@ -198,6 +200,11 @@ func (s *Supervisor) Reload(newCfg *config.SupervisorConfig) error {
 			}
 			addedWorkers[alias] = w
 		}
+	}
+
+	if err := s.resMgr.Resize(newCfg.Global.MaxConcurrentJobs); err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("resize resource manager: %w", err)
 	}
 
 	// Detect removed repositories
