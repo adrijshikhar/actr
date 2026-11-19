@@ -145,3 +145,21 @@ func (c *Client) GetHistoricalStepLogs(ctx context.Context, jobID, stepID string
 	}
 	return lines, nil
 }
+
+// Reload triggers a dynamic configuration reload on the daemon via POST /reload.
+func (c *Client) Reload(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://unix/reload", nil)
+	if err != nil {
+		return fmt.Errorf("create reload request: %w", err)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("send reload request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("reload failed with status %d", resp.StatusCode)
+	}
+	return nil
+}

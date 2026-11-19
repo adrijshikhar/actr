@@ -226,8 +226,8 @@ func TestSupervisor_DrainOnContextCancel(t *testing.T) {
 
 	// Verify Start has not exited yet because the job is still running
 	select {
-	case <-errCh:
-		t.Fatal("Start returned before in-flight job finished draining")
+	case err := <-errCh:
+		t.Fatalf("Start returned before in-flight job finished draining: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
 

@@ -1173,7 +1173,7 @@ func (m *DashboardModel) handleJobStart(job *monitor.JobInfo) {
 		}
 	}
 
-	var parentNode *TreeNode = live
+	parentNode := live
 	if isMulti {
 		repoKey := job.Repo
 		if repoKey == "" {
@@ -1492,12 +1492,12 @@ func (m *DashboardModel) renderRepoState(sel *TreeNode) string {
 	activeCount := len(sel.Children)
 	var sb strings.Builder
 	sb.WriteString("\n")
-	sb.WriteString(fmt.Sprintf("  Repository: %s\n", title))
-	sb.WriteString(fmt.Sprintf("  Active Jobs: %d\n", activeCount))
+	fmt.Fprintf(&sb, "  Repository: %s\n", title)
+	fmt.Fprintf(&sb, "  Active Jobs: %d\n", activeCount)
 	if activeCount > 0 {
 		sb.WriteString("  Jobs:\n")
 		for _, j := range sel.Children {
-			sb.WriteString(fmt.Sprintf("    • %s [%s]\n", j.Label, j.Status))
+			fmt.Fprintf(&sb, "    • %s [%s]\n", j.Label, j.Status)
 		}
 	} else {
 		sb.WriteString("  Status: Idle (no active jobs running)\n")

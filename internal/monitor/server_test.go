@@ -569,7 +569,7 @@ func TestServer_SupervisorStatusAndReload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST /reload failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 OK from /reload, got %d", resp.StatusCode)
 	}
@@ -585,7 +585,7 @@ func TestServer_SupervisorStatusAndReload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST /reload failed: %v", err)
 	}
-	defer respErr.Body.Close()
+	defer func() { _ = respErr.Body.Close() }()
 	if respErr.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("expected 500 InternalServerError from /reload, got %d", respErr.StatusCode)
 	}
@@ -596,7 +596,7 @@ func TestServer_SupervisorStatusAndReload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST /reload failed: %v", err)
 	}
-	defer respNil.Body.Close()
+	defer func() { _ = respNil.Body.Close() }()
 	if respNil.StatusCode != http.StatusNotImplemented {
 		t.Fatalf("expected 501 NotImplemented from /reload, got %d", respNil.StatusCode)
 	}

@@ -52,13 +52,15 @@ func NewSupervisor(cfg *config.SupervisorConfig, sockPath string) (*Supervisor, 
 		workers[alias] = w
 	}
 
-	return &Supervisor{
+	sup := &Supervisor{
 		cfg:       cfg,
 		sockPath:  sockPath,
 		resMgr:    resMgr,
 		monServer: monServer,
 		workers:   workers,
-	}, nil
+	}
+	sup.updateMonitorStatus()
+	return sup, nil
 }
 
 // ResourceManager returns the global resource governance manager.
@@ -124,6 +126,21 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		}
 	}
 	s.mu.Unlock()
+
+	s.updateMonitorStatus()
+
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				s.updateMonitorStatus()
+			}
+		}
+	}()
 
 	<-runCtx.Done()
 
@@ -248,6 +265,43 @@ func (s *Supervisor) Reload(newCfg *config.SupervisorConfig) error {
 		wg.Wait()
 	}
 
+	s.updateMonitorStatus()
 	logger.Info("supervisor configuration reloaded", "maxConcurrentJobs", newCfg.Global.MaxConcurrentJobs)
 	return nil
+}
+
+// updateMonitorStatus syncs the current global and per-repo capacity into the MonitorServer.
+func (s *Supervisor) updateMonitorStatus() {
+	if s.monServer == nil {
+		return
+	}
+	s.mu.RLock()
+	globalMax := s.resMgr.MaxConcurrentJobs()
+	globalActive := s.resMgr.ActiveCount()
+	slots := make([]*monitor.RepoSlotInfo, 0, len(s.workers))
+	for alias, w := range s.workers {
+		maxJ := w.repoCfg.MaxConcurrentJobs
+		if maxJ <= 0 {
+			maxJ = 1
+		}
+		activeJ := w.ActiveJobs()
+		status := "idle"
+		if activeJ > 0 {
+			status = "busy"
+		}
+		slots = append(slots, &monitor.RepoSlotInfo{
+			Alias:      alias,
+			MaxJobs:    maxJ,
+			ActiveJobs: activeJ,
+			Status:     status,
+			Driver:     w.repoCfg.Driver,
+		})
+	}
+	s.mu.RUnlock()
+
+	s.monServer.SetSupervisorStatus(&monitor.SupervisorStatus{
+		GlobalMaxJobs: globalMax,
+		GlobalActive:  globalActive,
+		RepoSlots:     slots,
+	})
 }

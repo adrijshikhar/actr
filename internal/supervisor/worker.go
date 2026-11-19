@@ -147,6 +147,37 @@ func NewRepoWorker(alias string, repoCfg config.RepoConfig, resMgr *ResourceMana
 	return w, nil
 }
 
+// SetBrokerClient overrides the BrokerClient (useful for testing and mocking).
+func (w *RepoWorker) SetBrokerClient(b BrokerClientInterface) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.brokerClient = b
+}
+
+// SetRunServiceClient overrides the RunServiceClient (useful for testing and mocking).
+func (w *RepoWorker) SetRunServiceClient(r RunServiceClientInterface) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.runServiceClient = r
+}
+
+// SetCoordinator overrides the JobExecutor (useful for testing and mocking).
+func (w *RepoWorker) SetCoordinator(c JobExecutor) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.coordinator = c
+}
+
+// ActiveJobs returns the number of currently active jobs executing for this repo worker.
+func (w *RepoWorker) ActiveJobs() int {
+	if w == nil {
+		return 0
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.repoSem)
+}
+
 // Start begins the repository worker polling loop in a background goroutine.
 func (w *RepoWorker) Start(ctx context.Context, pollingCtx context.Context) error {
 	w.mu.Lock()
