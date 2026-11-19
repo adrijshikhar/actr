@@ -76,6 +76,7 @@ type DashboardModel struct {
 	autoFocused          bool
 
 	historicalSummaries map[string]*HistoricalRunSummary
+	seenRepoExpansion   map[string]bool
 
 	historyStore monitor.HistoryStore
 	isOffline    bool
@@ -90,16 +91,19 @@ func NewDashboardModel(sockPath string) *DashboardModel {
 		ID:       "root",
 		Label:    "actr",
 		Expanded: true,
+		NodeType: NodeBranch,
 	}
 	liveNode := &TreeNode{
 		ID:       "live-runs",
 		Label:    "LIVE RUNS (0 active)",
 		Expanded: true,
+		NodeType: NodeBranch,
 	}
 	histNode := &TreeNode{
 		ID:       "historical-runs",
 		Label:    "HISTORICAL RUNS (0 past runs)",
 		Expanded: true,
+		NodeType: NodeBranch,
 	}
 	root.AddChild(liveNode)
 	root.AddChild(histNode)
@@ -113,6 +117,7 @@ func NewDashboardModel(sockPath string) *DashboardModel {
 		autoFollow:          true,
 		stepLogs:            make(map[string][]string),
 		historicalSummaries: make(map[string]*HistoricalRunSummary),
+		seenRepoExpansion:   make(map[string]bool),
 	}
 }
 
@@ -400,16 +405,25 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter", " ":
 			if !m.isZoomed {
 				m.tree.Toggle()
+				if sel := m.tree.SelectedNode(); sel != nil && sel.NodeType == NodeRepo {
+					m.seenRepoExpansion[sel.ID] = sel.Expanded
+				}
 				return m, m.updateActiveStepLogs()
 			}
 		case "h", "left":
 			if !m.isZoomed {
 				m.tree.Collapse()
+				if sel := m.tree.SelectedNode(); sel != nil && sel.NodeType == NodeRepo {
+					m.seenRepoExpansion[sel.ID] = sel.Expanded
+				}
 				return m, m.updateActiveStepLogs()
 			}
 		case "l", "right":
 			if !m.isZoomed {
 				m.tree.Expand()
+				if sel := m.tree.SelectedNode(); sel != nil && sel.NodeType == NodeRepo {
+					m.seenRepoExpansion[sel.ID] = sel.Expanded
+				}
 				return m, m.updateActiveStepLogs()
 			}
 		case "pgdown", "pagedown", "ctrl+d":
@@ -651,6 +665,9 @@ func (m *DashboardModel) applySnapshot(snap *monitor.Snapshot) tea.Cmd {
 	if snap.Telemetry != nil {
 		m.telemetry.Update(snap.Telemetry)
 	}
+	if snap.SupervisorStatus != nil {
+		m.telemetry.SetSupervisorStatus(snap.SupervisorStatus)
+	}
 	for stepKey, lines := range snap.StepLogs {
 		if len(lines) > maxStepLogLines {
 			lines = lines[len(lines)-maxStepLogLines:]
@@ -708,7 +725,7 @@ func (m *DashboardModel) getHistoricalBranch() *TreeNode {
 
 func (m *DashboardModel) ensureBranches() (*TreeNode, *TreeNode) {
 	if m.tree.Root == nil {
-		m.tree.Root = &TreeNode{ID: "root", Label: "actr", Expanded: true}
+		m.tree.Root = &TreeNode{ID: "root", Label: "actr", Expanded: true, NodeType: NodeBranch}
 	}
 	live := m.getLiveBranch()
 	if live == nil {
@@ -716,6 +733,7 @@ func (m *DashboardModel) ensureBranches() (*TreeNode, *TreeNode) {
 			ID:       "live-runs",
 			Label:    "LIVE RUNS (0 active)",
 			Expanded: true,
+			NodeType: NodeBranch,
 		}
 		m.tree.Root.AddChild(live)
 	}
@@ -725,6 +743,7 @@ func (m *DashboardModel) ensureBranches() (*TreeNode, *TreeNode) {
 			ID:       "historical-runs",
 			Label:    "HISTORICAL RUNS (0 past runs)",
 			Expanded: true,
+			NodeType: NodeBranch,
 		}
 		m.tree.Root.AddChild(hist)
 	}
@@ -737,7 +756,15 @@ func (m *DashboardModel) updateBranchLabels() {
 		if m.isOffline {
 			live.Label = "LIVE RUNS (daemon offline • polling...)"
 		} else {
-			live.Label = fmt.Sprintf("LIVE RUNS (%d active)", len(live.Children))
+			activeCount := 0
+			for _, ch := range live.Children {
+				if ch.NodeType == NodeRepo {
+					activeCount += len(ch.Children)
+				} else {
+					activeCount++
+				}
+			}
+			live.Label = fmt.Sprintf("LIVE RUNS (%d active)", activeCount)
 		}
 	}
 	hist := m.getHistoricalBranch()
@@ -866,11 +893,13 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 		ID:       "root",
 		Label:    label,
 		Expanded: true,
+		NodeType: NodeBranch,
 	}
 
 	liveNode := &TreeNode{
 		ID:       "live-runs",
 		Expanded: true,
+		NodeType: NodeBranch,
 	}
 	if m.isOffline {
 		liveNode.Label = "LIVE RUNS (daemon offline • polling...)"
@@ -881,6 +910,7 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 	histNode := &TreeNode{
 		ID:       "historical-runs",
 		Expanded: true,
+		NodeType: NodeBranch,
 	}
 
 	existingHistJobs := make(map[string]*TreeNode)
@@ -892,27 +922,101 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 		}
 	}
 
-	for _, job := range snap.ActiveJobs {
-		if job == nil {
-			continue
-		}
-		jobNode := &TreeNode{
-			ID:       job.ID,
-			Label:    job.Name,
-			Status:   job.Status,
-			Expanded: true,
-		}
-		for _, step := range job.Steps {
-			if step != nil {
-				stepNode := &TreeNode{
-					ID:     step.ID,
-					Label:  step.Name,
-					Status: step.Status,
-				}
-				jobNode.AddChild(stepNode)
+	isMultiRepo := snap.SupervisorStatus != nil
+	if !isMultiRepo {
+		for _, job := range snap.ActiveJobs {
+			if job != nil && (job.Repo != "" || job.RepoAlias != "") {
+				isMultiRepo = true
+				break
 			}
 		}
-		liveNode.AddChild(jobNode)
+	}
+
+	if isMultiRepo {
+		repoJobs := make(map[string][]*monitor.JobInfo)
+		var repoOrder []string
+
+		for _, job := range snap.ActiveJobs {
+			if job == nil {
+				continue
+			}
+			repoKey := job.Repo
+			if repoKey == "" {
+				repoKey = job.RepoAlias
+			}
+			if repoKey == "" {
+				repoKey = "default"
+			}
+			if _, exists := repoJobs[repoKey]; !exists {
+				repoJobs[repoKey] = []*monitor.JobInfo{}
+				repoOrder = append(repoOrder, repoKey)
+			}
+			repoJobs[repoKey] = append(repoJobs[repoKey], job)
+		}
+
+		for _, rKey := range repoOrder {
+			jobs := repoJobs[rKey]
+			repoID := "repo:" + rKey
+			expanded := true
+			if exp, ok := m.seenRepoExpansion[repoID]; ok {
+				expanded = exp
+			}
+			repoNode := &TreeNode{
+				ID:       repoID,
+				Label:    rKey,
+				Expanded: expanded,
+				NodeType: NodeRepo,
+			}
+			for _, job := range jobs {
+				jobNode := &TreeNode{
+					ID:       job.ID,
+					Label:    job.Name,
+					Status:   job.Status,
+					Expanded: true,
+					NodeType: NodeJob,
+					Data:     job,
+				}
+				for _, step := range job.Steps {
+					if step != nil {
+						stepNode := &TreeNode{
+							ID:       step.ID,
+							Label:    step.Name,
+							Status:   step.Status,
+							NodeType: NodeStep,
+						}
+						jobNode.AddChild(stepNode)
+					}
+				}
+				repoNode.AddChild(jobNode)
+			}
+			liveNode.AddChild(repoNode)
+		}
+	} else {
+		for _, job := range snap.ActiveJobs {
+			if job == nil {
+				continue
+			}
+			jobNode := &TreeNode{
+				ID:       job.ID,
+				Label:    job.Name,
+				Status:   job.Status,
+				Expanded: true,
+				NodeType: NodeJob,
+				Data:     job,
+			}
+			for _, step := range job.Steps {
+				if step != nil {
+					stepNode := &TreeNode{
+						ID:       step.ID,
+						Label:    step.Name,
+						Status:   step.Status,
+						NodeType: NodeStep,
+					}
+					jobNode.AddChild(stepNode)
+				}
+			}
+			liveNode.AddChild(jobNode)
+		}
 	}
 
 	selectedID := ""
@@ -939,14 +1043,16 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 			Label:    job.Name,
 			Status:   job.Status,
 			Expanded: expanded,
+			NodeType: NodeJob,
 			Data:     job,
 		}
 		for _, step := range job.Steps {
 			if step != nil {
 				stepNode := &TreeNode{
-					ID:     step.ID,
-					Label:  step.Name,
-					Status: step.Status,
+					ID:       step.ID,
+					Label:    step.Name,
+					Status:   step.Status,
+					NodeType: NodeStep,
 				}
 				jobNode.AddChild(stepNode)
 			}
@@ -1056,8 +1162,51 @@ func (m *DashboardModel) handleJobStart(job *monitor.JobInfo) {
 		return
 	}
 	live, _ := m.ensureBranches()
+	isMulti := (job.Repo != "" || job.RepoAlias != "")
+	if !isMulti {
+		for _, ch := range live.Children {
+			if ch.NodeType == NodeRepo {
+				isMulti = true
+				break
+			}
+		}
+	}
+
+	var parentNode *TreeNode = live
+	if isMulti {
+		repoKey := job.Repo
+		if repoKey == "" {
+			repoKey = job.RepoAlias
+		}
+		if repoKey == "" {
+			repoKey = "default"
+		}
+		repoID := "repo:" + repoKey
+		var repoNode *TreeNode
+		for _, ch := range live.Children {
+			if ch.ID == repoID {
+				repoNode = ch
+				break
+			}
+		}
+		if repoNode == nil {
+			expanded := true
+			if exp, ok := m.seenRepoExpansion[repoID]; ok {
+				expanded = exp
+			}
+			repoNode = &TreeNode{
+				ID:       repoID,
+				Label:    repoKey,
+				Expanded: expanded,
+				NodeType: NodeRepo,
+			}
+			live.AddChild(repoNode)
+		}
+		parentNode = repoNode
+	}
+
 	var target *TreeNode
-	for _, ch := range live.Children {
+	for _, ch := range parentNode.Children {
 		if ch.ID == job.ID {
 			target = ch
 			break
@@ -1069,11 +1218,14 @@ func (m *DashboardModel) handleJobStart(job *monitor.JobInfo) {
 			Label:    job.Name,
 			Status:   job.Status,
 			Expanded: true,
+			NodeType: NodeJob,
+			Data:     job,
 		}
-		live.AddChild(target)
+		parentNode.AddChild(target)
 	} else {
 		target.Label = job.Name
 		target.Status = job.Status
+		target.Data = job
 	}
 	for _, st := range job.Steps {
 		if st != nil {
@@ -1086,9 +1238,10 @@ func (m *DashboardModel) handleJobStart(job *monitor.JobInfo) {
 			}
 			if stepNode == nil {
 				stepNode = &TreeNode{
-					ID:     st.ID,
-					Label:  st.Name,
-					Status: st.Status,
+					ID:       st.ID,
+					Label:    st.Name,
+					Status:   st.Status,
+					NodeType: NodeStep,
 				}
 				target.AddChild(stepNode)
 			} else {
@@ -1104,23 +1257,34 @@ func (m *DashboardModel) handleJobStart(job *monitor.JobInfo) {
 func (m *DashboardModel) handleJobFinish(jobID string, job *monitor.JobInfo) tea.Cmd {
 	live, hist := m.ensureBranches()
 	var target *TreeNode
-	var targetIdx = -1
 
-	// 1. Look for job in live branch
+	// Look for job in live branch (both direct children and inside NodeRepo children)
 	for i, ch := range live.Children {
 		if ch.ID == jobID || (job != nil && ch.ID == job.ID) {
 			target = ch
-			targetIdx = i
+			live.Children = append(live.Children[:i], live.Children[i+1:]...)
 			break
+		}
+		if ch.NodeType == NodeRepo {
+			for j, sub := range ch.Children {
+				if sub.ID == jobID || (job != nil && sub.ID == job.ID) {
+					target = sub
+					ch.Children = append(ch.Children[:j], ch.Children[j+1:]...)
+					if len(ch.Children) == 0 {
+						live.Children = append(live.Children[:i], live.Children[i+1:]...)
+					}
+					break
+				}
+			}
+			if target != nil {
+				break
+			}
 		}
 	}
 
 	selectedBefore := m.tree.SelectedNode()
 
-	if target != nil {
-		// Remove from live branch
-		live.Children = append(live.Children[:targetIdx], live.Children[targetIdx+1:]...)
-	} else {
+	if target == nil {
 		// Check if already in historical branch
 		for _, ch := range hist.Children {
 			if ch.ID == jobID || (job != nil && ch.ID == job.ID) {
@@ -1142,6 +1306,7 @@ func (m *DashboardModel) handleJobFinish(jobID string, job *monitor.JobInfo) tea
 				Label:    label,
 				Status:   status,
 				Expanded: false,
+				NodeType: NodeJob,
 			}
 		}
 	}
@@ -1152,6 +1317,7 @@ func (m *DashboardModel) handleJobFinish(jobID string, job *monitor.JobInfo) tea
 			target.Label = job.Name
 		}
 		target.Status = job.Status
+		target.NodeType = NodeJob
 		for _, st := range job.Steps {
 			if st != nil {
 				var stepNode *TreeNode
@@ -1163,9 +1329,10 @@ func (m *DashboardModel) handleJobFinish(jobID string, job *monitor.JobInfo) tea
 				}
 				if stepNode == nil {
 					stepNode = &TreeNode{
-						ID:     st.ID,
-						Label:  st.Name,
-						Status: st.Status,
+						ID:       st.ID,
+						Label:    st.Name,
+						Status:   st.Status,
+						NodeType: NodeStep,
 					}
 					target.AddChild(stepNode)
 				} else {
@@ -1303,6 +1470,27 @@ func (m *DashboardModel) updateNodeStatus(nodeID string, status monitor.StepStat
 	m.tree.Rebuild()
 }
 
+func (m *DashboardModel) renderRepoState(sel *TreeNode) string {
+	if sel == nil {
+		return ""
+	}
+	title := sel.Label
+	activeCount := len(sel.Children)
+	var sb strings.Builder
+	sb.WriteString("\n")
+	sb.WriteString(fmt.Sprintf("  Repository: %s\n", title))
+	sb.WriteString(fmt.Sprintf("  Active Jobs: %d\n", activeCount))
+	if activeCount > 0 {
+		sb.WriteString("  Jobs:\n")
+		for _, j := range sel.Children {
+			sb.WriteString(fmt.Sprintf("    • %s [%s]\n", j.Label, j.Status))
+		}
+	} else {
+		sb.WriteString("  Status: Idle (no active jobs running)\n")
+	}
+	return sb.String()
+}
+
 func (m *DashboardModel) updateActiveStepLogs() tea.Cmd {
 	if m.width > 0 && m.height > 0 && (m.viewport.Width == 0 || m.viewport.Height == 0) {
 		m.updateSizes()
@@ -1311,9 +1499,15 @@ func (m *DashboardModel) updateActiveStepLogs() tea.Cmd {
 	sel := m.tree.SelectedNode()
 	if sel != nil {
 		m.activeStepID = sel.ID
+
+		if sel.NodeType == NodeRepo {
+			m.viewport.SetContent(m.renderRepoState(sel))
+			return nil
+		}
+
 		var lines []string
-		hasParentJob := sel.Parent != nil && sel.Parent.ID != "" && sel.Parent.ID != "root" && sel.Parent.ID != "live-runs" && sel.Parent.ID != "historical-runs"
-		if hasParentJob {
+		hasParentJob := sel.NodeType == NodeStep || (sel.Parent != nil && sel.Parent.NodeType == NodeJob) || (sel.Parent != nil && sel.Parent.ID != "" && sel.Parent.ID != "root" && sel.Parent.ID != "live-runs" && sel.Parent.ID != "historical-runs" && sel.Parent.NodeType != NodeRepo)
+		if hasParentJob && sel.Parent != nil {
 			lines = m.stepLogs[sel.Parent.ID+"/"+sel.ID]
 			if len(lines) == 0 && !isHistoricalNode(sel) {
 				lines = m.stepLogs[sel.ID]
@@ -1331,7 +1525,7 @@ func (m *DashboardModel) updateActiveStepLogs() tea.Cmd {
 		}
 
 		// If logs are not in memory, check if this is a historical step
-		if isHistoricalNode(sel) && sel.Parent != nil && sel.Parent.ID != "" && sel.Parent.ID != "historical-runs" {
+		if isHistoricalNode(sel) && sel.Parent != nil && sel.Parent.ID != "" && sel.Parent.ID != "historical-runs" && sel.Parent.NodeType != NodeRepo {
 			jobID := sel.Parent.ID
 			stepID := sel.ID
 			// In offline mode with a direct history store, read immediately without IPC
@@ -1355,7 +1549,7 @@ func (m *DashboardModel) updateActiveStepLogs() tea.Cmd {
 			}
 		}
 
-		if sel.ID == "root" || sel.Parent == nil || sel.ID == "live-runs" || sel.ID == "historical-runs" {
+		if sel.ID == "root" || sel.Parent == nil || sel.ID == "live-runs" || sel.ID == "historical-runs" || sel.NodeType == NodeBranch {
 			m.viewport.SetContent(m.renderRootState(m.tree.Root.Label))
 		} else {
 			m.viewport.SetContent(renderStepEmptyState(sel))
