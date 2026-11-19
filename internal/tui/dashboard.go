@@ -55,6 +55,11 @@ type historicalLogsLoadedMsg struct {
 	err    error
 }
 
+// clearToastMsg signals that a HUD toast notification has expired.
+type clearToastMsg struct {
+	id int
+}
+
 const (
 	StatusBadgeConnected = "● CONNECTED (LIVE)"
 	StatusBadgeOffline   = "◉ OFFLINE (HISTORY)"
@@ -83,6 +88,24 @@ type DashboardModel struct {
 	searchMatches   []int
 	currentMatchIdx int
 
+	// Mouse drag selection state
+	isSelecting   bool
+	dragStartLine int
+	dragEndLine   int
+	dragStartX    int
+	dragStartY    int
+	dragCurX      int
+	dragCurY      int
+
+	// Sidebar click tracking for double-click detection
+	lastTreeClickTime   time.Time
+	lastTreeClickNodeID string
+
+	// HUD toast notification
+	toastMsg       string
+	toastExpiresAt time.Time
+	toastID        int
+
 	width        int
 	height       int
 	ready        bool
@@ -109,6 +132,8 @@ type DashboardModel struct {
 var (
 	normalMatchStyle = lipgloss.NewStyle().Background(lipgloss.Color("226")).Foreground(lipgloss.Color("0"))
 	activeMatchStyle = lipgloss.NewStyle().Background(lipgloss.Color("208")).Foreground(lipgloss.Color("0")).Bold(true)
+	selectedLogStyle = lipgloss.NewStyle().Background(lipgloss.Color("#2563EB")).Foreground(lipgloss.Color("#FFFFFF"))
+	toastStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#22C55E")).Bold(true)
 )
 
 // NewDashboardModel creates a new DashboardModel configured to connect to the given socket.
@@ -262,6 +287,47 @@ func (m *DashboardModel) PrevMatch() {
 	m.autoFollow = false
 	m.refreshHighlightedLogs()
 	m.scrollToMatch(m.searchMatches[m.currentMatchIdx])
+}
+
+// setToast sets a temporary HUD toast message in the dashboard footer.
+func (m *DashboardModel) setToast(msg string) tea.Cmd {
+	if m == nil {
+		return nil
+	}
+	m.toastMsg = msg
+	m.toastExpiresAt = time.Now().Add(3 * time.Second)
+	m.toastID++
+	currID := m.toastID
+	return tea.Tick(3*time.Second, func(time.Time) tea.Msg {
+		return clearToastMsg{id: currID}
+	})
+}
+
+// ToastMsg returns the active HUD toast notification message, if any.
+func (m *DashboardModel) ToastMsg() string {
+	if m == nil {
+		return ""
+	}
+	if !m.toastExpiresAt.IsZero() && time.Now().After(m.toastExpiresAt) {
+		m.toastMsg = ""
+	}
+	return m.toastMsg
+}
+
+// IsSelecting returns whether mouse text drag-selection is currently active.
+func (m *DashboardModel) IsSelecting() bool {
+	if m == nil {
+		return false
+	}
+	return m.isSelecting
+}
+
+// DragSelection returns the start and end line indices of the current drag selection.
+func (m *DashboardModel) DragSelection() (startLine, endLine int) {
+	if m == nil {
+		return 0, 0
+	}
+	return m.dragStartLine, m.dragEndLine
 }
 
 // AutoFocusRunningStep enables auto-focusing the active running step on initial snapshot.
@@ -590,12 +656,24 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		if msg.String() != "c" && msg.String() != "C" && m.toastMsg != "" {
+			m.toastMsg = ""
+		}
+
 		switch msg.String() {
 		case "q", "ctrl+c":
 			if m.cancel != nil {
 				m.cancel()
 			}
 			return m, tea.Quit
+		case "c", "C":
+			logs := m.activeStepLogLines()
+			if len(logs) > 0 {
+				_ = CopyText(strings.Join(logs, "\n"))
+				cmd := m.setToast(fmt.Sprintf("✓ Copied %d lines to clipboard", len(logs)))
+				return m, cmd
+			}
+			return m, nil
 		case "ctrl+f":
 			m.logSearching = true
 			m.focus = FocusViewport
@@ -690,6 +768,187 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			var cmd tea.Cmd
 			m.viewport, cmd = m.viewport.Update(msg)
 			return m, cmd
+		}
+
+	case clearToastMsg:
+		if msg.id == m.toastID {
+			m.toastMsg = ""
+		}
+		return m, nil
+
+	case tea.MouseMsg:
+		if m.toastMsg != "" && !m.toastExpiresAt.IsZero() && time.Now().After(m.toastExpiresAt) {
+			m.toastMsg = ""
+		}
+
+		sidebarWidth := 0
+		if !m.isZoomed {
+			sidebarWidth = m.calcTreeWidth() + 2
+		}
+
+		// Handle mouse wheel scrolling
+		if tea.MouseEvent(msg).IsWheel() || msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
+			isUp := msg.Button == tea.MouseButtonWheelUp
+			if !m.isZoomed && msg.X < sidebarWidth {
+				if isUp {
+					m.tree.Up()
+				} else {
+					m.tree.Down()
+				}
+				return m, m.updateActiveStepLogs()
+			}
+			// Viewport scrolling
+			m.autoFollow = false
+			if isUp {
+				m.viewport.LineUp(3)
+			} else {
+				m.viewport.LineDown(3)
+			}
+			return m, nil
+		}
+
+		// Calculate viewport vertical bounds
+		viewportTop := 1
+		if !m.isZoomed {
+			telemOuterHeight := 6
+			if m.height < 18 {
+				telemOuterHeight = 4
+			}
+			viewportTop = telemOuterHeight + 1
+		}
+		viewportBottom := viewportTop + m.viewport.Height
+
+		// Release event: finalize drag selection if in progress
+		if msg.Action == tea.MouseActionRelease {
+			if m.isSelecting {
+				m.isSelecting = false
+				lines := m.activeStepLogLines()
+				var cmd tea.Cmd
+				if len(lines) > 0 {
+					minLine := m.dragStartLine
+					maxLine := m.dragEndLine
+					if minLine > maxLine {
+						minLine, maxLine = maxLine, minLine
+					}
+					if minLine < 0 {
+						minLine = 0
+					}
+					if maxLine >= len(lines) {
+						maxLine = len(lines) - 1
+					}
+					if minLine <= maxLine && minLine < len(lines) {
+						selected := strings.Join(lines[minLine:maxLine+1], "\n")
+						if selected != "" {
+							_ = CopyText(selected)
+							cmd = m.setToast("✓ Copied selection to clipboard")
+						}
+					}
+				}
+				m.refreshHighlightedLogs()
+				return m, cmd
+			}
+		}
+
+		// Motion event: update selection range while dragging
+		if msg.Action == tea.MouseActionMotion {
+			if m.isSelecting {
+				m.dragCurX = msg.X
+				m.dragCurY = msg.Y
+				relY := msg.Y - viewportTop
+				if relY < 0 {
+					relY = 0
+				}
+				if relY >= m.viewport.Height && m.viewport.Height > 0 {
+					relY = m.viewport.Height - 1
+				}
+				curLine := m.viewport.YOffset + relY
+				if curLine < 0 {
+					curLine = 0
+				}
+				m.dragEndLine = curLine
+				m.refreshHighlightedLogs()
+				return m, nil
+			}
+		}
+
+		// Press event (left click)
+		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+
+			if !m.isZoomed && msg.X < sidebarWidth {
+				// Click in Sidebar Tree
+				m.focus = FocusTree
+
+				treeTopOffset := 1
+				if m.treeSearching || m.treeSearchInput.Value() != "" {
+					treeTopOffset = 2
+					if msg.Y == 1 {
+						m.treeSearching = true
+						cmd := m.treeSearchInput.Focus()
+						return m, cmd
+					}
+				}
+
+				row := msg.Y - treeTopOffset
+				if row >= 0 && row < len(m.tree.Rows()) {
+					clickedNode := m.tree.NodeAtRow(row)
+
+					// Double click detection: same node within 350ms
+					isDoubleClick := !m.lastTreeClickTime.IsZero() &&
+						time.Since(m.lastTreeClickTime) <= 350*time.Millisecond &&
+						clickedNode != nil && m.lastTreeClickNodeID == clickedNode.ID
+
+					// Chevron click detection: indent + glyph
+					isChevron := false
+					if clickedNode != nil && len(clickedNode.Children) > 0 {
+						chevronStart := 1 + clickedNode.Depth*2
+						chevronEnd := chevronStart + 2
+						if msg.X >= 1 && msg.X <= chevronEnd {
+							isChevron = true
+						}
+					}
+
+					m.tree.SelectRow(row)
+					if isDoubleClick || isChevron {
+						m.tree.ToggleExpandSelected()
+					}
+					if clickedNode != nil && clickedNode.NodeType == NodeRepo {
+						m.seenRepoExpansion[clickedNode.ID] = clickedNode.Expanded
+					}
+
+					m.lastTreeClickTime = time.Now()
+					if clickedNode != nil {
+						m.lastTreeClickNodeID = clickedNode.ID
+					}
+
+					return m, m.updateActiveStepLogs()
+				}
+				return m, nil
+			}
+
+			// Click in Viewport
+			m.focus = FocusViewport
+
+			if msg.Y >= viewportTop && msg.Y < viewportBottom {
+				relY := msg.Y - viewportTop
+				startLine := m.viewport.YOffset + relY
+				if startLine < 0 {
+					startLine = 0
+				}
+				m.isSelecting = true
+				m.dragStartLine = startLine
+				m.dragEndLine = startLine
+				m.dragStartX = msg.X
+				m.dragStartY = msg.Y
+				m.dragCurX = msg.X
+				m.dragCurY = msg.Y
+				m.refreshHighlightedLogs()
+				return m, nil
+			}
+
+			if m.logSearching && msg.Y == viewportBottom {
+				cmd := m.logSearchInput.Focus()
+				return m, cmd
+			}
 		}
 
 	case SnapshotMsg:
@@ -2291,20 +2550,32 @@ func leftNavText(width int, err error) string {
 }
 
 func (m *DashboardModel) renderFooter() string {
+	hasToast := m.toastMsg != "" && (m.toastExpiresAt.IsZero() || time.Now().Before(m.toastExpiresAt))
 	var leftStr string
-	if m.treeSearching {
+	if hasToast {
+		leftStr = " " + m.toastMsg
+	} else if m.treeSearching {
 		leftStr = " Esc cancel • Enter select"
 	} else if m.logSearching {
 		leftStr = " Esc cancel • Enter navigate"
 	} else {
 		leftStr = leftNavText(m.width, m.lastErr)
 	}
-	left := dimStyle.Render(leftStr)
+
+	var left string
+	if hasToast {
+		left = toastStyle.Render(leftStr)
+	} else {
+		left = dimStyle.Render(leftStr)
+	}
 	leftW := lipgloss.Width(left)
 
 	sample := m.telemetry.Sample()
 	if sample == nil || m.width < 70 {
 		if leftW > m.width && m.width > 0 {
+			if hasToast {
+				return toastStyle.Render(ansi.Truncate(leftStr, m.width, ""))
+			}
 			return dimStyle.Render(ansi.Truncate(leftStr, m.width, ""))
 		}
 		return left
@@ -2339,6 +2610,9 @@ func (m *DashboardModel) renderFooter() string {
 
 	// 3. Fallback: insufficient clearance for host vitals
 	if leftW > m.width && m.width > 0 {
+		if hasToast {
+			return toastStyle.Render(ansi.Truncate(leftStr, m.width, ""))
+		}
 		return dimStyle.Render(ansi.Truncate(leftStr, m.width, ""))
 	}
 	return left
@@ -2559,21 +2833,36 @@ func highlightLine(line, query string, style lipgloss.Style) string {
 }
 
 func (m *DashboardModel) renderHighlightedLines(lines []string) string {
-	if m.searchQuery == "" {
-		return strings.Join(lines, "\n")
+	minLine, maxLine := -1, -1
+	if m.isSelecting {
+		minLine = m.dragStartLine
+		maxLine = m.dragEndLine
+		if minLine > maxLine {
+			minLine, maxLine = maxLine, minLine
+		}
 	}
 
 	activeLine := -1
-	if len(m.searchMatches) > 0 && m.currentMatchIdx >= 0 && m.currentMatchIdx < len(m.searchMatches) {
+	if m.searchQuery != "" && len(m.searchMatches) > 0 && m.currentMatchIdx >= 0 && m.currentMatchIdx < len(m.searchMatches) {
 		activeLine = m.searchMatches[m.currentMatchIdx]
 	}
 
 	renderedLines := make([]string, len(lines))
 	for i, line := range lines {
-		if activeLine == i {
-			renderedLines[i] = highlightLine(line, m.searchQuery, activeMatchStyle)
+		if minLine != -1 && i >= minLine && i <= maxLine {
+			stripped := ansi.Strip(line)
+			if m.viewport.Width > 0 && ansi.StringWidth(stripped) < m.viewport.Width {
+				stripped += strings.Repeat(" ", m.viewport.Width-ansi.StringWidth(stripped))
+			}
+			renderedLines[i] = selectedLogStyle.Render(stripped)
+		} else if m.searchQuery != "" {
+			if activeLine == i {
+				renderedLines[i] = highlightLine(line, m.searchQuery, activeMatchStyle)
+			} else {
+				renderedLines[i] = highlightLine(line, m.searchQuery, normalMatchStyle)
+			}
 		} else {
-			renderedLines[i] = highlightLine(line, m.searchQuery, normalMatchStyle)
+			renderedLines[i] = line
 		}
 	}
 	return strings.Join(renderedLines, "\n")
@@ -2583,8 +2872,10 @@ func (m *DashboardModel) renderAndSetLogs(lines []string) {
 	if len(lines) == 0 {
 		return
 	}
-	if m.searchQuery != "" {
-		m.updateSearchMatches(lines)
+	if m.searchQuery != "" || m.isSelecting {
+		if m.searchQuery != "" {
+			m.updateSearchMatches(lines)
+		}
 		rendered := m.renderHighlightedLines(lines)
 		m.viewport.SetContent(rendered)
 	} else {
@@ -2597,7 +2888,7 @@ func (m *DashboardModel) refreshHighlightedLogs() {
 	if len(lines) == 0 {
 		return
 	}
-	if m.searchQuery != "" {
+	if m.searchQuery != "" || m.isSelecting {
 		rendered := m.renderHighlightedLines(lines)
 		m.viewport.SetContent(rendered)
 	} else {

@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -1963,4 +1965,357 @@ func TestDashboard_LogSearch_Highlighting(t *testing.T) {
 	assert.Contains(t, vpContentClean, "connection failure in db")
 	assert.Contains(t, vpContentClean, "fatal failure in network")
 }
+
+func TestDashboard_MouseTreeSelection(t *testing.T) {
+	m := NewDashboardModel(testSocketPath(t))
+	m.ready = true
+	resModel, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = resModel.(*DashboardModel)
+
+	snap := &monitor.Snapshot{
+		RunnerName: "test-runner",
+		ActiveJobs: []*monitor.JobInfo{
+			{
+				ID:       "job-1",
+				Name:     "Build Job",
+				Workflow: "ci.yml",
+				Repo:     "adrijshikhar/actr",
+				Status:   monitor.StatusRunning,
+				Steps: []*monitor.StepInfo{
+					{ID: "step-1", Name: "Checkout", Status: monitor.StatusSuccess},
+					{ID: "step-2", Name: "Compile", Status: monitor.StatusRunning},
+				},
+			},
+		},
+	}
+	m.ApplySnapshot(snap)
+	m.stepLogs["job-1/step-1"] = []string{"checkout finished successfully"}
+	m.stepLogs["job-1/step-2"] = []string{"compiling binary..."}
+
+	// Visible rows in tree:
+	// row 0: root ("actr")
+	// row 1: live-runs ("LIVE RUNS (1 active)")
+	// row 2: repo ("adrijshikhar/actr")
+	// row 3: job-1 ("Build Job")
+	// row 4: step-1 ("Checkout")
+	// row 5: step-2 ("Compile")
+	rows := m.Tree().Rows()
+	require.GreaterOrEqual(t, len(rows), 6)
+
+	// treeTopOffset is 1 when not searching (Y=0 is top border, Y=1 is row 0)
+	// Click on row 4 (step-1) at X=10, Y=5 (row = 5 - 1 = 4)
+	newModel, _ := m.Update(tea.MouseMsg{
+		X:      10,
+		Y:      5,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	m = newModel.(*DashboardModel)
+
+	assert.Equal(t, FocusTree, m.Focus())
+	assert.Equal(t, 4, m.Tree().Cursor)
+	assert.Equal(t, "step-1", m.Tree().SelectedNode().ID)
+	assert.Contains(t, m.Viewport().View(), "checkout finished successfully")
+
+	// Click on row 3 (job-1) label at X=15, Y=4 (row = 4 - 1 = 3)
+	jobNode := m.Tree().NodeAtRow(3)
+	require.NotNil(t, jobNode)
+	assert.True(t, jobNode.Expanded)
+
+	newModel, _ = m.Update(tea.MouseMsg{
+		X:      15,
+		Y:      4,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	m = newModel.(*DashboardModel)
+	assert.Equal(t, 3, m.Tree().Cursor)
+
+	// Double click: click again within 200ms -> toggles expand
+	newModel, _ = m.Update(tea.MouseMsg{
+		X:      15,
+		Y:      4,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	m = newModel.(*DashboardModel)
+	assert.False(t, jobNode.Expanded, "double clicking should collapse the node")
+
+	// Chevron click on row 3: job-1 is depth 3 (indent = 6 spaces, chevron around X=7..9)
+	// Click chevron at X=7, Y=4
+	newModel, _ = m.Update(tea.MouseMsg{
+		X:      7,
+		Y:      4,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	assert.NotNil(t, newModel)
+	assert.True(t, jobNode.Expanded, "clicking on chevron should expand the node immediately")
+}
+
+func TestDashboard_MouseWheelScrolling(t *testing.T) {
+	m := NewDashboardModel(testSocketPath(t))
+	m.ready = true
+	resModel, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = resModel.(*DashboardModel)
+
+	snap := &monitor.Snapshot{
+		RunnerName: "test-runner",
+		ActiveJobs: []*monitor.JobInfo{
+			{
+				ID:       "job-1",
+				Name:     "Build Job",
+				Workflow: "ci.yml",
+				Repo:     "adrijshikhar/actr",
+				Status:   monitor.StatusRunning,
+				Steps: []*monitor.StepInfo{
+					{ID: "step-1", Name: "Checkout", Status: monitor.StatusSuccess},
+					{ID: "step-2", Name: "Compile", Status: monitor.StatusRunning},
+				},
+			},
+		},
+	}
+	m.ApplySnapshot(snap)
+
+	var manyLogs []string
+	for i := 1; i <= 50; i++ {
+		manyLogs = append(manyLogs, fmt.Sprintf("Log line %02d", i))
+	}
+	m.stepLogs["job-1/step-2"] = manyLogs
+
+	// Select step-2
+	m.Tree().SelectRow(5)
+	_ = m.updateActiveStepLogs()
+
+	treeWidth := m.calcTreeWidth()
+	sidebarWidth := treeWidth + 2
+
+	// 1. Wheel over sidebar (X < sidebarWidth)
+	assert.Equal(t, 5, m.Tree().Cursor)
+	newModel, _ := m.Update(tea.MouseMsg{
+		X:      5,
+		Y:      5,
+		Button: tea.MouseButtonWheelUp,
+	})
+	m = newModel.(*DashboardModel)
+	assert.Equal(t, 4, m.Tree().Cursor, "wheel up over tree should move cursor up")
+
+	newModel, _ = m.Update(tea.MouseMsg{
+		X:      5,
+		Y:      5,
+		Button: tea.MouseButtonWheelDown,
+	})
+	m = newModel.(*DashboardModel)
+	assert.Equal(t, 5, m.Tree().Cursor, "wheel down over tree should move cursor down")
+
+	// 2. Wheel over viewport (X >= sidebarWidth)
+	m.autoFollow = true
+	m.viewport.GotoBottom()
+	initYOffset := m.viewport.YOffset
+
+	newModel, _ = m.Update(tea.MouseMsg{
+		X:      sidebarWidth + 5,
+		Y:      10,
+		Button: tea.MouseButtonWheelUp,
+	})
+	m = newModel.(*DashboardModel)
+	assert.False(t, m.autoFollow, "wheel scrolling viewport should disable autoFollow")
+	assert.Less(t, m.viewport.YOffset, initYOffset, "wheel up should scroll viewport up")
+
+	prevYOffset := m.viewport.YOffset
+	newModel, _ = m.Update(tea.MouseMsg{
+		X:      sidebarWidth + 5,
+		Y:      10,
+		Button: tea.MouseButtonWheelDown,
+	})
+	m = newModel.(*DashboardModel)
+	assert.GreaterOrEqual(t, m.viewport.YOffset, prevYOffset, "wheel down should scroll viewport down")
+}
+
+func TestDashboard_DragToCopySelection(t *testing.T) {
+	oldWriter := clipboardWriter
+	oldGOOS := currentGOOS
+	defer func() {
+		clipboardWriter = oldWriter
+		currentGOOS = oldGOOS
+	}()
+
+	currentGOOS = "linux"
+	var clipBuf bytes.Buffer
+	clipboardWriter = &clipBuf
+
+	m := NewDashboardModel(testSocketPath(t))
+	m.ready = true
+	resModel, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = resModel.(*DashboardModel)
+
+	snap := &monitor.Snapshot{
+		RunnerName: "test-runner",
+		ActiveJobs: []*monitor.JobInfo{
+			{
+				ID:       "job-1",
+				Name:     "Build Job",
+				Workflow: "ci.yml",
+				Repo:     "adrijshikhar/actr",
+				Status:   monitor.StatusRunning,
+				Steps: []*monitor.StepInfo{
+					{ID: "step-1", Name: "Build", Status: monitor.StatusRunning},
+				},
+			},
+		},
+	}
+	m.ApplySnapshot(snap)
+
+	lines := []string{
+		"Starting build process",
+		"Step 1: dependencies downloaded",
+		"Step 2: compiling packages",
+		"Step 3: tests executed",
+		"Build succeeded completely",
+	}
+	m.stepLogs["job-1/step-1"] = lines
+	m.Tree().SelectRow(4) // select step-1
+	_ = m.updateActiveStepLogs()
+
+	treeWidth := m.calcTreeWidth()
+	sidebarWidth := treeWidth + 2
+
+	// Viewport Y bounds: telemOuterHeight = 6, viewportTop = 7
+	viewportTop := 7
+
+	// 1. Mouse press inside viewport to start drag selection at line 1
+	newModel, _ := m.Update(tea.MouseMsg{
+		X:      sidebarWidth + 5,
+		Y:      viewportTop + 1, // line 1: "Step 1: dependencies downloaded"
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	m = newModel.(*DashboardModel)
+
+	assert.Equal(t, FocusViewport, m.Focus())
+	assert.True(t, m.IsSelecting())
+	startLine, endLine := m.DragSelection()
+	assert.Equal(t, 1, startLine)
+	assert.Equal(t, 1, endLine)
+
+	// 2. Mouse motion to line 3 ("Step 3: tests executed")
+	newModel, _ = m.Update(tea.MouseMsg{
+		X:      sidebarWidth + 5,
+		Y:      viewportTop + 3,
+		Action: tea.MouseActionMotion,
+	})
+	m = newModel.(*DashboardModel)
+
+	assert.True(t, m.IsSelecting())
+	startLine, endLine = m.DragSelection()
+	assert.Equal(t, 1, startLine)
+	assert.Equal(t, 3, endLine)
+
+	// Viewport content should show selection styling
+	vpView := m.Viewport().View()
+	assert.Contains(t, vpView, selectedLogStyle.Render("Step 1: dependencies downloaded"))
+
+	// 3. Mouse release: copies lines 1..3 to clipboard, sets HUD toast
+	newModel, _ = m.Update(tea.MouseMsg{
+		X:      sidebarWidth + 5,
+		Y:      viewportTop + 3,
+		Action: tea.MouseActionRelease,
+		Button: tea.MouseButtonNone,
+	})
+	m = newModel.(*DashboardModel)
+
+	assert.False(t, m.IsSelecting(), "selection should end on release")
+	assert.Equal(t, "✓ Copied selection to clipboard", m.ToastMsg())
+	assert.Contains(t, m.View(), "✓ Copied selection to clipboard")
+
+	// Verify clipboard output
+	clipOutput := clipBuf.String()
+	assert.Contains(t, clipOutput, "\x1b]52;c;")
+	expectedSelected := strings.Join(lines[1:4], "\n")
+	b64Expected := base64.StdEncoding.EncodeToString([]byte(expectedSelected))
+	assert.Contains(t, clipOutput, b64Expected)
+}
+
+func TestDashboard_KeyboardCopyShortcut(t *testing.T) {
+	oldWriter := clipboardWriter
+	oldGOOS := currentGOOS
+	defer func() {
+		clipboardWriter = oldWriter
+		currentGOOS = oldGOOS
+	}()
+
+	currentGOOS = "linux"
+	var clipBuf bytes.Buffer
+	clipboardWriter = &clipBuf
+
+	m := NewDashboardModel(testSocketPath(t))
+	m.ready = true
+	resModel, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = resModel.(*DashboardModel)
+
+	snap := &monitor.Snapshot{
+		RunnerName: "test-runner",
+		ActiveJobs: []*monitor.JobInfo{
+			{
+				ID:       "job-1",
+				Name:     "Build Job",
+				Workflow: "ci.yml",
+				Repo:     "adrijshikhar/actr",
+				Status:   monitor.StatusRunning,
+				Steps: []*monitor.StepInfo{
+					{ID: "step-1", Name: "Build", Status: monitor.StatusRunning},
+				},
+			},
+		},
+	}
+	m.ApplySnapshot(snap)
+
+	lines := []string{
+		"first line",
+		"second line",
+		"third line",
+	}
+	m.stepLogs["job-1/step-1"] = lines
+	m.Tree().SelectRow(4) // select step-1
+	_ = m.updateActiveStepLogs()
+
+	// Press 'c' to copy entire step log
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = newModel.(*DashboardModel)
+
+	expectedToast := fmt.Sprintf("✓ Copied %d lines to clipboard", len(lines))
+	assert.Equal(t, expectedToast, m.ToastMsg())
+	assert.Contains(t, m.View(), expectedToast)
+
+	// Verify clipboard content
+	clipOutput := clipBuf.String()
+	assert.Contains(t, clipOutput, "\x1b]52;c;")
+	b64Expected := base64.StdEncoding.EncodeToString([]byte(strings.Join(lines, "\n")))
+	assert.Contains(t, clipOutput, b64Expected)
+
+	// Pressing another navigation key clears the toast
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = newModel.(*DashboardModel)
+	assert.Empty(t, m.ToastMsg(), "toast should clear on next navigation key")
+	assert.NotContains(t, m.View(), expectedToast)
+}
+
+func TestDashboard_ToastNotificationLifecycle(t *testing.T) {
+	m := NewDashboardModel(testSocketPath(t))
+	m.ready = true
+	resModel, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = resModel.(*DashboardModel)
+
+	m.setToast("✓ Copied 42 lines to clipboard")
+	assert.Equal(t, "✓ Copied 42 lines to clipboard", m.ToastMsg())
+
+	view := m.View()
+	assert.Contains(t, view, "✓ Copied 42 lines to clipboard")
+
+	// Trigger clearToastMsg
+	newModel, _ := m.Update(clearToastMsg{id: m.toastID})
+	m = newModel.(*DashboardModel)
+	assert.Empty(t, m.ToastMsg(), "toast should be empty after clearToastMsg")
+}
+
 

@@ -391,6 +391,14 @@ func (tw *TreeWidget) Toggle() {
 	}
 }
 
+// ToggleExpandSelected toggles the expansion of the currently selected node if it has children.
+func (tw *TreeWidget) ToggleExpandSelected() {
+	if tw == nil {
+		return
+	}
+	tw.Toggle()
+}
+
 // Collapse collapses the currently selected node if it is expanded and has children.
 // If already collapsed or a leaf node, it navigates selection to the node's parent.
 func (tw *TreeWidget) Collapse() {
@@ -427,6 +435,27 @@ func (tw *TreeWidget) selectNode(target *TreeNode) bool {
 // SelectNode moves the cursor to the specified node if it is currently visible in rows. Returns true if found.
 func (tw *TreeWidget) SelectNode(target *TreeNode) bool {
 	return tw.selectNode(target)
+}
+
+// SelectRow sets the cursor to the row index if valid (within bounds of visible rows tw.rows).
+// Returns true if the cursor changed.
+func (tw *TreeWidget) SelectRow(rowIdx int) bool {
+	if tw == nil || rowIdx < 0 || rowIdx >= len(tw.rows) {
+		return false
+	}
+	if tw.Cursor == rowIdx {
+		return false
+	}
+	tw.Cursor = rowIdx
+	return true
+}
+
+// NodeAtRow returns the TreeNode at the given visible row index, or nil if rowIdx is out of bounds.
+func (tw *TreeWidget) NodeAtRow(rowIdx int) *TreeNode {
+	if tw == nil || rowIdx < 0 || rowIdx >= len(tw.rows) {
+		return nil
+	}
+	return tw.rows[rowIdx].Node
 }
 
 // SelectByID moves the cursor to the visible node with the given ID. Returns true if found.

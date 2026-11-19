@@ -607,3 +607,135 @@ func TestTreeWidget_StatusFilter(t *testing.T) {
 	}
 }
 
+func TestTreeWidget_SelectRowAndNodeAtRow(t *testing.T) {
+	root := &TreeNode{
+		ID:       "root",
+		Label:    "actr",
+		Expanded: true,
+		NodeType: NodeBranch,
+	}
+	job := &TreeNode{
+		ID:       "job-1",
+		Label:    "BuildJob",
+		Expanded: true,
+		NodeType: NodeJob,
+	}
+	step := &TreeNode{
+		ID:       "step-1",
+		Label:    "Compile",
+		NodeType: NodeStep,
+	}
+	job.AddChild(step)
+	root.AddChild(job)
+
+	tw := NewTreeWidget(root)
+	// Rows: 0: root, 1: job-1, 2: step-1
+
+	// Initial cursor is 0
+	if tw.Cursor != 0 {
+		t.Fatalf("expected cursor 0, got %d", tw.Cursor)
+	}
+
+	// Select row 2 (step-1) -> cursor changes
+	changed := tw.SelectRow(2)
+	if !changed {
+		t.Fatalf("expected SelectRow(2) to return true (cursor changed)")
+	}
+	if tw.Cursor != 2 {
+		t.Fatalf("expected cursor 2, got %d", tw.Cursor)
+	}
+	if node := tw.NodeAtRow(2); node == nil || node.ID != "step-1" {
+		t.Fatalf("expected NodeAtRow(2) to be 'step-1', got %v", node)
+	}
+
+	// Select row 2 again -> cursor does NOT change
+	changed = tw.SelectRow(2)
+	if changed {
+		t.Fatalf("expected SelectRow(2) again to return false (cursor unchanged)")
+	}
+
+	// Out of bounds checks
+	if tw.SelectRow(-1) {
+		t.Fatalf("expected SelectRow(-1) to return false")
+	}
+	if tw.SelectRow(100) {
+		t.Fatalf("expected SelectRow(100) to return false")
+	}
+	if tw.NodeAtRow(-1) != nil {
+		t.Fatalf("expected NodeAtRow(-1) to be nil")
+	}
+	if tw.NodeAtRow(100) != nil {
+		t.Fatalf("expected NodeAtRow(100) to be nil")
+	}
+
+	// Nil safety
+	var nilTree *TreeWidget
+	if nilTree.SelectRow(0) {
+		t.Fatalf("expected nilTree.SelectRow to return false")
+	}
+	if nilTree.NodeAtRow(0) != nil {
+		t.Fatalf("expected nilTree.NodeAtRow to return nil")
+	}
+}
+
+func TestTreeWidget_ToggleExpandSelected(t *testing.T) {
+	root := &TreeNode{
+		ID:       "root",
+		Label:    "actr",
+		Expanded: true,
+		NodeType: NodeBranch,
+	}
+	job := &TreeNode{
+		ID:       "job-1",
+		Label:    "BuildJob",
+		Expanded: true,
+		NodeType: NodeJob,
+	}
+	step := &TreeNode{
+		ID:       "step-1",
+		Label:    "Compile",
+		NodeType: NodeStep,
+	}
+	job.AddChild(step)
+	root.AddChild(job)
+
+	tw := NewTreeWidget(root)
+	// Cursor on root (0)
+	// Select job-1 (1)
+	tw.SelectRow(1)
+	if !job.Expanded {
+		t.Fatalf("expected job to be expanded initially")
+	}
+
+	// Toggle expansion of job-1 -> collapses
+	tw.ToggleExpandSelected()
+	if job.Expanded {
+		t.Fatalf("expected job to be collapsed after ToggleExpandSelected")
+	}
+	// Verify step-1 is no longer visible in rows
+	if len(tw.Rows()) != 2 {
+		t.Fatalf("expected 2 visible rows when job collapsed, got %d", len(tw.Rows()))
+	}
+
+	// Toggle again -> expands
+	tw.ToggleExpandSelected()
+	if !job.Expanded {
+		t.Fatalf("expected job to be expanded after second ToggleExpandSelected")
+	}
+	if len(tw.Rows()) != 3 {
+		t.Fatalf("expected 3 visible rows when job expanded, got %d", len(tw.Rows()))
+	}
+
+	// Leaf node toggle does nothing
+	tw.SelectRow(2) // step-1
+	tw.ToggleExpandSelected()
+	if len(tw.Rows()) != 3 {
+		t.Fatalf("expected row count unchanged when toggling leaf, got %d", len(tw.Rows()))
+	}
+
+	// Nil safety
+	var nilTree *TreeWidget
+	nilTree.ToggleExpandSelected() // should not panic
+}
+
+
