@@ -473,6 +473,7 @@ func HydrateSnapshotFromStore(store monitor.HistoryStore, limit int) (*monitor.S
 			Name:      r.Name,
 			Workflow:  r.Workflow,
 			Repo:      r.Repo,
+			RepoAlias: r.RepoAlias,
 			Owner:     r.Owner,
 			Status:    r.Status,
 			StartedAt: r.StartedAt,
