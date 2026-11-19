@@ -29,6 +29,7 @@ type JobRequestReference struct {
 
 // BrokerClientInterface defines the broker messaging contract.
 type BrokerClientInterface interface {
+	CreateSession(ctx context.Context, agentName string, agentID int64, poolID int64) error
 	GetMessage(ctx context.Context, runnerVersion, osName, archName string) (*protocol.BrokerMessage, error)
 	AcknowledgeMessage(ctx context.Context, runnerRequestID string) error
 	DeleteSession(ctx context.Context) error
@@ -59,7 +60,12 @@ type RepoWorker struct {
 	workFolder       string
 	serverURL        string
 	token            string
+	agentName        string
+	agentID          int64
+	poolID           int64
 	running          bool
+	pollCancel       context.CancelFunc
+	jobWg            sync.WaitGroup
 	doneCh           chan struct{}
 }
 
@@ -93,6 +99,9 @@ func NewRepoWorker(alias string, repoCfg config.RepoConfig, resMgr *ResourceMana
 			if runnerCfg != nil {
 				w.workFolder = runnerCfg.WorkFolder
 				w.serverURL = runnerCfg.ServerURL
+				w.agentName = runnerCfg.AgentName
+				w.agentID = runnerCfg.AgentID
+				w.poolID = runnerCfg.PoolID
 				brokerURL := runnerCfg.ServerURL
 				if runnerCfg.UseV2Flow && runnerCfg.ServerURLV2 != "" {
 					brokerURL = runnerCfg.ServerURLV2
@@ -147,11 +156,14 @@ func (w *RepoWorker) Start(ctx context.Context, pollingCtx context.Context) erro
 	}
 	w.running = true
 	w.doneCh = make(chan struct{})
+	pollCtx, cancelPoll := context.WithCancel(pollingCtx)
+	w.pollCancel = cancelPoll
 	w.mu.Unlock()
 
 	go func() {
 		defer close(w.doneCh)
-		w.runLoop(ctx, pollingCtx)
+		w.runLoop(ctx, pollCtx)
+		w.jobWg.Wait()
 	}()
 
 	return nil
@@ -163,6 +175,9 @@ func (w *RepoWorker) Stop(ctx context.Context) error {
 	if !w.running {
 		w.mu.Unlock()
 		return nil
+	}
+	if w.pollCancel != nil {
+		w.pollCancel()
 	}
 	done := w.doneCh
 	w.mu.Unlock()
@@ -212,6 +227,12 @@ func (w *RepoWorker) runLoop(ctx context.Context, pollingCtx context.Context) {
 	runnerVersion := "3.0.0"
 	osName := runnerOS()
 	archName := runnerArch()
+
+	if w.brokerClient != nil && w.agentName != "" {
+		if err := w.brokerClient.CreateSession(ctx, w.agentName, w.agentID, w.poolID); err != nil {
+			logger.Error("failed to create broker session", "repo", w.repoAlias, "error", err)
+		}
+	}
 
 	for {
 		select {
@@ -273,6 +294,12 @@ func (w *RepoWorker) runLoop(ctx context.Context, pollingCtx context.Context) {
 		msg, err := w.brokerClient.GetMessage(pollingCtx, runnerVersion, osName, archName)
 		if err != nil {
 			<-w.repoSem
+			if w.brokerClient != nil && w.agentName != "" && (strings.Contains(err.Error(), "RunnerSessionInvalid") ||
+				strings.Contains(err.Error(), "Runner session is invalid") ||
+				strings.Contains(err.Error(), "no active session")) {
+				logger.Warn("broker session invalid; recreating broker session", "repo", w.repoAlias)
+				_ = w.brokerClient.CreateSession(ctx, w.agentName, w.agentID, w.poolID)
+			}
 			select {
 			case <-pollingCtx.Done():
 				return
@@ -296,8 +323,10 @@ func (w *RepoWorker) runLoop(ctx context.Context, pollingCtx context.Context) {
 			reqRef.RunnerRequestID = strconv.FormatInt(msg.MessageID, 10)
 		}
 
-		// Execute job in background goroutine with local slot held
+		// Execute job in background goroutine with local slot held and jobWg tracking
+		w.jobWg.Add(1)
 		go func(ref JobRequestReference) {
+			defer w.jobWg.Done()
 			defer func() { <-w.repoSem }()
 			_ = w.executeWithGuards(ctx, ref, func() error {
 				return w.dispatchJob(ctx, ref)
@@ -308,7 +337,7 @@ func (w *RepoWorker) runLoop(ctx context.Context, pollingCtx context.Context) {
 
 // dispatchJob acknowledges the broker message, claims the job from Run Service, runs execution
 // through coordinator, and delivers completion with context.WithoutCancel.
-func (w *RepoWorker) dispatchJob(ctx context.Context, ref JobRequestReference) error {
+func (w *RepoWorker) dispatchJob(ctx context.Context, ref JobRequestReference) (execErr error) {
 	if w.brokerClient != nil {
 		if err := w.brokerClient.AcknowledgeMessage(ctx, ref.RunnerRequestID); err != nil {
 			logger.Error("failed to ack message", "repo", w.repoAlias, "error", err)
@@ -324,32 +353,40 @@ func (w *RepoWorker) dispatchJob(ctx context.Context, ref JobRequestReference) e
 		runServiceURL = w.serverURL
 	}
 
-	jobSpec, err := w.runServiceClient.AcquireJob(ctx, runServiceURL, ref.RunnerRequestID, ref.BillingOwnerID, w.token)
+	token := w.token
+	if bt, ok := w.brokerClient.(interface{ Token() string }); ok {
+		if t := bt.Token(); t != "" {
+			token = t
+		}
+	}
+
+	jobSpec, err := w.runServiceClient.AcquireJob(ctx, runServiceURL, ref.RunnerRequestID, ref.BillingOwnerID, token)
 	if err != nil {
 		return fmt.Errorf("acquire job: %w", err)
 	}
 
-	jobToken := w.token
+	jobToken := token
 	if jobSpec.JobToken != "" {
 		jobToken = jobSpec.JobToken
 	}
 
 	var completeReq *protocol.CompleteJobRequest
-	var execErr error
+	defer func() {
+		if completeReq == nil {
+			completeReq = &protocol.CompleteJobRequest{
+				PlanID:     jobSpec.PlanID,
+				JobID:      jobSpec.JobID,
+				Conclusion: "failure",
+			}
+		}
+		completeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancel()
+		_ = w.runServiceClient.CompleteJob(completeCtx, runServiceURL, jobToken, completeReq)
+	}()
+
 	if w.coordinator != nil {
 		completeReq, execErr = w.coordinator.ExecuteJob(ctx, jobSpec, runServiceURL, jobToken)
 	}
-	if completeReq == nil {
-		completeReq = &protocol.CompleteJobRequest{
-			PlanID:     jobSpec.PlanID,
-			JobID:      jobSpec.JobID,
-			Conclusion: "failure",
-		}
-	}
-
-	completeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-	defer cancel()
-	_ = w.runServiceClient.CompleteJob(completeCtx, runServiceURL, jobToken, completeReq)
 	return execErr
 }
 

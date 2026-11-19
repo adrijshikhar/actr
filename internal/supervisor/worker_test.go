@@ -3,6 +3,7 @@ package supervisor
 import (
 	"context"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,6 +16,19 @@ type mockBrokerClient struct {
 	msgQueue chan *protocol.BrokerMessage
 	ackFn    func(ctx context.Context, id string) error
 	delFn    func(ctx context.Context) error
+	createFn func(ctx context.Context, agentName string, agentID int64, poolID int64) error
+	token    string
+}
+
+func (m *mockBrokerClient) CreateSession(ctx context.Context, agentName string, agentID int64, poolID int64) error {
+	if m.createFn != nil {
+		return m.createFn(ctx, agentName, agentID, poolID)
+	}
+	return nil
+}
+
+func (m *mockBrokerClient) Token() string {
+	return m.token
 }
 
 func (m *mockBrokerClient) GetMessage(ctx context.Context, v, os, arch string) (*protocol.BrokerMessage, error) {
@@ -403,12 +417,184 @@ func TestRepoWorker_StartAndStop(t *testing.T) {
 		t.Fatal("expected error starting already running worker")
 	}
 
-	cancelPolling()
-
+	// Test that worker.Stop() halts the worker cleanly without requiring external cancelPolling()
 	stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer stopCancel()
 
 	if err := worker.Stop(stopCtx); err != nil {
 		t.Fatalf("Stop failed: %v", err)
+	}
+}
+
+// TestRepoWorker_StopDrainsActiveJobs verifies that Stop awaits in-flight job completion
+// before calling DeleteSession.
+func TestRepoWorker_StopDrainsActiveJobs(t *testing.T) {
+	resMgr, _ := NewResourceManager(1)
+	msgQueue := make(chan *protocol.BrokerMessage, 1)
+
+	var sessionDeleted bool
+	var sessionDeleteMu sync.Mutex
+	var jobFinished bool
+
+	mockBroker := &mockBrokerClient{
+		msgQueue: msgQueue,
+		delFn: func(ctx context.Context) error {
+			sessionDeleteMu.Lock()
+			defer sessionDeleteMu.Unlock()
+			sessionDeleted = true
+			if !jobFinished {
+				t.Error("DeleteSession was called before in-flight job finished")
+			}
+			return nil
+		},
+	}
+
+	jobStarted := make(chan struct{})
+	mockCoord := &mockCoordinator{
+		executeFn: func(ctx context.Context, job *protocol.JobSpecification, runServiceURL, token string) (*protocol.CompleteJobRequest, error) {
+			close(jobStarted)
+			time.Sleep(100 * time.Millisecond)
+			jobFinished = true
+			return &protocol.CompleteJobRequest{PlanID: job.PlanID, JobID: job.JobID, Conclusion: "success"}, nil
+		},
+	}
+
+	mockRun := &mockRunServiceClient{
+		acquireFn: func(ctx context.Context, runServiceURL, runnerRequestID, billingOwnerID, token string) (*protocol.JobSpecification, error) {
+			return &protocol.JobSpecification{PlanID: "p1", JobID: "j1"}, nil
+		},
+	}
+
+	worker := &RepoWorker{
+		repoAlias:        "drain-repo",
+		resMgr:           resMgr,
+		brokerClient:     mockBroker,
+		runServiceClient: mockRun,
+		coordinator:      mockCoord,
+		repoSem:          make(chan struct{}, 1),
+	}
+
+	ctx := context.Background()
+	pollingCtx := context.Background()
+
+	if err := worker.Start(ctx, pollingCtx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	msgQueue <- &protocol.BrokerMessage{
+		MessageID:   100,
+		MessageType: "RunnerJobRequest",
+		Body:        `{"runner_request_id":"req-drain"}`,
+	}
+
+	// Wait for job to begin executing
+	select {
+	case <-jobStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for job to start")
+	}
+
+	// Call Stop without canceling pollingCtx first
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelStop()
+
+	if err := worker.Stop(stopCtx); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+
+	sessionDeleteMu.Lock()
+	defer sessionDeleteMu.Unlock()
+	if !sessionDeleted {
+		t.Fatal("expected DeleteSession to be called")
+	}
+	if !jobFinished {
+		t.Fatal("expected job to finish before Stop completed")
+	}
+}
+
+// TestRepoWorker_DynamicTokenRefresh verifies that dispatchJob fetches updated tokens from brokerClient.
+func TestRepoWorker_DynamicTokenRefresh(t *testing.T) {
+	resMgr, _ := NewResourceManager(1)
+	mockBroker := &mockBrokerClient{
+		token: "refreshed-oauth-token-xyz",
+	}
+
+	var capturedToken string
+	mockRun := &mockRunServiceClient{
+		acquireFn: func(ctx context.Context, runServiceURL, runnerRequestID, billingOwnerID, token string) (*protocol.JobSpecification, error) {
+			capturedToken = token
+			return &protocol.JobSpecification{PlanID: "p1", JobID: "j1"}, nil
+		},
+	}
+
+	worker := &RepoWorker{
+		repoAlias:        "test-repo",
+		resMgr:           resMgr,
+		brokerClient:     mockBroker,
+		runServiceClient: mockRun,
+		token:            "initial-stale-token",
+		repoSem:          make(chan struct{}, 1),
+	}
+
+	ref := JobRequestReference{
+		RunnerRequestID: "req-1",
+	}
+
+	err := worker.dispatchJob(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("dispatchJob failed: %v", err)
+	}
+
+	if capturedToken != "refreshed-oauth-token-xyz" {
+		t.Fatalf("expected refreshed token, got %q", capturedToken)
+	}
+}
+
+// TestRepoWorker_PanicAfterAcquireNotifiesCompleteJob verifies that if coordinator panics,
+// CompleteJob is still invoked with conclusion="failure".
+func TestRepoWorker_PanicAfterAcquireNotifiesCompleteJob(t *testing.T) {
+	resMgr, _ := NewResourceManager(1)
+	var completedWithFailure bool
+
+	mockRun := &mockRunServiceClient{
+		acquireFn: func(ctx context.Context, runServiceURL, runnerRequestID, billingOwnerID, token string) (*protocol.JobSpecification, error) {
+			return &protocol.JobSpecification{PlanID: "plan-panic", JobID: "job-panic"}, nil
+		},
+		completeFn: func(ctx context.Context, runServiceURL, token string, req *protocol.CompleteJobRequest) error {
+			if req.Conclusion == "failure" && req.JobID == "job-panic" {
+				completedWithFailure = true
+			}
+			return nil
+		},
+	}
+
+	mockCoord := &mockCoordinator{
+		executeFn: func(ctx context.Context, job *protocol.JobSpecification, runServiceURL, token string) (*protocol.CompleteJobRequest, error) {
+			panic("coordinator crashed during execution")
+		},
+	}
+
+	worker := &RepoWorker{
+		repoAlias:        "test-repo",
+		resMgr:           resMgr,
+		runServiceClient: mockRun,
+		coordinator:      mockCoord,
+		repoSem:          make(chan struct{}, 1),
+	}
+
+	ref := JobRequestReference{
+		RunnerRequestID: "req-panic",
+	}
+
+	err := worker.executeWithGuards(context.Background(), ref, func() error {
+		return worker.dispatchJob(context.Background(), ref)
+	})
+
+	if err == nil {
+		t.Fatal("expected panic error")
+	}
+
+	if !completedWithFailure {
+		t.Fatal("expected CompleteJob with conclusion='failure' to be delivered on coordinator panic")
 	}
 }
