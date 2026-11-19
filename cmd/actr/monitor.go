@@ -39,28 +39,32 @@ func newMonitorCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfgDir := resolveConfigDir(configDirFlag, cmd.Flags().Changed("config-dir"))
 
-			var store history.Store
-			var cleanupStore func()
+			var (
+				store      history.Store
+				tmpDemoDir string
+			)
+			defer func() {
+				if store != nil {
+					_ = store.Close()
+				}
+				if tmpDemoDir != "" {
+					_ = os.RemoveAll(tmpDemoDir)
+				}
+			}()
 
 			if demoFlag {
-				tmpDemoDir, err := os.MkdirTemp("", "actr-demo-*")
+				var err error
+				tmpDemoDir, err = os.MkdirTemp("", "actr-demo-*")
 				if err != nil {
 					return fmt.Errorf("create demo temp dir: %w", err)
 				}
 				s, err := history.NewSQLiteStore(filepath.Join(tmpDemoDir, "demo_history.db"))
 				if err != nil {
-					_ = os.RemoveAll(tmpDemoDir)
 					return fmt.Errorf("create demo sqlite store: %w", err)
 				}
 				store = s
 				if err := demo.SeedHistoryStore(store); err != nil {
-					_ = s.Close()
-					_ = os.RemoveAll(tmpDemoDir)
 					return fmt.Errorf("seed demo history store: %w", err)
-				}
-				cleanupStore = func() {
-					_ = s.Close()
-					_ = os.RemoveAll(tmpDemoDir)
 				}
 			} else {
 				dbPath := filepath.Join(cfgDir, "history.db")
@@ -73,13 +77,7 @@ func newMonitorCmd() *cobra.Command {
 				}
 				if s, err := history.NewSQLiteStore(dbPath); err == nil {
 					store = s
-					cleanupStore = func() {
-						_ = s.Close()
-					}
 				}
-			}
-			if cleanupStore != nil {
-				defer cleanupStore()
 			}
 
 			var srv *monitor.Server
@@ -133,7 +131,6 @@ func newMonitorCmd() *cobra.Command {
 						return fmt.Errorf("initialize history store at %s: %w", dbPath, err)
 					}
 					store = s
-					defer func() { _ = s.Close() }()
 				}
 				snap, err := tui.HydrateSnapshotFromStore(store, 50)
 				if err != nil {

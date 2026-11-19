@@ -152,3 +152,34 @@ func TestClipboardCopy_Alias(t *testing.T) {
 		t.Fatalf("expected OSC 52 sequence, got %q", buf.String())
 	}
 }
+
+type mockClipboard struct {
+	copied string
+	err    error
+}
+
+func (m *mockClipboard) Copy(text string) error {
+	m.copied = text
+	return m.err
+}
+
+func TestClipboardInterface(t *testing.T) {
+	mock := &mockClipboard{}
+	var cb Clipboard = mock
+	if err := cb.Copy("interface test"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mock.copied != "interface test" {
+		t.Fatalf("expected copied text 'interface test', got %q", mock.copied)
+	}
+
+	model := NewDashboardModel("/tmp/test.sock").WithClipboard(mock)
+	if model.clipboard != mock {
+		t.Fatalf("expected custom clipboard to be set")
+	}
+
+	model.SetClipboard(DefaultClipboard)
+	if model.clipboard != DefaultClipboard {
+		t.Fatalf("expected DefaultClipboard to be set")
+	}
+}

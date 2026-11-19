@@ -122,6 +122,7 @@ type DashboardModel struct {
 	seenRepoExpansion   map[string]bool
 
 	historyStore     monitor.HistoryStore
+	clipboard        Clipboard
 	supervisorStatus *monitor.SupervisorStatus
 	isOffline        bool
 
@@ -179,6 +180,7 @@ func NewDashboardModel(sockPath string) *DashboardModel {
 		sockPath:            sockPath,
 		client:              monitor.NewClient(sockPath),
 		tree:                NewTreeWidget(root),
+		clipboard:           DefaultClipboard,
 		telemetry:           NewTelemetryWidget(),
 		viewport:            viewport.New(0, 0),
 		autoFollow:          true,
@@ -377,6 +379,29 @@ func (m *DashboardModel) WithHistoryStore(store monitor.HistoryStore) *Dashboard
 		m.historyStore = store
 	}
 	return m
+}
+
+// SetClipboard sets the clipboard implementation for copying logs and selections.
+func (m *DashboardModel) SetClipboard(c Clipboard) {
+	if m == nil {
+		return
+	}
+	m.clipboard = c
+}
+
+// WithClipboard sets the clipboard implementation and returns m for chaining.
+func (m *DashboardModel) WithClipboard(c Clipboard) *DashboardModel {
+	if m != nil {
+		m.clipboard = c
+	}
+	return m
+}
+
+func (m *DashboardModel) copyText(text string) error {
+	if m != nil && m.clipboard != nil {
+		return m.clipboard.Copy(text)
+	}
+	return DefaultClipboard.Copy(text)
 }
 
 // ApplySnapshot applies a monitor.Snapshot to rebuild tree and update telemetry.
@@ -677,7 +702,7 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				for i, l := range logs {
 					cleanLogs[i] = ansi.Strip(l)
 				}
-				if err := CopyText(strings.Join(cleanLogs, "\n")); err != nil {
+				if err := m.copyText(strings.Join(cleanLogs, "\n")); err != nil {
 					cmd := m.setToast("✖ Failed to copy to clipboard")
 					return m, cmd
 				}
@@ -868,7 +893,7 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 						selected := strings.Join(cleanLines, "\n")
 						if selected != "" {
-							if err := CopyText(selected); err != nil {
+							if err := m.copyText(selected); err != nil {
 								cmd = m.setToast("✖ Failed to copy to clipboard")
 							} else {
 								cmd = m.setToast("✓ Copied selection to clipboard")

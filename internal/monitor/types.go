@@ -215,6 +215,7 @@ type Pruner interface {
 
 // HistoryStore defines the interface for local run history persistence.
 type HistoryStore interface {
+	io.Closer
 	LogStore
 	Pruner
 	StartRun(job *JobInfo, limits *config.LimitsConfig, driver string) error

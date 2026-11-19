@@ -10,6 +10,22 @@ import (
 	"strings"
 )
 
+// Clipboard defines the capability to copy text to the system clipboard.
+type Clipboard interface {
+	Copy(text string) error
+}
+
+// SystemClipboard implements Clipboard using OSC 52 with fallback to pbcopy.
+type SystemClipboard struct{}
+
+// Copy sends text to the system clipboard.
+func (s SystemClipboard) Copy(text string) error {
+	return CopyText(text)
+}
+
+// DefaultClipboard is the default Clipboard implementation.
+var DefaultClipboard Clipboard = SystemClipboard{}
+
 var (
 	clipboardWriter io.Writer = os.Stdout
 	execCommand               = exec.Command

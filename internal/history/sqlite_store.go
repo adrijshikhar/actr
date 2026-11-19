@@ -20,9 +20,10 @@ import (
 )
 
 var (
-	_ Store    = (*SQLiteStore)(nil)
-	_ LogStore = (*SQLiteStore)(nil)
-	_ Pruner   = (*SQLiteStore)(nil)
+	_ Store     = (*SQLiteStore)(nil)
+	_ LogStore  = (*SQLiteStore)(nil)
+	_ Pruner    = (*SQLiteStore)(nil)
+	_ io.Closer = (*SQLiteStore)(nil)
 )
 
 var (
@@ -402,11 +403,13 @@ func (s *SQLiteStore) ListRuns(limit int) ([]*monitor.RunSummary, error) {
 		FROM runs
 		ORDER BY started_at DESC
 	`
+	var args []any
 	if limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", limit)
+		query += " LIMIT ?"
+		args = append(args, limit)
 	}
 
-	rows, err := s.db.QueryContext(ctx, query)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list runs: %w", err)
 	}

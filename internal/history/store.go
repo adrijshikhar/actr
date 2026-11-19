@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -50,6 +51,12 @@ type DiskStore struct {
 var _ Store = (*DiskStore)(nil)
 var _ LogStore = (*DiskStore)(nil)
 var _ Pruner = (*DiskStore)(nil)
+var _ io.Closer = (*DiskStore)(nil)
+
+// Close implements io.Closer for DiskStore. DiskStore has no persistent open descriptors to release.
+func (s *DiskStore) Close() error {
+	return nil
+}
 
 // runDir sanitizes jobID and ensures the resolved run path resides within baseDir.
 func (s *DiskStore) runDir(jobID string) (string, error) {

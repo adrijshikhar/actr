@@ -17,6 +17,7 @@ func TestSQLiteStore_CompileTimeInterfaces(t *testing.T) {
 	var _ Store = (*SQLiteStore)(nil)
 	var _ LogStore = (*SQLiteStore)(nil)
 	var _ Pruner = (*SQLiteStore)(nil)
+	var _ io.Closer = (*SQLiteStore)(nil)
 }
 
 func TestSQLiteStore_Lifecycle(t *testing.T) {
