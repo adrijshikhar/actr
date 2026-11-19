@@ -70,6 +70,38 @@ runs:
 		assert.Equal(t, "success()", manifest.Runs.PostIf)
 	})
 
+	t.Run("non-string default inputs unmarshaled as strings", func(t *testing.T) {
+		yamlData := []byte(`
+name: 'Action With Non-String Defaults'
+description: 'Tests boolean and integer defaults'
+inputs:
+  no-cache:
+    required: false
+    default: false
+  cache-ttl:
+    required: false
+    default: 3600
+  feature-flag:
+    required: false
+    default: true
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
+`)
+		manifest, err := action.ParseManifest(yamlData)
+		require.NoError(t, err)
+		require.NotNil(t, manifest)
+
+		require.Contains(t, manifest.Inputs, "no-cache")
+		assert.Equal(t, "false", manifest.Inputs["no-cache"].Default)
+
+		require.Contains(t, manifest.Inputs, "cache-ttl")
+		assert.Equal(t, "3600", manifest.Inputs["cache-ttl"].Default)
+
+		require.Contains(t, manifest.Inputs, "feature-flag")
+		assert.Equal(t, "true", manifest.Inputs["feature-flag"].Default)
+	})
+
 	t.Run("missing runs.using returns error", func(t *testing.T) {
 		yamlData := []byte(`
 name: 'Broken Action'

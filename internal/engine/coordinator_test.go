@@ -1367,7 +1367,14 @@ func TestEvaluateExpressionAndParseContextData(t *testing.T) {
 			"d": [
 				{"k": "event_name", "v": "workflow_dispatch"},
 				{"k": "repository", "v": "adrijshikhar/cxstatusline"},
+				{"k": "server_url", "v": "https://github.com"},
 				{"k": "token", "v": "ghs_secret_123"}
+			],
+			"t": 2
+		},
+		"runner": {
+			"d": [
+				{"k": "temp", "v": "/tmp/runner/temp"}
 			],
 			"t": 2
 		},
@@ -1425,7 +1432,14 @@ func TestEvaluateExpressionAndParseContextData(t *testing.T) {
 		{"needs.detect.outputs.should_build", "false"},
 		{"needs.detect.result", "success"},
 		{"github.token", "ghs_secret_123"},
+		{"${{ github.token }}", "ghs_secret_123"},
+		{"${{ github.server_url == 'https://github.com' && github.token || '' }}", "ghs_secret_123"},
+		{"${{ github.server_url == 'https://other.com' && github.token || '' }}", ""},
 		{"github.repository", "adrijshikhar/cxstatusline"},
+		{"prefix-${{ github.repository }}-suffix", "prefix-adrijshikhar/cxstatusline-suffix"},
+		{"${{ runner.temp }}/prebuilt-detect.log", "/tmp/runner/temp/prebuilt-detect.log"},
+		{"format('{0}/prebuilt-detect.log', runner.temp)", "/tmp/runner/temp/prebuilt-detect.log"},
+		{"format('logs-detect-{0}', github.token)", "logs-detect-ghs_secret_123"},
 		{"'plain literal'", "plain literal"},
 	}
 
@@ -2654,5 +2668,102 @@ func TestResolveActionScriptPath_PathTraversalRejection(t *testing.T) {
 	// Empty path
 	if _, err := resolveActionScriptPath(actionDir, ""); err == nil {
 		t.Error("expected error for empty script path, got nil")
+	}
+}
+
+func TestShouldExecuteStep(t *testing.T) {
+	ctx := map[string]any{
+		"runner": map[string]any{
+			"os": "macOS",
+		},
+		"matrix": map[string]any{
+			"platform": "darwin-arm64",
+		},
+	}
+
+	// 1. Success condition when not failed
+	if !shouldExecuteStep("success()", ctx, false, false) {
+		t.Error("expected success() to be true when not failed")
+	}
+	if shouldExecuteStep("success()", ctx, true, false) {
+		t.Error("expected success() to be false when failed")
+	}
+
+	// 2. Always condition
+	if !shouldExecuteStep("always()", ctx, false, false) {
+		t.Error("expected always() to be true when not failed")
+	}
+	if !shouldExecuteStep("always()", ctx, true, false) {
+		t.Error("expected always() to be true when failed")
+	}
+
+	// 3. Failure condition
+	if shouldExecuteStep("failure()", ctx, false, false) {
+		t.Error("expected failure() to be false when not failed")
+	}
+	if !shouldExecuteStep("failure()", ctx, true, false) {
+		t.Error("expected failure() to be true when failed")
+	}
+
+	// 4. Expression evaluating to false: runner.os == 'macOS' && startsWith(matrix.platform, 'linux-')
+	dockerCond := "runner.os == 'macOS' && startsWith(matrix.platform, 'linux-')"
+	if shouldExecuteStep(dockerCond, ctx, false, false) {
+		t.Error("expected dockerCond to be false for darwin platform")
+	}
+
+	// 5. Expression evaluating to true for native macOS
+	nativeCond := "${{ runner.os != 'macOS' || !startsWith(matrix.platform, 'linux-') }}"
+	if !shouldExecuteStep(nativeCond, ctx, false, false) {
+		t.Error("expected nativeCond to be true for darwin platform")
+	}
+
+	// 6. Test with linux matrix platform
+	linuxCtx := map[string]any{
+		"runner": map[string]any{
+			"os": "macOS",
+		},
+		"matrix": map[string]any{
+			"platform": "linux-arm64",
+		},
+	}
+	if !shouldExecuteStep(dockerCond, linuxCtx, false, false) {
+		t.Error("expected dockerCond to be true for linux-arm64")
+	}
+	if shouldExecuteStep(nativeCond, linuxCtx, false, false) {
+		t.Error("expected nativeCond to be false for linux-arm64")
+	}
+}
+
+func TestEvaluateExpression_ContextPathVsLiteral(t *testing.T) {
+	ctx := map[string]any{
+		"github": map[string]any{
+			"event_name": "push",
+		},
+		"env": map[string]any{
+			"FOO": "bar",
+		},
+	}
+
+	// String literals containing dot should NOT be treated as context paths and stripped
+	for _, lit := range []string{"14.0", "1.4.0", "v1.2.3"} {
+		if got := evaluateExpression(lit, ctx); got != lit {
+			t.Errorf("evaluateExpression(%q) = %q, want %q", lit, got, lit)
+		}
+	}
+
+	// Valid context paths should resolve
+	if got := evaluateExpression("github.event_name", ctx); got != "push" {
+		t.Errorf("evaluateExpression(github.event_name) = %q, want 'push'", got)
+	}
+	if got := evaluateExpression("env.FOO", ctx); got != "bar" {
+		t.Errorf("evaluateExpression(env.FOO) = %q, want 'bar'", got)
+	}
+
+	// Unknown context paths should resolve to empty string
+	if got := evaluateExpression("github.unknown_var", ctx); got != "" {
+		t.Errorf("evaluateExpression(github.unknown_var) = %q, want empty", got)
+	}
+	if got := evaluateExpression("needs.detect.outputs.nonexistent", ctx); got != "" {
+		t.Errorf("evaluateExpression(needs.detect.outputs.nonexistent) = %q, want empty", got)
 	}
 }

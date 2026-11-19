@@ -52,6 +52,8 @@ type PostStepHook struct {
 	StepName   string
 	ActionDir  string
 	PostScript string
+	PostIf     string
+	StepFailed bool
 	Env        map[string]string
 	State      map[string]string
 	Inputs     map[string]string
@@ -451,6 +453,8 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			filepath.Join(homeDir, ".cargo", "bin"),
 			filepath.Join(homeDir, ".bun", "bin"),
 			filepath.Join(homeDir, ".local", "bin"),
+			filepath.Join(homeDir, ".local", "share", "fnm", "aliases", "default", "bin"),
+			filepath.Join(homeDir, ".fnm", "current", "bin"),
 		)
 	}
 	currentPath := cumulativeEnv["PATH"]
@@ -485,6 +489,51 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	if cumulativeEnv["GITHUB_TOKEN"] == "" && strings.TrimSpace(token) != "" {
 		cumulativeEnv["GITHUB_TOKEN"] = token
 	}
+
+	for _, ep := range job.Endpoints {
+		if strings.EqualFold(ep.Name, "SystemVssConnection") || strings.EqualFold(ep.Type, "SystemVssConnection") {
+			if ep.URL != "" && cumulativeEnv["ACTIONS_RUNTIME_URL"] == "" {
+				cumulativeEnv["ACTIONS_RUNTIME_URL"] = strings.TrimRight(ep.URL, "/") + "/"
+			}
+			if ep.Authorization != nil && ep.Authorization.Parameters != nil {
+				for _, paramKey := range []string{"AccessToken", "accesstoken", "Token", "token"} {
+					if tok, ok := ep.Authorization.Parameters[paramKey]; ok && tok != "" {
+						if cumulativeEnv["ACTIONS_RUNTIME_TOKEN"] == "" {
+							cumulativeEnv["ACTIONS_RUNTIME_TOKEN"] = tok
+						}
+						break
+					}
+				}
+			}
+		}
+		for k, v := range ep.Data {
+			if strings.EqualFold(k, "ResultsServiceUrl") && v != "" {
+				cumulativeEnv["ACTIONS_RESULTS_URL"] = v
+			} else if strings.EqualFold(k, "CacheServerUrl") && v != "" {
+				cumulativeEnv["ACTIONS_CACHE_URL"] = v
+			} else if strings.EqualFold(k, "GenerateIdTokenUrl") && v != "" {
+				cumulativeEnv["ACTIONS_ID_TOKEN_REQUEST_URL"] = v
+			}
+		}
+	}
+
+	if cumulativeEnv["ACTIONS_RUNTIME_TOKEN"] == "" && strings.TrimSpace(token) != "" {
+		cumulativeEnv["ACTIONS_RUNTIME_TOKEN"] = token
+	}
+	if cumulativeEnv["ACTIONS_RUNTIME_URL"] == "" && strings.TrimSpace(runServiceURL) != "" {
+		cumulativeEnv["ACTIONS_RUNTIME_URL"] = strings.TrimRight(strings.TrimSpace(runServiceURL), "/") + "/"
+	}
+	if cumulativeEnv["ACTIONS_CACHE_URL"] == "" && cumulativeEnv["ACTIONS_RUNTIME_URL"] != "" {
+		cumulativeEnv["ACTIONS_CACHE_URL"] = cumulativeEnv["ACTIONS_RUNTIME_URL"]
+	}
+	if cumulativeEnv["ACTIONS_RESULTS_URL"] == "" {
+		serverURL := cumulativeEnv["GITHUB_SERVER_URL"]
+		if serverURL == "" || serverURL == "https://github.com" {
+			cumulativeEnv["ACTIONS_RESULTS_URL"] = "https://results-receiver.actions.githubusercontent.com/"
+		} else if cumulativeEnv["ACTIONS_RUNTIME_URL"] != "" {
+			cumulativeEnv["ACTIONS_RESULTS_URL"] = cumulativeEnv["ACTIONS_RUNTIME_URL"]
+		}
+	}
 	if cumulativeEnv["GITHUB_SERVER_URL"] == "" {
 		cumulativeEnv["GITHUB_SERVER_URL"] = "https://github.com"
 	}
@@ -512,11 +561,32 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	if ghCtx["token"] == nil && cumulativeEnv["GITHUB_TOKEN"] != "" {
 		ghCtx["token"] = cumulativeEnv["GITHUB_TOKEN"]
 	}
+	if cumulativeEnv["GITHUB_TOKEN"] == "" && ghCtx["token"] != nil {
+		cumulativeEnv["GITHUB_TOKEN"] = fmt.Sprint(ghCtx["token"])
+	}
+	if cumulativeEnv["GITHUB_SHA"] == "" && ghCtx["sha"] != nil {
+		cumulativeEnv["GITHUB_SHA"] = fmt.Sprint(ghCtx["sha"])
+	}
+	if ghCtx["sha"] == nil && cumulativeEnv["GITHUB_SHA"] != "" {
+		ghCtx["sha"] = cumulativeEnv["GITHUB_SHA"]
+	}
+	if cumulativeEnv["GITHUB_REF"] == "" && ghCtx["ref"] != nil {
+		cumulativeEnv["GITHUB_REF"] = fmt.Sprint(ghCtx["ref"])
+	}
+	if ghCtx["ref"] == nil && cumulativeEnv["GITHUB_REF"] != "" {
+		ghCtx["ref"] = cumulativeEnv["GITHUB_REF"]
+	}
 	if ghCtx["repository"] == nil && cumulativeEnv["GITHUB_REPOSITORY"] != "" {
 		ghCtx["repository"] = cumulativeEnv["GITHUB_REPOSITORY"]
 	}
+	if cumulativeEnv["GITHUB_REPOSITORY"] == "" && ghCtx["repository"] != nil {
+		cumulativeEnv["GITHUB_REPOSITORY"] = fmt.Sprint(ghCtx["repository"])
+	}
 	if ghCtx["event_name"] == nil && cumulativeEnv["GITHUB_EVENT_NAME"] != "" {
 		ghCtx["event_name"] = cumulativeEnv["GITHUB_EVENT_NAME"]
+	}
+	if cumulativeEnv["GITHUB_EVENT_NAME"] == "" && ghCtx["event_name"] != nil {
+		cumulativeEnv["GITHUB_EVENT_NAME"] = fmt.Sprint(ghCtx["event_name"])
 	}
 	if ghCtx["server_url"] == nil && cumulativeEnv["GITHUB_SERVER_URL"] != "" {
 		ghCtx["server_url"] = cumulativeEnv["GITHUB_SERVER_URL"]
@@ -556,6 +626,33 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	} else if job.JobID != "" {
 		cumulativeEnv["GITHUB_JOB"] = job.JobID
 	}
+
+	runnerCtx, _ := parsedContext["runner"].(map[string]any)
+	if runnerCtx == nil {
+		runnerCtx = make(map[string]any)
+		parsedContext["runner"] = runnerCtx
+	}
+	runnerCtx["name"] = runnerName
+	runnerCtx["os"] = runnerOS()
+	runnerCtx["arch"] = runnerArch()
+	runnerCtx["temp"] = runnerTemp
+	runnerCtx["workspace"] = baseWorkDir
+	runnerCtx["tool_cache"] = runnerToolCache
+	runnerCtx["environment"] = "self-hosted"
+
+	if ghCtx["workspace"] == nil {
+		ghCtx["workspace"] = jobWorkspace
+	}
+	if ghCtx["run_id"] == nil && cumulativeEnv["GITHUB_RUN_ID"] != "" {
+		ghCtx["run_id"] = cumulativeEnv["GITHUB_RUN_ID"]
+	}
+
+	if job.Environment != nil {
+		for k, v := range job.Environment {
+			cumulativeEnv[k] = evaluateExpression(v, parsedContext)
+		}
+	}
+	parsedContext["env"] = cumulativeEnv
 
 	workflowName := ""
 	if job.Variables != nil {
@@ -645,10 +742,13 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		}
 	}()
 
+	jobFailed := false
+	jobCancelled := false
+
 	for i, step := range job.Steps {
-		if err := ctx.Err(); err != nil {
+		if ctx.Err() != nil {
+			jobCancelled = true
 			conclusion = "cancelled"
-			break
 		}
 
 		stepID := step.ID
@@ -659,6 +759,12 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		stepDisplayName := step.Name
 		if stepDisplayName == "" {
 			stepDisplayName = stepID
+		}
+
+		if !shouldExecuteStep(step.Condition, parsedContext, jobFailed, jobCancelled) {
+			c.NotifyJobStepLog(jobID, stepID, fmt.Sprintf("::debug::Skipping step %s (condition %q evaluated to false)", stepDisplayName, step.Condition))
+			c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusSkipped, 0)
+			continue
 		}
 
 		envFile, err := os.CreateTemp(runnerTemp, fmt.Sprintf("env_%s_*.txt", stepID))
@@ -787,13 +893,17 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 				PathFilePath:   pathFilePath,
 				EnvFilePath:    envPath,
 				OutputFilePath: outputPath,
+				Context:        parsedContext,
 			}
+			c.NotifyJobStepLog(jobID, stepID, fmt.Sprintf("::debug::Inputs for %s: %+v | Evaluated: %+v", stepDisplayName, step.Inputs, evaluatedInputs))
 			res, _, stepErr = c.executeActionStep(ctx, jobID, stepID, stepDisplayName, ref, actCtx, stepLogger, jobMasker)
 
 			// Ingest state file and queue post-step hook if manifest defines runs.post
 			stepState, _ := IngestStateFile(statePath)
 			if actCtx != nil && actCtx.Manifest != nil && strings.TrimSpace(actCtx.Manifest.Runs.Post) != "" {
 				postScript := actCtx.Manifest.Runs.Post
+				postIf := strings.TrimSpace(actCtx.Manifest.Runs.PostIf)
+				stepFailed := stepErr != nil || (res != nil && res.ExitCode != 0)
 				hookEnv := make(map[string]string, len(stepEnv))
 				for k, v := range stepEnv {
 					hookEnv[k] = v
@@ -803,6 +913,8 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 					StepName:   stepDisplayName,
 					ActionDir:  actCtx.ActionDir,
 					PostScript: postScript,
+					PostIf:     postIf,
+					StepFailed: stepFailed,
 					Env:        hookEnv,
 					State:      stepState,
 					Inputs:     evaluatedInputs,
@@ -810,6 +922,9 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			}
 		} else {
 			stepScript := step.Script
+			if strings.HasPrefix(strings.TrimSpace(stepScript), "format(") || strings.Contains(stepScript, "${{") {
+				stepScript = evaluateExpression(stepScript, parsedContext)
+			}
 			if stepScript == "" && isCheckoutStep(step) {
 				stepScript = generateCheckoutScript(step, stepEnv)
 			}
@@ -836,8 +951,9 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 				ExitCode:   exitCode,
 			})
 			cleanupStepFiles()
+			jobCancelled = true
 			conclusion = "cancelled"
-			break
+			continue
 		}
 
 		if (res != nil && res.ExitCode != 0) || stepErr != nil {
@@ -851,8 +967,9 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 				ExitCode:   exitCode,
 			})
 			cleanupStepFiles()
+			jobFailed = true
 			conclusion = "failure"
-			break
+			continue
 		}
 
 		// Step succeeded: parse environment, output, and path files
@@ -864,8 +981,9 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 				ExitCode:   1,
 			})
 			cleanupStepFiles()
+			jobFailed = true
 			conclusion = "failure"
-			break
+			continue
 		}
 
 		newOutputs, err := ParseEnvAndOutputFile(outputPath)
@@ -877,8 +995,9 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 				ExitCode:   1,
 			})
 			cleanupStepFiles()
+			jobFailed = true
 			conclusion = "failure"
-			break
+			continue
 		}
 		stepOutputsMap := make(map[string]any)
 		for k, v := range newOutputs {
@@ -911,8 +1030,9 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 				ExitCode:   1,
 			})
 			cleanupStepFiles()
+			jobFailed = true
 			conclusion = "failure"
-			break
+			continue
 		}
 		cumulativeEnv[pathKey] = updatedPath
 
@@ -1009,6 +1129,14 @@ func (c *Coordinator) executeActionStep(ctx context.Context, jobID, stepID, step
 			return &driver.StepResult{ExitCode: 1, Error: err}, err
 		}
 		actCtx.ActionDir = actionDir
+		if manifest.Inputs != nil && actCtx != nil && actCtx.Context != nil {
+			for name, inputDef := range manifest.Inputs {
+				if strings.Contains(inputDef.Default, "${{") {
+					inputDef.Default = evaluateExpression(inputDef.Default, actCtx.Context)
+					manifest.Inputs[name] = inputDef
+				}
+			}
+		}
 		actCtx.Manifest = manifest
 
 		execErr := action.ExecuteNodeAction(ctx, nodePath, scriptPath, actCtx, stdout, stderr)
@@ -1299,10 +1427,14 @@ fi
 
 if [ -n "$TARGET_REF" ]; then
     CLEAN_REF="${TARGET_REF#refs/heads/}"
-    git checkout -f -- "$CLEAN_REF" 2>/dev/null || \
-    git checkout -f -- "$TARGET_REF" 2>/dev/null || (
+    git checkout -f "$CLEAN_REF" 2>/dev/null || \
+    git checkout -f "$TARGET_REF" 2>/dev/null || (
         git fetch --depth=1 "$CLONE_URL" "$TARGET_REF" 2>/dev/null || git fetch "$CLONE_URL"
-        git checkout -f -- "$CLEAN_REF" 2>/dev/null || git checkout -f -- "$TARGET_REF"
+        git checkout -f "$CLEAN_REF" 2>/dev/null || \
+        git checkout -f "$TARGET_REF" 2>/dev/null || \
+        git checkout -f -B "$CLEAN_REF" "origin/$CLEAN_REF" 2>/dev/null || \
+        git checkout -f FETCH_HEAD 2>/dev/null || \
+        git checkout -f -- "$TARGET_REF"
     )
 fi
 `
@@ -1359,33 +1491,391 @@ func lookupContext(path string, ctx map[string]any) (any, bool) {
 	return current, true
 }
 
+// parseExpressionArgs splits a comma-separated argument list while respecting single-quoted strings and parentheses.
+func parseExpressionArgs(s string) []string {
+	var args []string
+	var current strings.Builder
+	inQuotes := false
+	parenDepth := 0
+
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		switch ch {
+		case '\'':
+			inQuotes = !inQuotes
+			current.WriteByte(ch)
+		case '(':
+			if !inQuotes {
+				parenDepth++
+			}
+			current.WriteByte(ch)
+		case ')':
+			if !inQuotes {
+				parenDepth--
+			}
+			current.WriteByte(ch)
+		case ',':
+			if !inQuotes && parenDepth == 0 {
+				args = append(args, strings.TrimSpace(current.String()))
+				current.Reset()
+			} else {
+				current.WriteByte(ch)
+			}
+		default:
+			current.WriteByte(ch)
+		}
+	}
+	if current.Len() > 0 {
+		args = append(args, strings.TrimSpace(current.String()))
+	}
+	return args
+}
+
+// isTruthy reports whether an expression result string represents a truthy value.
+func isTruthy(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	return trimmed != "" && trimmed != "false" && trimmed != "null" && trimmed != "0"
+}
+
+// splitTopLevel splits s by sep only at parentheses depth 0 and outside single quotes.
+func splitTopLevel(s, sep string) []string {
+	var parts []string
+	inQuotes := false
+	parenDepth := 0
+	lastIdx := 0
+	sepLen := len(sep)
+
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		switch ch {
+		case '\'':
+			inQuotes = !inQuotes
+		case '(':
+			if !inQuotes {
+				parenDepth++
+			}
+		case ')':
+			if !inQuotes && parenDepth > 0 {
+				parenDepth--
+			}
+		}
+
+		if !inQuotes && parenDepth == 0 && i+sepLen <= len(s) && s[i:i+sepLen] == sep {
+			parts = append(parts, strings.TrimSpace(s[lastIdx:i]))
+			lastIdx = i + sepLen
+			i += sepLen - 1
+		}
+	}
+	if lastIdx < len(s) {
+		parts = append(parts, strings.TrimSpace(s[lastIdx:]))
+	}
+	return parts
+}
+
+func isContextPath(s string) bool {
+	roots := []string{
+		"github.", "env.", "job.", "steps.", "runner.",
+		"needs.", "inputs.", "matrix.", "strategy.", "secrets.", "vars.",
+	}
+	for _, r := range roots {
+		if strings.HasPrefix(s, r) {
+			return true
+		}
+	}
+	return false
+}
+
+// shouldExecuteStep determines whether a job step should execute based on its condition.
+func shouldExecuteStep(cond string, ctx map[string]any, jobFailed, jobCancelled bool) bool {
+	trimmed := strings.TrimSpace(cond)
+	if trimmed == "" || strings.EqualFold(trimmed, "success()") {
+		return !jobFailed && !jobCancelled
+	}
+	if strings.EqualFold(trimmed, "always()") {
+		return !jobCancelled
+	}
+	if strings.EqualFold(trimmed, "failure()") {
+		return jobFailed && !jobCancelled
+	}
+	if strings.EqualFold(trimmed, "cancelled()") {
+		return jobCancelled
+	}
+
+	evalCtx := make(map[string]any, len(ctx)+4)
+	for k, v := range ctx {
+		evalCtx[k] = v
+	}
+	evalCtx["_job_failed"] = jobFailed
+	evalCtx["_job_cancelled"] = jobCancelled
+
+	res := evaluateExpression(trimmed, evalCtx)
+	return isTruthy(res)
+}
+
 func evaluateExpression(expr string, ctx map[string]any) string {
 	trimmed := strings.TrimSpace(expr)
 	if trimmed == "" {
 		return ""
 	}
 
-	// Handle OR expressions: left || right
-	if strings.Contains(trimmed, " || ") {
-		parts := strings.Split(trimmed, " || ")
-		for _, part := range parts {
+	// Check if this string contains embedded ${{ ... }} expressions with text before or after, or multiple expressions
+	if strings.Contains(trimmed, "${{") && strings.Contains(trimmed, "}}") {
+		startIdx := strings.Index(trimmed, "${{")
+		endIdx := strings.Index(trimmed, "}}")
+		if !(startIdx == 0 && endIdx == len(trimmed)-2 && strings.Count(trimmed, "${{") == 1) {
+			var sb strings.Builder
+			remaining := trimmed
+			for {
+				s := strings.Index(remaining, "${{")
+				if s == -1 {
+					sb.WriteString(remaining)
+					break
+				}
+				e := strings.Index(remaining, "}}")
+				if e == -1 || e < s {
+					sb.WriteString(remaining)
+					break
+				}
+				sb.WriteString(remaining[:s])
+				inner := strings.TrimSpace(remaining[s+len("${{") : e])
+				sb.WriteString(evaluateExpression(inner, ctx))
+				remaining = remaining[e+len("}}"):]
+			}
+			return sb.String()
+		}
+	}
+
+	// Strip ${{ ... }} wrappers if present
+	if strings.HasPrefix(trimmed, "${{") && strings.HasSuffix(trimmed, "}}") {
+		trimmed = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(trimmed, "${{"), "}}"))
+	}
+
+	// Trim outer matching parentheses: (expr)
+	for strings.HasPrefix(trimmed, "(") && strings.HasSuffix(trimmed, ")") {
+		depth := 0
+		matched := true
+		for i := 0; i < len(trimmed)-1; i++ {
+			if trimmed[i] == '(' {
+				depth++
+			} else if trimmed[i] == ')' {
+				depth--
+				if depth == 0 {
+					matched = false
+					break
+				}
+			}
+		}
+		if matched && depth == 1 {
+			trimmed = strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+		} else {
+			break
+		}
+	}
+
+	// Handle status check functions
+	if strings.EqualFold(trimmed, "success()") {
+		failed, _ := ctx["_job_failed"].(bool)
+		cancelled, _ := ctx["_job_cancelled"].(bool)
+		if !failed && !cancelled {
+			return "true"
+		}
+		return "false"
+	}
+	if strings.EqualFold(trimmed, "always()") {
+		cancelled, _ := ctx["_job_cancelled"].(bool)
+		if !cancelled {
+			return "true"
+		}
+		return "false"
+	}
+	if strings.EqualFold(trimmed, "failure()") {
+		failed, _ := ctx["_job_failed"].(bool)
+		cancelled, _ := ctx["_job_cancelled"].(bool)
+		if failed && !cancelled {
+			return "true"
+		}
+		return "false"
+	}
+	if strings.EqualFold(trimmed, "cancelled()") {
+		cancelled, _ := ctx["_job_cancelled"].(bool)
+		if cancelled {
+			return "true"
+		}
+		return "false"
+	}
+
+	// Handle OR expressions: left || right at top level
+	if orParts := splitTopLevel(trimmed, " || "); len(orParts) > 1 {
+		for _, part := range orParts {
 			res := evaluateExpression(part, ctx)
-			if res != "" && res != "false" && res != "null" {
+			if isTruthy(res) {
 				return res
 			}
 		}
-		return evaluateExpression(parts[len(parts)-1], ctx)
+		return evaluateExpression(orParts[len(orParts)-1], ctx)
 	}
 
-	// Handle equality expressions: left == right
-	if strings.Contains(trimmed, " == ") {
-		parts := strings.SplitN(trimmed, " == ", 2)
-		left := evaluateExpression(parts[0], ctx)
-		right := evaluateExpression(parts[1], ctx)
+	// Handle AND expressions: left && right at top level
+	if andParts := splitTopLevel(trimmed, " && "); len(andParts) > 1 {
+		for _, part := range andParts {
+			res := evaluateExpression(part, ctx)
+			if !isTruthy(res) {
+				return ""
+			}
+		}
+		return evaluateExpression(andParts[len(andParts)-1], ctx)
+	}
+
+	// Handle equality expressions: left == right at top level
+	if eqParts := splitTopLevel(trimmed, " == "); len(eqParts) == 2 {
+		left := evaluateExpression(eqParts[0], ctx)
+		right := evaluateExpression(eqParts[1], ctx)
 		if strings.EqualFold(left, right) {
 			return "true"
 		}
 		return "false"
+	}
+
+	// Handle inequality expressions: left != right at top level
+	if neParts := splitTopLevel(trimmed, " != "); len(neParts) == 2 {
+		left := evaluateExpression(neParts[0], ctx)
+		right := evaluateExpression(neParts[1], ctx)
+		if !strings.EqualFold(left, right) {
+			return "true"
+		}
+		return "false"
+	}
+
+	// Handle prefix NOT: !expr
+	if strings.HasPrefix(trimmed, "!") {
+		inner := strings.TrimSpace(trimmed[1:])
+		res := evaluateExpression(inner, ctx)
+		if isTruthy(res) {
+			return "false"
+		}
+		return "true"
+	}
+
+	// Handle format('template', arg0, arg1, ...)
+	if strings.HasPrefix(trimmed, "format(") && strings.HasSuffix(trimmed, ")") {
+		inner := strings.TrimSpace(trimmed[7 : len(trimmed)-1])
+		args := parseExpressionArgs(inner)
+		if len(args) > 0 {
+			templateStr := evaluateExpression(args[0], ctx)
+			formatted := templateStr
+			for i := 1; i < len(args); i++ {
+				placeholder := fmt.Sprintf("{%d}", i-1)
+				val := evaluateExpression(args[i], ctx)
+				formatted = strings.ReplaceAll(formatted, placeholder, val)
+			}
+			return formatted
+		}
+	}
+
+	// Handle startsWith(searchString, prefix)
+	if strings.HasPrefix(trimmed, "startsWith(") && strings.HasSuffix(trimmed, ")") {
+		inner := strings.TrimSpace(trimmed[11 : len(trimmed)-1])
+		args := parseExpressionArgs(inner)
+		if len(args) >= 2 {
+			str := evaluateExpression(args[0], ctx)
+			prefix := evaluateExpression(args[1], ctx)
+			if strings.HasPrefix(str, prefix) {
+				return "true"
+			}
+			return "false"
+		}
+	}
+
+	// Handle endsWith(searchString, suffix)
+	if strings.HasPrefix(trimmed, "endsWith(") && strings.HasSuffix(trimmed, ")") {
+		inner := strings.TrimSpace(trimmed[9 : len(trimmed)-1])
+		args := parseExpressionArgs(inner)
+		if len(args) >= 2 {
+			str := evaluateExpression(args[0], ctx)
+			suffix := evaluateExpression(args[1], ctx)
+			if strings.HasSuffix(str, suffix) {
+				return "true"
+			}
+			return "false"
+		}
+	}
+
+	// Handle contains(searchString, item)
+	if strings.HasPrefix(trimmed, "contains(") && strings.HasSuffix(trimmed, ")") {
+		inner := strings.TrimSpace(trimmed[9 : len(trimmed)-1])
+		args := parseExpressionArgs(inner)
+		if len(args) >= 2 {
+			str := evaluateExpression(args[0], ctx)
+			item := evaluateExpression(args[1], ctx)
+			if strings.Contains(str, item) {
+				return "true"
+			}
+			return "false"
+		}
+	}
+
+	// Handle eq(a, b)
+	if strings.HasPrefix(trimmed, "eq(") && strings.HasSuffix(trimmed, ")") {
+		inner := strings.TrimSpace(trimmed[3 : len(trimmed)-1])
+		args := parseExpressionArgs(inner)
+		if len(args) >= 2 {
+			a := evaluateExpression(args[0], ctx)
+			b := evaluateExpression(args[1], ctx)
+			if strings.EqualFold(a, b) {
+				return "true"
+			}
+			return "false"
+		}
+	}
+
+	// Handle ne(a, b)
+	if strings.HasPrefix(trimmed, "ne(") && strings.HasSuffix(trimmed, ")") {
+		inner := strings.TrimSpace(trimmed[3 : len(trimmed)-1])
+		args := parseExpressionArgs(inner)
+		if len(args) >= 2 {
+			a := evaluateExpression(args[0], ctx)
+			b := evaluateExpression(args[1], ctx)
+			if !strings.EqualFold(a, b) {
+				return "true"
+			}
+			return "false"
+		}
+	}
+
+	// Handle and(arg0, arg1, ...)
+	if strings.HasPrefix(trimmed, "and(") && strings.HasSuffix(trimmed, ")") {
+		inner := strings.TrimSpace(trimmed[4 : len(trimmed)-1])
+		args := parseExpressionArgs(inner)
+		for _, arg := range args {
+			res := evaluateExpression(arg, ctx)
+			if !isTruthy(res) {
+				return "false"
+			}
+		}
+		return "true"
+	}
+
+	// Handle or(arg0, arg1, ...)
+	if strings.HasPrefix(trimmed, "or(") && strings.HasSuffix(trimmed, ")") {
+		inner := strings.TrimSpace(trimmed[3 : len(trimmed)-1])
+		args := parseExpressionArgs(inner)
+		for _, arg := range args {
+			res := evaluateExpression(arg, ctx)
+			if isTruthy(res) {
+				return "true"
+			}
+		}
+		return "false"
+	}
+
+	// Handle not(arg)
+	if strings.HasPrefix(trimmed, "not(") && strings.HasSuffix(trimmed, ")") {
+		inner := strings.TrimSpace(trimmed[4 : len(trimmed)-1])
+		res := evaluateExpression(inner, ctx)
+		if isTruthy(res) {
+			return "false"
+		}
+		return "true"
 	}
 
 	// String literals: 'foo'
@@ -1401,7 +1891,7 @@ func evaluateExpression(expr string, ctx map[string]any) string {
 	// Context lookup (e.g. inputs.platforms, needs.detect.outputs.platforms, github.event_name)
 	if val, ok := lookupContext(trimmed, ctx); ok && val != nil {
 		return fmt.Sprint(val)
-	} else if strings.Contains(trimmed, ".") {
+	} else if isContextPath(trimmed) {
 		return ""
 	}
 
@@ -1548,6 +2038,12 @@ func (c *Coordinator) executePostHooks(ctx context.Context, jobID string, postHo
 	var firstErr error
 	for i := len(postHooks) - 1; i >= 0; i-- {
 		hook := postHooks[i]
+		if strings.TrimSpace(hook.PostIf) == "success()" && hook.StepFailed {
+			continue
+		}
+		if strings.TrimSpace(hook.PostIf) == "failure()" && !hook.StepFailed {
+			continue
+		}
 		if err := c.executeSinglePostHook(postCtx, jobID, hook, nodePath, stepLogger, jobMasker); err != nil {
 			if firstErr == nil {
 				firstErr = err

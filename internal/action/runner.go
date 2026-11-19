@@ -25,6 +25,7 @@ type ActionContext struct {
 	PathFilePath   string
 	EnvFilePath    string
 	OutputFilePath string
+	Context        map[string]any
 }
 
 // BuildActionEnvironment constructs the execution environment map for an action step,
@@ -45,7 +46,7 @@ func BuildActionEnvironment(actCtx *ActionContext) map[string]string {
 	effectiveInputs := make(map[string]string)
 	if actCtx.Manifest != nil && actCtx.Manifest.Inputs != nil {
 		for name, inputDef := range actCtx.Manifest.Inputs {
-			if inputDef.Default != "" {
+			if inputDef.Default != "" && !strings.HasPrefix(strings.TrimSpace(inputDef.Default), "${{") {
 				effectiveInputs[name] = inputDef.Default
 			}
 		}

@@ -1104,3 +1104,105 @@ func TestParseAcquiredJob_StepReferencePreservation(t *testing.T) {
 	assert.Equal(t, "v3", s2.Reference.Ref)
 	assert.Equal(t, "uses", s2.Type)
 }
+
+func TestParseAcquiredJob_EnvironmentVariables(t *testing.T) {
+	rawJSON := `{
+		"jobId": "job-env-test",
+		"environmentVariables": [
+			{"Key": "EXPECTED_ARCH", "Value": "arm64"},
+			{"Key": "PLATFORM", "Value": "darwin-arm64"},
+			{"k": "V8_TARGET", "v": "aarch64-apple-darwin"}
+		],
+		"steps": [
+			{
+				"id": "step-1",
+				"name": "Check Env",
+				"condition": "success()",
+				"type": "run",
+				"script": "echo hello"
+			}
+		]
+	}`
+
+	job, err := protocol.ParseAcquiredJob([]byte(rawJSON))
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	require.NotNil(t, job.Environment)
+	assert.Equal(t, "arm64", job.Environment["EXPECTED_ARCH"])
+	assert.Equal(t, "darwin-arm64", job.Environment["PLATFORM"])
+	assert.Equal(t, "aarch64-apple-darwin", job.Environment["V8_TARGET"])
+}
+
+func TestParseAcquiredJob_Endpoints(t *testing.T) {
+	rawJSON := `{
+		"jobId": "job-endpoints-test",
+		"resources": {
+			"endpoints": [
+				{
+					"name": "SystemVssConnection",
+					"type": "SystemVssConnection",
+					"url": "https://pipelines.actions.githubusercontent.com/test",
+					"authorization": {
+						"parameters": {
+							"AccessToken": "test-runtime-token"
+						}
+					},
+					"data": {
+						"ResultsServiceUrl": "https://results-receiver.actions.githubusercontent.com/",
+						"CacheServerUrl": "https://artifactcache.actions.githubusercontent.com/"
+					}
+				}
+			]
+		},
+		"steps": []
+	}`
+
+	job, err := protocol.ParseAcquiredJob([]byte(rawJSON))
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	require.Len(t, job.Endpoints, 1)
+
+	ep := job.Endpoints[0]
+	assert.Equal(t, "SystemVssConnection", ep.Name)
+	assert.Equal(t, "https://pipelines.actions.githubusercontent.com/test", ep.URL)
+	assert.Equal(t, "test-runtime-token", job.JobToken)
+	assert.Equal(t, "https://results-receiver.actions.githubusercontent.com/", ep.Data["ResultsServiceUrl"])
+	assert.Equal(t, "https://artifactcache.actions.githubusercontent.com/", ep.Data["CacheServerUrl"])
+}
+
+func TestParseAcquiredJob_StepConditions(t *testing.T) {
+	rawJSON := `{
+		"jobId": "job-conditions-test",
+		"steps": [
+			{
+				"id": "s1",
+				"name": "Always run",
+				"condition": "always()",
+				"type": "run",
+				"script": "echo always"
+			},
+			{
+				"id": "s2",
+				"name": "Docker step",
+				"condition": {"expression": "runner.os == 'macOS' && startsWith(matrix.platform, 'linux-')"},
+				"type": "run",
+				"script": "docker run"
+			},
+			{
+				"id": "s3",
+				"name": "Default step",
+				"type": "run",
+				"script": "echo default"
+			}
+		]
+	}`
+
+	job, err := protocol.ParseAcquiredJob([]byte(rawJSON))
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	require.Len(t, job.Steps, 3)
+
+	assert.Equal(t, "always()", job.Steps[0].Condition)
+	assert.Equal(t, "runner.os == 'macOS' && startsWith(matrix.platform, 'linux-')", job.Steps[1].Condition)
+	assert.Equal(t, "success()", job.Steps[2].Condition)
+}

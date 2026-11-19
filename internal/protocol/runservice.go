@@ -33,6 +33,7 @@ type JobStep struct {
 	Environment      map[string]string `json:"environment,omitempty"`
 	Inputs           map[string]string `json:"inputs,omitempty"`
 	Reference        *StepReference    `json:"reference,omitempty"`
+	Condition        string            `json:"condition,omitempty"`
 }
 
 // JobContainer defines the container execution environment for a workflow job.
@@ -44,6 +45,15 @@ type JobContainer struct {
 	Ports       []string          `json:"ports,omitempty"`
 }
 
+// ServiceEndpoint represents an external or internal service endpoint.
+type ServiceEndpoint struct {
+	Name          string            `json:"name"`
+	Type          string            `json:"type"`
+	URL           string            `json:"url"`
+	Authorization *rawEndpointAuth  `json:"authorization,omitempty"`
+	Data          map[string]string `json:"data,omitempty"`
+}
+
 // JobSpecification represents the complete workflow job payload returned by the Run Service.
 type JobSpecification struct {
 	JobID       string            `json:"jobId"`
@@ -52,8 +62,10 @@ type JobSpecification struct {
 	JobToken    string            `json:"jobToken,omitempty"`
 	Steps       []JobStep         `json:"steps"`
 	Variables   map[string]string `json:"variables,omitempty"`
+	Environment map[string]string `json:"environment,omitempty"`
 	ContextData map[string]any    `json:"contextData,omitempty"`
 	Container   *JobContainer     `json:"container,omitempty"`
+	Endpoints   []ServiceEndpoint `json:"endpoints,omitempty"`
 }
 
 type rawStepReference struct {
@@ -77,6 +89,10 @@ type rawStep struct {
 	Environment      any               `json:"environment"`
 	Reference        *rawStepReference `json:"reference"`
 	Inputs           any               `json:"inputs"`
+	Condition        any               `json:"condition"`
+	ConditionAlt     any               `json:"Condition"`
+	If               any               `json:"if"`
+	IfAlt            any               `json:"If"`
 }
 
 type rawPlan struct {
@@ -123,18 +139,19 @@ type rawJobResources struct {
 }
 
 type rawJobSpec struct {
-	JobID          string           `json:"jobId"`
-	JobIDAlt       string           `json:"job_id"`
-	JobName        any              `json:"jobName"`
-	JobDisplayName any              `json:"jobDisplayName"`
-	Name           any              `json:"name"`
-	PlanID         string           `json:"planId"`
-	Plan           *rawPlan         `json:"plan"`
-	Steps          []rawStep        `json:"steps"`
-	Variables      map[string]any   `json:"variables"`
-	ContextData    map[string]any   `json:"contextData"`
-	Resources      *rawJobResources `json:"resources"`
-	Container      any              `json:"container"`
+	JobID                string           `json:"jobId"`
+	JobIDAlt             string           `json:"job_id"`
+	JobName              any              `json:"jobName"`
+	JobDisplayName       any              `json:"jobDisplayName"`
+	Name                 any              `json:"name"`
+	PlanID               string           `json:"planId"`
+	Plan                 *rawPlan         `json:"plan"`
+	Steps                []rawStep        `json:"steps"`
+	Variables            map[string]any   `json:"variables"`
+	EnvironmentVariables any              `json:"environmentVariables"`
+	ContextData          map[string]any   `json:"contextData"`
+	Resources            *rawJobResources `json:"resources"`
+	Container            any              `json:"container"`
 }
 
 func extractASTString(v any) string {
@@ -151,11 +168,23 @@ func extractASTString(v any) string {
 		if expr, ok := val["expr"]; ok && expr != nil {
 			return fmt.Sprint(expr)
 		}
+		if expr, ok := val["expression"]; ok && expr != nil {
+			return fmt.Sprint(expr)
+		}
+		if v, ok := val["v"]; ok && v != nil {
+			return extractASTString(v)
+		}
+		if valStr, ok := val["val"]; ok && valStr != nil {
+			return extractASTString(valStr)
+		}
 		if value, ok := val["value"]; ok && value != nil {
 			return extractASTString(value)
 		}
 		if Value, ok := val["Value"]; ok && Value != nil {
 			return extractASTString(Value)
+		}
+		if b, err := json.Marshal(val); err == nil {
+			return string(b)
 		}
 		return ""
 	default:
@@ -183,9 +212,18 @@ func extractASTMap(v any) map[string]string {
 					if k == "" {
 						k = extractASTString(itemMap["Key"])
 					}
+					if k == "" {
+						k = extractASTString(itemMap["k"])
+					}
 					vStr := extractASTString(itemMap["value"])
 					if vStr == "" {
 						vStr = extractASTString(itemMap["Value"])
+					}
+					if vStr == "" {
+						vStr = extractASTString(itemMap["v"])
+					}
+					if vStr == "" {
+						vStr = extractASTString(itemMap["val"])
 					}
 					if k != "" {
 						res[k] = vStr
@@ -202,6 +240,48 @@ func extractASTMap(v any) map[string]string {
 	default:
 		return nil
 	}
+}
+
+func extractEnvironmentVariables(v any) map[string]string {
+	if v == nil {
+		return nil
+	}
+	res := make(map[string]string)
+	if slice, ok := v.([]any); ok {
+		for _, item := range slice {
+			if itemMap, ok := item.(map[string]any); ok {
+				k := extractASTString(itemMap["key"])
+				if k == "" {
+					k = extractASTString(itemMap["Key"])
+				}
+				if k == "" {
+					k = extractASTString(itemMap["k"])
+				}
+				vStr := extractASTString(itemMap["value"])
+				if vStr == "" {
+					vStr = extractASTString(itemMap["Value"])
+				}
+				if vStr == "" {
+					vStr = extractASTString(itemMap["v"])
+				}
+				if vStr == "" {
+					vStr = extractASTString(itemMap["val"])
+				}
+				if k != "" && (vStr != "" || itemMap["value"] != nil || itemMap["Value"] != nil || itemMap["v"] != nil || itemMap["val"] != nil) {
+					res[k] = vStr
+					continue
+				}
+			}
+			m := extractASTMap(item)
+			for k, val := range m {
+				res[k] = val
+			}
+		}
+		if len(res) > 0 {
+			return res
+		}
+	}
+	return extractASTMap(v)
 }
 
 func extractASTSlice(v any) []string {
@@ -443,6 +523,11 @@ func (j *JobSpecification) UnmarshalJSON(data []byte) error {
 
 	j.ContextData = raw.ContextData
 
+	envVars := extractEnvironmentVariables(raw.EnvironmentVariables)
+	if len(envVars) > 0 {
+		j.Environment = envVars
+	}
+
 	vars := make(map[string]string)
 	if len(raw.Variables) > 0 {
 		for k, v := range raw.Variables {
@@ -545,6 +630,20 @@ func (j *JobSpecification) UnmarshalJSON(data []byte) error {
 				}
 			}
 
+			condStr := extractASTString(s.Condition)
+			if condStr == "" {
+				condStr = extractASTString(s.ConditionAlt)
+			}
+			if condStr == "" {
+				condStr = extractASTString(s.If)
+			}
+			if condStr == "" {
+				condStr = extractASTString(s.IfAlt)
+			}
+			if condStr == "" {
+				condStr = "success()"
+			}
+
 			steps = append(steps, JobStep{
 				ID:               stepID,
 				Name:             stepName,
@@ -554,6 +653,7 @@ func (j *JobSpecification) UnmarshalJSON(data []byte) error {
 				Environment:      stepEnv,
 				Inputs:           stepInputs,
 				Reference:        ref,
+				Condition:        condStr,
 			})
 		}
 		j.Steps = steps
@@ -569,19 +669,30 @@ func (j *JobSpecification) UnmarshalJSON(data []byte) error {
 		}
 	}
 
-	// Extract JobToken from Resources.Endpoints or Variables
-	if raw.Resources != nil {
+	// Extract Endpoints and JobToken from Resources.Endpoints
+	if raw.Resources != nil && len(raw.Resources.Endpoints) > 0 {
 		for _, ep := range raw.Resources.Endpoints {
-			if ep.Authorization != nil && ep.Authorization.Parameters != nil {
+			dataMap := make(map[string]string)
+			for k, v := range ep.Data {
+				if v != nil {
+					dataMap[k] = extractASTString(v)
+				}
+			}
+			j.Endpoints = append(j.Endpoints, ServiceEndpoint{
+				Name:          ep.Name,
+				Type:          ep.Type,
+				URL:           ep.URL,
+				Authorization: ep.Authorization,
+				Data:          dataMap,
+			})
+
+			if j.JobToken == "" && ep.Authorization != nil && ep.Authorization.Parameters != nil {
 				for _, paramKey := range []string{"AccessToken", "accesstoken", "Token", "token"} {
 					if tok, ok := ep.Authorization.Parameters[paramKey]; ok && tok != "" {
 						j.JobToken = tok
 						break
 					}
 				}
-			}
-			if j.JobToken != "" {
-				break
 			}
 		}
 	}
