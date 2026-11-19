@@ -498,3 +498,82 @@ func TestServer_Publish_SlowSubscriberChannelClosed(t *testing.T) {
 		}
 	}
 }
+
+func TestServer_JobTelemetryAttribution(t *testing.T) {
+	sockPath := testSocketPath(t)
+	s := NewServer(sockPath, "actr • test")
+
+	j1 := &JobInfo{ID: "job-1", Repo: "adrijshikhar/aim", RepoAlias: "aim", Name: "CI"}
+	j2 := &JobInfo{ID: "job-2", Repo: "adrijshikhar/cxstatusline", RepoAlias: "cxstatusline", Name: "Vitest"}
+
+	s.Publish(Event{Type: EventJobStart, Job: j1})
+	s.Publish(Event{Type: EventJobStart, Job: j2})
+
+	sample1 := &TelemetrySample{PID: 100, StepCPU: 45.0, StepRSSBytes: 500 * 1024 * 1024}
+	s.Publish(Event{Type: EventTelemetry, JobID: "job-1", Telemetry: sample1})
+
+	peak1 := s.PeakMetricsForJob("job-1")
+	if peak1 == nil || peak1.PeakCPUPercent != 45.0 {
+		t.Errorf("expected peak CPU 45.0 for job-1, got %v", peak1)
+	}
+
+	peak2 := s.PeakMetricsForJob("job-2")
+	if peak2 != nil && peak2.PeakCPUPercent == 45.0 {
+		t.Errorf("job-2 peak CPU was cross-contaminated by job-1 telemetry: %v", peak2)
+	}
+}
+
+func TestServer_SupervisorStatusAndReload(t *testing.T) {
+	sockPath := testSocketPath(t)
+	s := NewServer(sockPath, "actr • multi-repo")
+
+	reloaded := false
+	s.WithReloadFunc(func() error {
+		reloaded = true
+		return nil
+	})
+
+	status := &SupervisorStatus{
+		GlobalMaxJobs: 2,
+		GlobalActive:  1,
+		RepoSlots: []*RepoSlotInfo{
+			{Alias: "aim", MaxJobs: 1, ActiveJobs: 1, Driver: "host", Status: "busy"},
+			{Alias: "cxstatusline", MaxJobs: 1, ActiveJobs: 0, Driver: "host", Status: "idle"},
+		},
+	}
+	s.SetSupervisorStatus(status)
+
+	if err := s.Start(); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+	defer func() { _ = s.Stop() }()
+
+	client := NewClient(sockPath)
+	snap, err := client.GetSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("GetSnapshot failed: %v", err)
+	}
+	if snap.SupervisorStatus == nil || snap.SupervisorStatus.GlobalMaxJobs != 2 {
+		t.Fatalf("expected supervisor status with GlobalMaxJobs 2, got %v", snap.SupervisorStatus)
+	}
+
+	// Test POST /reload over unix socket HTTP
+	httpc := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", sockPath)
+			},
+		},
+	}
+	resp, err := httpc.Post("http://unix/reload", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /reload failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK from /reload, got %d", resp.StatusCode)
+	}
+	if !reloaded {
+		t.Fatal("expected reloadFn to be called")
+	}
+}
