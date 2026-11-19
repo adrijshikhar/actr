@@ -97,7 +97,21 @@ func (s *Server) WithReloadFunc(fn func() error) *Server {
 func (s *Server) SetSupervisorStatus(status *SupervisorStatus) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.supervisorStatus = status
+	if status == nil {
+		s.supervisorStatus = nil
+		return
+	}
+	cp := *status
+	if status.RepoSlots != nil {
+		cp.RepoSlots = make([]*RepoSlotInfo, len(status.RepoSlots))
+		for i, slot := range status.RepoSlots {
+			if slot != nil {
+				sc := *slot
+				cp.RepoSlots[i] = &sc
+			}
+		}
+	}
+	s.supervisorStatus = &cp
 }
 
 // SupervisorStatus returns a deep copy of current supervisor status.

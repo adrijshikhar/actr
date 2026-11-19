@@ -576,4 +576,61 @@ func TestServer_SupervisorStatusAndReload(t *testing.T) {
 	if !reloaded {
 		t.Fatal("expected reloadFn to be called")
 	}
+
+	// Test POST /reload error returns 500
+	s.WithReloadFunc(func() error {
+		return fmt.Errorf("simulated reload failure")
+	})
+	respErr, err := httpc.Post("http://unix/reload", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /reload failed: %v", err)
+	}
+	defer respErr.Body.Close()
+	if respErr.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500 InternalServerError from /reload, got %d", respErr.StatusCode)
+	}
+
+	// Test POST /reload when reloadFn is nil returns 501
+	s.WithReloadFunc(nil)
+	respNil, err := httpc.Post("http://unix/reload", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /reload failed: %v", err)
+	}
+	defer respNil.Body.Close()
+	if respNil.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("expected 501 NotImplemented from /reload, got %d", respNil.StatusCode)
+	}
+}
+
+func TestServer_SetJobTelemetry(t *testing.T) {
+	sockPath := testSocketPath(t)
+	s := NewServer(sockPath, "actr • test")
+
+	s.Publish(Event{
+		Type: EventJobStart,
+		Job: &JobInfo{
+			ID:   "job-test-telemetry",
+			Repo: "adrijshikhar/aim",
+			Name: "CI",
+		},
+	})
+
+	sample := &TelemetrySample{
+		PID:          1234,
+		StepCPU:      33.5,
+		StepRSSBytes: 250 * 1024 * 1024,
+	}
+	s.SetJobTelemetry("job-test-telemetry", "aim", sample)
+
+	peak := s.PeakMetricsForJob("job-test-telemetry")
+	if peak == nil || peak.PeakCPUPercent != 33.5 || peak.PeakRSSBytes != 250*1024*1024 {
+		t.Fatalf("unexpected peak metrics: %v", peak)
+	}
+
+	s.mu.RLock()
+	job := s.jobs["job-test-telemetry"]
+	s.mu.RUnlock()
+	if job == nil || job.RepoAlias != "aim" {
+		t.Fatalf("expected job RepoAlias 'aim', got %v", job)
+	}
 }
