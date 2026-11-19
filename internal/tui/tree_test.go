@@ -403,3 +403,53 @@ func TestTreeWidget_SelectionBackground(t *testing.T) {
 		t.Fatalf("expected selected line to fill full width %d, got %d", width, visibleWidth)
 	}
 }
+
+func TestTreeNode_FindParentJobAndRepo(t *testing.T) {
+	root := &TreeNode{ID: "root", Label: "root", NodeType: NodeBranch}
+	liveBranch := &TreeNode{ID: "live-runs", Label: "LIVE RUNS", NodeType: NodeBranch}
+	root.AddChild(liveBranch)
+
+	repoNode := &TreeNode{ID: "repo:aim", Label: "aim (busy • 1/1 slots)", NodeType: NodeRepo}
+	liveBranch.AddChild(repoNode)
+
+	jobNode := &TreeNode{ID: "job-100", Label: "CI Test", NodeType: NodeJob}
+	repoNode.AddChild(jobNode)
+
+	stepNode := &TreeNode{ID: "step-1", Label: "Checkout", NodeType: NodeStep}
+	jobNode.AddChild(stepNode)
+
+	// Step resolves parent job and parent repo
+	if stepNode.FindParentJob() != jobNode {
+		t.Fatalf("expected step to resolve jobNode, got %v", stepNode.FindParentJob())
+	}
+	if stepNode.FindParentRepo() != repoNode {
+		t.Fatalf("expected step to resolve repoNode, got %v", stepNode.FindParentRepo())
+	}
+
+	// Job resolves itself as job and resolves parent repo
+	if jobNode.FindParentJob() != jobNode {
+		t.Fatalf("expected job to resolve itself, got %v", jobNode.FindParentJob())
+	}
+	if jobNode.FindParentRepo() != repoNode {
+		t.Fatalf("expected job to resolve repoNode, got %v", jobNode.FindParentRepo())
+	}
+
+	// Repo resolves itself as repo and has no parent job
+	if repoNode.FindParentJob() != nil {
+		t.Fatalf("expected repo to have nil parent job, got %v", repoNode.FindParentJob())
+	}
+	if repoNode.FindParentRepo() != repoNode {
+		t.Fatalf("expected repo to resolve itself, got %v", repoNode.FindParentRepo())
+	}
+
+	// Branch nodes have neither
+	if liveBranch.FindParentJob() != nil || liveBranch.FindParentRepo() != nil {
+		t.Fatalf("expected branch node to return nil for both job and repo")
+	}
+
+	// Nil safety
+	var nilNode *TreeNode
+	if nilNode.FindParentJob() != nil || nilNode.FindParentRepo() != nil {
+		t.Fatalf("expected nil safety on FindParentJob and FindParentRepo")
+	}
+}

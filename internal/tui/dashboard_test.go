@@ -994,14 +994,21 @@ func TestDashboard_UnifiedTree_LiveAndHistoricalBranches(t *testing.T) {
 	if histBranch.Label != "HISTORICAL RUNS (2 past runs)" {
 		t.Fatalf("expected historical branch label 'HISTORICAL RUNS (2 past runs)', got %q", histBranch.Label)
 	}
-	if len(histBranch.Children) != 2 {
-		t.Fatalf("expected 2 historical jobs under historical branch, got %d", len(histBranch.Children))
+	if len(histBranch.Children) != 1 {
+		t.Fatalf("expected 1 repo group under historical branch, got %d", len(histBranch.Children))
 	}
-	if histBranch.Children[0].ID != "job-hist-1" {
-		t.Fatalf("expected first historical job ID 'job-hist-1', got %q", histBranch.Children[0].ID)
+	defaultRepo := histBranch.Children[0]
+	if defaultRepo.NodeType != NodeRepo || defaultRepo.Label != "default" {
+		t.Fatalf("expected default repo node, got %+v", defaultRepo)
 	}
-	if histBranch.Children[1].ID != "job-hist-2" {
-		t.Fatalf("expected second historical job ID 'job-hist-2', got %q", histBranch.Children[1].ID)
+	if len(defaultRepo.Children) != 2 {
+		t.Fatalf("expected 2 historical jobs under default repo node, got %d", len(defaultRepo.Children))
+	}
+	if defaultRepo.Children[0].ID != "job-hist-1" {
+		t.Fatalf("expected first historical job ID 'job-hist-1', got %q", defaultRepo.Children[0].ID)
+	}
+	if defaultRepo.Children[1].ID != "job-hist-2" {
+		t.Fatalf("expected second historical job ID 'job-hist-2', got %q", defaultRepo.Children[1].ID)
 	}
 
 	view := m.tree.View(60)
@@ -1054,7 +1061,10 @@ func TestDashboard_LiveJobTransitionsToHistoricalOnFinish(t *testing.T) {
 	liveBranch := m.tree.Root.Children[0]
 	histBranch := m.tree.Root.Children[1]
 	if len(liveBranch.Children) != 2 || len(histBranch.Children) != 1 {
-		t.Fatalf("expected 2 live and 1 historical job, got %d and %d", len(liveBranch.Children), len(histBranch.Children))
+		t.Fatalf("expected 2 live and 1 historical repo, got %d and %d", len(liveBranch.Children), len(histBranch.Children))
+	}
+	if len(histBranch.Children[0].Children) != 1 {
+		t.Fatalf("expected 1 historical job in default repo, got %d", len(histBranch.Children[0].Children))
 	}
 
 	// 1. EventJobStart adds a new job under LIVE RUNS
@@ -1103,14 +1113,18 @@ func TestDashboard_LiveJobTransitionsToHistoricalOnFinish(t *testing.T) {
 		}
 	}
 
-	if len(histBranch.Children) != 2 {
-		t.Fatalf("expected 2 historical jobs after job-1 finished, got %d", len(histBranch.Children))
+	if len(histBranch.Children) != 1 {
+		t.Fatalf("expected 1 historical repo after job-1 finished, got %d", len(histBranch.Children))
 	}
-	if histBranch.Children[0].ID != "job-1" {
-		t.Fatalf("expected job-1 prepended as first historical job, got %q", histBranch.Children[0].ID)
+	defaultRepo := histBranch.Children[0]
+	if len(defaultRepo.Children) != 2 {
+		t.Fatalf("expected 2 historical jobs after job-1 finished, got %d", len(defaultRepo.Children))
 	}
-	if histBranch.Children[0].Status != monitor.StatusSuccess {
-		t.Fatalf("expected job-1 status success, got %v", histBranch.Children[0].Status)
+	if defaultRepo.Children[0].ID != "job-1" {
+		t.Fatalf("expected job-1 prepended as first historical job, got %q", defaultRepo.Children[0].ID)
+	}
+	if defaultRepo.Children[0].Status != monitor.StatusSuccess {
+		t.Fatalf("expected job-1 status success, got %v", defaultRepo.Children[0].Status)
 	}
 
 	if liveBranch.Label != "LIVE RUNS (2 active)" {
@@ -1177,8 +1191,8 @@ func TestDashboard_HistoricalStepSelection_LoadsLogs(t *testing.T) {
 	}
 
 	// Expand historical job to expose its steps
-	histBranch := m.tree.Root.Children[1]
-	jobNode := histBranch.Children[0]
+	jobNode := m.tree.FindNode("job-hist-1")
+	require.NotNil(t, jobNode, "job-hist-1 must exist in tree")
 	jobNode.Expanded = true
 	m.tree.Rebuild()
 
@@ -1294,8 +1308,8 @@ func TestDashboard_HistoricalSelection_PeakVitalsHUD(t *testing.T) {
 	assert.Contains(t, dashView, "DISK WR: 84 MB")
 
 	// 3. Expand historical job and select step-h1: telemetry remains in Peak Vitals mode
-	histBranch := m.tree.Root.Children[1]
-	jobNode := histBranch.Children[0]
+	jobNode := m.tree.FindNode("job-hist-1")
+	require.NotNil(t, jobNode, "job-hist-1 must exist in tree")
 	jobNode.Expanded = true
 	m.tree.Rebuild()
 	foundStep := m.tree.SelectFirst(func(n *TreeNode) bool { return n.ID == "step-h1" })
@@ -1389,7 +1403,7 @@ func TestDashboard_MultiRepoExpansionAndRepoSelection(t *testing.T) {
 
 	// Verify repo selection renders repository info in right pane
 	repoView := model.viewport.View()
-	assert.Contains(t, repoView, "Repository: adrijshikhar/aim")
+	assert.Contains(t, repoView, "Repository: aim")
 	assert.Contains(t, repoView, "Active Jobs: 1")
 
 	// Collapse repo node
@@ -1403,4 +1417,226 @@ func TestDashboard_MultiRepoExpansionAndRepoSelection(t *testing.T) {
 	repoNodeAfter := model.tree.FindNode(repoNode.ID)
 	require.NotNil(t, repoNodeAfter)
 	assert.False(t, repoNodeAfter.Expanded, "expected collapsed state to be preserved across snapshot hydration")
+}
+
+func TestDashboard_AlwaysVisibleLiveRepos_ZeroAndNonZeroActive(t *testing.T) {
+	// 1. With 0 active jobs, both configured repos are visible under LIVE RUNS with idle badges
+	snap0 := &monitor.Snapshot{
+		RunnerName: "actr • multi-repo",
+		SupervisorStatus: &monitor.SupervisorStatus{
+			GlobalMaxJobs: 2,
+			GlobalActive:  0,
+			RepoSlots: []*monitor.RepoSlotInfo{
+				{Alias: "cxstatusline", MaxJobs: 1, ActiveJobs: 0, Status: "idle"},
+				{Alias: "aim", MaxJobs: 1, ActiveJobs: 0, Status: "idle"},
+			},
+		},
+		ActiveJobs: []*monitor.JobInfo{},
+	}
+
+	model := NewDashboardModel("/tmp/daemon.sock")
+	model.ready = true
+	_ = model.ApplySnapshot(snap0)
+
+	liveNode := model.getLiveBranch()
+	require.NotNil(t, liveNode)
+	assert.Equal(t, "LIVE RUNS (0 active)", liveNode.Label)
+
+	// Repos should be sorted by alias ascending: aim then cxstatusline
+	require.Len(t, liveNode.Children, 2)
+	assert.Equal(t, "repo:aim", liveNode.Children[0].ID)
+	assert.Equal(t, "aim (idle • 0/1 slots)", liveNode.Children[0].Label)
+	assert.Empty(t, liveNode.Children[0].Children)
+
+	assert.Equal(t, "repo:cxstatusline", liveNode.Children[1].ID)
+	assert.Equal(t, "cxstatusline (idle • 0/1 slots)", liveNode.Children[1].Label)
+	assert.Empty(t, liveNode.Children[1].Children)
+
+	// 2. With 1 active job for aim, aim becomes busy with the job nested, cxstatusline remains idle
+	snap1 := &monitor.Snapshot{
+		RunnerName: "actr • multi-repo",
+		SupervisorStatus: &monitor.SupervisorStatus{
+			GlobalMaxJobs: 2,
+			GlobalActive:  1,
+			RepoSlots: []*monitor.RepoSlotInfo{
+				{Alias: "aim", MaxJobs: 1, ActiveJobs: 1, Status: "busy"},
+				{Alias: "cxstatusline", MaxJobs: 1, ActiveJobs: 0, Status: "idle"},
+			},
+		},
+		ActiveJobs: []*monitor.JobInfo{
+			{
+				ID:        "job-aim-1",
+				Name:      "CI Test",
+				RepoAlias: "aim",
+				Status:    monitor.StatusRunning,
+				Steps: []*monitor.StepInfo{
+					{ID: "step-1", Name: "Run Tests", Status: monitor.StatusRunning},
+				},
+			},
+		},
+	}
+	_ = model.ApplySnapshot(snap1)
+	liveNode = model.getLiveBranch()
+	require.NotNil(t, liveNode)
+
+	assert.Equal(t, "LIVE RUNS (1 active)", liveNode.Label)
+	require.Len(t, liveNode.Children, 2)
+
+	assert.Equal(t, "aim (busy • 1/1 slots)", liveNode.Children[0].Label)
+	require.Len(t, liveNode.Children[0].Children, 1)
+	assert.Equal(t, "job-aim-1", liveNode.Children[0].Children[0].ID)
+	require.Len(t, liveNode.Children[0].Children[0].Children, 1)
+	assert.Equal(t, "step-1", liveNode.Children[0].Children[0].Children[0].ID)
+
+	assert.Equal(t, "cxstatusline (idle • 0/1 slots)", liveNode.Children[1].Label)
+	assert.Empty(t, liveNode.Children[1].Children)
+}
+
+func TestDashboard_HierarchicalHistoricalRuns_GroupedByRepoAlias(t *testing.T) {
+	snap := &monitor.Snapshot{
+		RunnerName: "actr • multi-repo",
+		RecentJobs: []*monitor.JobInfo{
+			{
+				ID:        "hist-1",
+				Name:      "Aim Build",
+				RepoAlias: "aim",
+				Status:    monitor.StatusSuccess,
+			},
+			{
+				ID:        "hist-2",
+				Name:      "CX Lint",
+				RepoAlias: "cxstatusline",
+				Status:    monitor.StatusSuccess,
+			},
+			{
+				ID:        "hist-3",
+				Name:      "Legacy Job",
+				RepoAlias: "", // Empty should fallback to "default"
+				Status:    monitor.StatusFailed,
+			},
+			{
+				ID:        "hist-4",
+				Name:      "Aim Tests",
+				RepoAlias: "aim",
+				Status:    monitor.StatusSuccess,
+			},
+		},
+	}
+
+	model := NewDashboardModel("/tmp/daemon.sock")
+	model.ready = true
+	_ = model.ApplySnapshot(snap)
+
+	histNode := model.getHistoricalBranch()
+	require.NotNil(t, histNode)
+	// 4 total past runs across 3 distinct repo groups
+	assert.Equal(t, "HISTORICAL RUNS (4 past runs)", histNode.Label)
+
+	// Repos sorted alphabetically: aim, cxstatusline, default
+	require.Len(t, histNode.Children, 3)
+
+	// aim
+	aimGroup := histNode.Children[0]
+	assert.Equal(t, "hist-repo:aim", aimGroup.ID)
+	assert.Equal(t, "aim", aimGroup.Label)
+	assert.Equal(t, NodeRepo, aimGroup.NodeType)
+	require.Len(t, aimGroup.Children, 2)
+	assert.Equal(t, "hist-1", aimGroup.Children[0].ID)
+	assert.Equal(t, "hist-4", aimGroup.Children[1].ID)
+
+	// cxstatusline
+	cxGroup := histNode.Children[1]
+	assert.Equal(t, "hist-repo:cxstatusline", cxGroup.ID)
+	assert.Equal(t, "cxstatusline", cxGroup.Label)
+	assert.Equal(t, NodeRepo, cxGroup.NodeType)
+	require.Len(t, cxGroup.Children, 1)
+	assert.Equal(t, "hist-2", cxGroup.Children[0].ID)
+
+	// default
+	defaultGroup := histNode.Children[2]
+	assert.Equal(t, "hist-repo:default", defaultGroup.ID)
+	assert.Equal(t, "default", defaultGroup.Label)
+	assert.Equal(t, NodeRepo, defaultGroup.NodeType)
+	require.Len(t, defaultGroup.Children, 1)
+	assert.Equal(t, "hist-3", defaultGroup.Children[0].ID)
+}
+
+func TestDashboard_NodeTraversalAndStepSelection(t *testing.T) {
+	snap := &monitor.Snapshot{
+		RunnerName: "actr • multi-repo",
+		RecentJobs: []*monitor.JobInfo{
+			{
+				ID:        "job-aim-h1",
+				Name:      "Aim Pipeline",
+				RepoAlias: "aim",
+				Status:    monitor.StatusSuccess,
+				Steps: []*monitor.StepInfo{
+					{ID: "step-aim-s1", Name: "Build Artifact", Status: monitor.StatusSuccess},
+				},
+			},
+		},
+		StepLogs: map[string][]string{
+			"job-aim-h1/step-aim-s1": {"compiled successfully", "exit code 0"},
+		},
+	}
+
+	model := NewDashboardModel("/tmp/daemon.sock")
+	model.width = 100
+	model.height = 30
+	model.ready = true
+	_ = model.ApplySnapshot(snap)
+
+	histSummary := &HistoricalRunSummary{
+		JobName:        "Aim Pipeline",
+		Status:         monitor.StatusSuccess,
+		DurationSec:    45,
+		PeakCPUPercent: 78.5,
+	}
+	model.SetHistoricalRunSummary("job-aim-h1", histSummary)
+
+	// 1. Select the repo group node: HUD should NOT treat it as a job
+	foundRepo := model.tree.SelectFirst(func(n *TreeNode) bool { return n.ID == "hist-repo:aim" })
+	require.True(t, foundRepo)
+	_ = model.updateActiveStepLogs()
+	assert.Nil(t, findHistoricalJobNode(model.tree.SelectedNode()))
+	assert.False(t, model.telemetry.IsHistorical())
+
+	// Viewport should show historical repository info
+	repoView := model.viewport.View()
+	assert.Contains(t, repoView, "Repository: aim")
+	assert.Contains(t, repoView, "Historical Runs: 1")
+
+	// 2. Select the historical job node: HUD switches to historical Peak Vitals mode
+	foundJob := model.tree.SelectFirst(func(n *TreeNode) bool { return n.ID == "job-aim-h1" })
+	require.True(t, foundJob)
+	_ = model.updateActiveStepLogs()
+	assert.Equal(t, "job-aim-h1", findHistoricalJobNode(model.tree.SelectedNode()).ID)
+	assert.True(t, model.telemetry.IsHistorical())
+
+	// 3. Expand the job and select its step: step node resolves enclosing parent job through repo branch
+	jobNode := model.tree.FindNode("job-aim-h1")
+	require.NotNil(t, jobNode)
+	jobNode.Expanded = true
+	model.tree.Rebuild()
+
+	foundStep := model.tree.SelectFirst(func(n *TreeNode) bool { return n.ID == "step-aim-s1" })
+	require.True(t, foundStep)
+	_ = model.updateActiveStepLogs()
+
+	stepNode := model.tree.SelectedNode()
+	require.NotNil(t, stepNode)
+	assert.Equal(t, "step-aim-s1", stepNode.ID)
+
+	// Traversal resolves enclosing job
+	resolvedJob := findHistoricalJobNode(stepNode)
+	require.NotNil(t, resolvedJob)
+	assert.Equal(t, "job-aim-h1", resolvedJob.ID)
+
+	// HUD stays in Historical mode for the enclosing job
+	assert.True(t, model.telemetry.IsHistorical())
+
+	// Viewport contains step logs resolved by jobID/stepID key
+	vp := model.viewport.View()
+	assert.Contains(t, vp, "compiled successfully")
+	assert.Contains(t, vp, "exit code 0")
 }

@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -78,8 +79,9 @@ type DashboardModel struct {
 	historicalSummaries map[string]*HistoricalRunSummary
 	seenRepoExpansion   map[string]bool
 
-	historyStore monitor.HistoryStore
-	isOffline    bool
+	historyStore     monitor.HistoryStore
+	supervisorStatus *monitor.SupervisorStatus
+	isOffline        bool
 
 	events <-chan monitor.Event
 	errs   <-chan error
@@ -666,6 +668,7 @@ func (m *DashboardModel) applySnapshot(snap *monitor.Snapshot) tea.Cmd {
 		m.telemetry.Update(snap.Telemetry)
 	}
 	if snap.SupervisorStatus != nil {
+		m.supervisorStatus = snap.SupervisorStatus
 		m.telemetry.SetSupervisorStatus(snap.SupervisorStatus)
 	}
 	for stepKey, lines := range snap.StepLogs {
@@ -750,6 +753,24 @@ func (m *DashboardModel) ensureBranches() (*TreeNode, *TreeNode) {
 	return live, hist
 }
 
+func formatRepoSlotLabel(alias, status string, active, max int) string {
+	if status == "" {
+		if active > 0 {
+			status = "busy"
+		} else {
+			status = "idle"
+		}
+	}
+	if max <= 0 {
+		if active > 0 {
+			max = active
+		} else {
+			max = 1
+		}
+	}
+	return fmt.Sprintf("%s (%s • %d/%d slots)", alias, status, active, max)
+}
+
 func (m *DashboardModel) updateBranchLabels() {
 	live := m.getLiveBranch()
 	if live != nil {
@@ -765,11 +786,60 @@ func (m *DashboardModel) updateBranchLabels() {
 				}
 			}
 			live.Label = fmt.Sprintf("LIVE RUNS (%d active)", activeCount)
+
+			if m.supervisorStatus != nil {
+				for _, ch := range live.Children {
+					if ch.NodeType == NodeRepo {
+						alias := strings.TrimPrefix(ch.ID, "repo:")
+						var slot *monitor.RepoSlotInfo
+						for _, s := range m.supervisorStatus.RepoSlots {
+							if s.Alias == alias {
+								slot = s
+								break
+							}
+						}
+						active := len(ch.Children)
+						max := 1
+						status := "idle"
+						if slot != nil {
+							max = slot.MaxJobs
+							status = slot.Status
+						}
+						if status == "" {
+							if active > 0 {
+								status = "busy"
+							} else {
+								status = "idle"
+							}
+						} else if active > 0 && status == "idle" {
+							status = "busy"
+						} else if active == 0 && status == "busy" {
+							status = "idle"
+						}
+						if max <= 0 {
+							if active > 0 {
+								max = active
+							} else {
+								max = 1
+							}
+						}
+						ch.Label = formatRepoSlotLabel(alias, status, active, max)
+					}
+				}
+			}
 		}
 	}
 	hist := m.getHistoricalBranch()
 	if hist != nil {
-		hist.Label = fmt.Sprintf("HISTORICAL RUNS (%d past runs)", len(hist.Children))
+		totalPastRuns := 0
+		for _, ch := range hist.Children {
+			if ch.NodeType == NodeRepo {
+				totalPastRuns += len(ch.Children)
+			} else {
+				totalPastRuns++
+			}
+		}
+		hist.Label = fmt.Sprintf("HISTORICAL RUNS (%d past runs)", totalPastRuns)
 	}
 }
 
@@ -783,12 +853,20 @@ func isHistoricalNode(node *TreeNode) bool {
 }
 
 func findHistoricalJobNode(sel *TreeNode) *TreeNode {
-	if sel == nil || sel.ID == "historical-runs" || sel.ID == "root" || sel.ID == "live-runs" {
+	if sel == nil || !isHistoricalNode(sel) {
 		return nil
 	}
-	for curr := sel; curr != nil; curr = curr.Parent {
-		if curr.Parent != nil && curr.Parent.ID == "historical-runs" {
-			return curr
+	if sel.ID == "historical-runs" || sel.NodeType == NodeRepo || sel.NodeType == NodeBranch {
+		return nil
+	}
+	if job := sel.FindParentJob(); job != nil {
+		return job
+	}
+	for curr := sel; curr != nil && curr.ID != "historical-runs"; curr = curr.Parent {
+		if curr.Parent != nil && (curr.Parent.ID == "historical-runs" || curr.Parent.NodeType == NodeRepo) {
+			if curr.NodeType != NodeRepo && curr.ID != "historical-runs" {
+				return curr
+			}
 		}
 	}
 	return nil
@@ -913,15 +991,6 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 		NodeType: NodeBranch,
 	}
 
-	existingHistJobs := make(map[string]*TreeNode)
-	var existingHistOrder []*TreeNode
-	if oldHist := m.getHistoricalBranch(); oldHist != nil {
-		for _, ch := range oldHist.Children {
-			existingHistJobs[ch.ID] = ch
-			existingHistOrder = append(existingHistOrder, ch)
-		}
-	}
-
 	isMultiRepo := snap.SupervisorStatus != nil
 	if !isMultiRepo {
 		for _, job := range snap.ActiveJobs {
@@ -932,7 +1001,155 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 		}
 	}
 
-	if isMultiRepo {
+	if snap.SupervisorStatus != nil && len(snap.SupervisorStatus.RepoSlots) > 0 {
+		slots := make([]*monitor.RepoSlotInfo, len(snap.SupervisorStatus.RepoSlots))
+		copy(slots, snap.SupervisorStatus.RepoSlots)
+		sort.Slice(slots, func(i, j int) bool {
+			return slots[i].Alias < slots[j].Alias
+		})
+
+		repoJobs := make(map[string][]*monitor.JobInfo)
+		for _, job := range snap.ActiveJobs {
+			if job == nil {
+				continue
+			}
+			matchedAlias := ""
+			for _, s := range slots {
+				if job.RepoAlias != "" && s.Alias == job.RepoAlias {
+					matchedAlias = s.Alias
+					break
+				}
+				if job.Repo != "" && (s.Alias == job.Repo || strings.HasSuffix(job.Repo, "/"+s.Alias)) {
+					matchedAlias = s.Alias
+					break
+				}
+			}
+			if matchedAlias == "" {
+				matchedAlias = job.RepoAlias
+				if matchedAlias == "" {
+					matchedAlias = job.Repo
+				}
+				if matchedAlias == "" {
+					matchedAlias = "default"
+				}
+			}
+			repoJobs[matchedAlias] = append(repoJobs[matchedAlias], job)
+		}
+
+		for _, slot := range slots {
+			jobs := repoJobs[slot.Alias]
+			activeCount := len(jobs)
+			status := slot.Status
+			if status == "" {
+				if activeCount > 0 {
+					status = "busy"
+				} else {
+					status = "idle"
+				}
+			} else if activeCount > 0 && status == "idle" {
+				status = "busy"
+			} else if activeCount == 0 && status == "busy" {
+				status = "idle"
+			}
+			max := slot.MaxJobs
+			if max <= 0 {
+				if activeCount > 0 {
+					max = activeCount
+				} else {
+					max = 1
+				}
+			}
+			label := formatRepoSlotLabel(slot.Alias, status, activeCount, max)
+			repoID := "repo:" + slot.Alias
+			expanded := true
+			if exp, ok := m.seenRepoExpansion[repoID]; ok {
+				expanded = exp
+			}
+			repoNode := &TreeNode{
+				ID:       repoID,
+				Label:    label,
+				Expanded: expanded,
+				NodeType: NodeRepo,
+				Data:     slot,
+			}
+			for _, job := range jobs {
+				jobNode := &TreeNode{
+					ID:       job.ID,
+					Label:    job.Name,
+					Status:   job.Status,
+					Expanded: true,
+					NodeType: NodeJob,
+					Data:     job,
+				}
+				for _, step := range job.Steps {
+					if step != nil {
+						stepNode := &TreeNode{
+							ID:       step.ID,
+							Label:    step.Name,
+							Status:   step.Status,
+							NodeType: NodeStep,
+						}
+						jobNode.AddChild(stepNode)
+					}
+				}
+				repoNode.AddChild(jobNode)
+			}
+			liveNode.AddChild(repoNode)
+		}
+
+		// Also handle any active jobs that didn't match any configured slot
+		var unconfiguredAliases []string
+		for alias := range repoJobs {
+			isConfigured := false
+			for _, s := range slots {
+				if s.Alias == alias {
+					isConfigured = true
+					break
+				}
+			}
+			if !isConfigured {
+				unconfiguredAliases = append(unconfiguredAliases, alias)
+			}
+		}
+		sort.Strings(unconfiguredAliases)
+		for _, alias := range unconfiguredAliases {
+			jobs := repoJobs[alias]
+			repoID := "repo:" + alias
+			expanded := true
+			if exp, ok := m.seenRepoExpansion[repoID]; ok {
+				expanded = exp
+			}
+			repoNode := &TreeNode{
+				ID:       repoID,
+				Label:    alias,
+				Expanded: expanded,
+				NodeType: NodeRepo,
+			}
+			for _, job := range jobs {
+				jobNode := &TreeNode{
+					ID:       job.ID,
+					Label:    job.Name,
+					Status:   job.Status,
+					Expanded: true,
+					NodeType: NodeJob,
+					Data:     job,
+				}
+				for _, step := range job.Steps {
+					if step != nil {
+						stepNode := &TreeNode{
+							ID:       step.ID,
+							Label:    step.Name,
+							Status:   step.Status,
+							NodeType: NodeStep,
+						}
+						jobNode.AddChild(stepNode)
+					}
+				}
+				repoNode.AddChild(jobNode)
+			}
+			liveNode.AddChild(repoNode)
+		}
+	} else if isMultiRepo {
 		repoJobs := make(map[string][]*monitor.JobInfo)
 		var repoOrder []string
 
@@ -1028,47 +1245,134 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 		}
 	}
 
+	existingHistJobs := make(map[string]*TreeNode)
+	type histEntry struct {
+		alias string
+		node  *TreeNode
+	}
+	var existingHistOrder []histEntry
+	if oldHist := m.getHistoricalBranch(); oldHist != nil {
+		for _, ch := range oldHist.Children {
+			if ch.NodeType == NodeRepo {
+				alias := ch.Label
+				for _, jNode := range ch.Children {
+					existingHistJobs[jNode.ID] = jNode
+					existingHistOrder = append(existingHistOrder, histEntry{alias: alias, node: jNode})
+				}
+			} else {
+				existingHistJobs[ch.ID] = ch
+				existingHistOrder = append(existingHistOrder, histEntry{alias: "default", node: ch})
+			}
+		}
+	}
+
+	histRepoJobs := make(map[string][]*monitor.JobInfo)
+	var histRepoAliases []string
+	seenAliases := make(map[string]bool)
 	seenHistIDs := make(map[string]bool)
+
 	for _, job := range snap.RecentJobs {
 		if job == nil {
 			continue
 		}
 		seenHistIDs[job.ID] = true
-		expanded := false
-		if oldJob, ok := existingHistJobs[job.ID]; ok {
-			expanded = oldJob.Expanded
+		alias := job.RepoAlias
+		if alias == "" {
+			alias = "default"
 		}
-		jobNode := &TreeNode{
-			ID:       job.ID,
-			Label:    job.Name,
-			Status:   job.Status,
-			Expanded: expanded,
-			NodeType: NodeJob,
-			Data:     job,
+		if !seenAliases[alias] {
+			seenAliases[alias] = true
+			histRepoAliases = append(histRepoAliases, alias)
 		}
-		for _, step := range job.Steps {
-			if step != nil {
-				stepNode := &TreeNode{
-					ID:       step.ID,
-					Label:    step.Name,
-					Status:   step.Status,
-					NodeType: NodeStep,
-				}
-				jobNode.AddChild(stepNode)
+		histRepoJobs[alias] = append(histRepoJobs[alias], job)
+	}
+
+	// Also check preserved jobs from previous tree
+	for _, entry := range existingHistOrder {
+		jobID := entry.node.ID
+		if !seenHistIDs[jobID] {
+			seenHistIDs[jobID] = true
+			alias := entry.alias
+			if alias == "" {
+				alias = "default"
+			}
+			if !seenAliases[alias] {
+				seenAliases[alias] = true
+				histRepoAliases = append(histRepoAliases, alias)
 			}
 		}
-		histNode.AddChild(jobNode)
 	}
 
-	// Preserve existing historical runs that were loaded but not present in the new snapshot
-	for _, oldJob := range existingHistOrder {
-		if !seenHistIDs[oldJob.ID] {
-			seenHistIDs[oldJob.ID] = true
-			histNode.AddChild(oldJob)
+	sort.Strings(histRepoAliases)
+
+	for _, alias := range histRepoAliases {
+		repoID := "hist-repo:" + alias
+		expanded := true
+		if exp, ok := m.seenRepoExpansion[repoID]; ok {
+			expanded = exp
+		}
+		repoNode := &TreeNode{
+			ID:       repoID,
+			Label:    alias,
+			Expanded: expanded,
+			NodeType: NodeRepo,
+		}
+
+		for _, job := range histRepoJobs[alias] {
+			expanded := false
+			if oldJob, ok := existingHistJobs[job.ID]; ok {
+				expanded = oldJob.Expanded
+			}
+			jobNode := &TreeNode{
+				ID:       job.ID,
+				Label:    job.Name,
+				Status:   job.Status,
+				Expanded: expanded,
+				NodeType: NodeJob,
+				Data:     job,
+			}
+			for _, step := range job.Steps {
+				if step != nil {
+					stepNode := &TreeNode{
+						ID:       step.ID,
+						Label:    step.Name,
+						Status:   step.Status,
+						NodeType: NodeStep,
+					}
+					jobNode.AddChild(stepNode)
+				}
+			}
+			repoNode.AddChild(jobNode)
+		}
+
+		// Preserve any older jobs not in snapshot for this repo alias
+		for _, entry := range existingHistOrder {
+			if entry.alias == alias {
+				inJobs := false
+				for _, j := range histRepoJobs[alias] {
+					if j.ID == entry.node.ID {
+						inJobs = true
+						break
+					}
+				}
+				if !inJobs {
+					repoNode.AddChild(entry.node)
+				}
+			}
+		}
+
+		histNode.AddChild(repoNode)
+	}
+
+	totalHistRuns := 0
+	for _, ch := range histNode.Children {
+		if ch.NodeType == NodeRepo {
+			totalHistRuns += len(ch.Children)
+		} else {
+			totalHistRuns++
 		}
 	}
-
-	histNode.Label = fmt.Sprintf("HISTORICAL RUNS (%d past runs)", len(histNode.Children))
+	histNode.Label = fmt.Sprintf("HISTORICAL RUNS (%d past runs)", totalHistRuns)
 
 	root.AddChild(liveNode)
 	root.AddChild(histNode)
@@ -1163,7 +1467,7 @@ func (m *DashboardModel) handleJobStart(job *monitor.JobInfo) {
 		return
 	}
 	live, _ := m.ensureBranches()
-	isMulti := (job.Repo != "" || job.RepoAlias != "")
+	isMulti := (m.supervisorStatus != nil) || (job.Repo != "" || job.RepoAlias != "")
 	if !isMulti {
 		for _, ch := range live.Children {
 			if ch.NodeType == NodeRepo {
@@ -1175,17 +1479,17 @@ func (m *DashboardModel) handleJobStart(job *monitor.JobInfo) {
 
 	parentNode := live
 	if isMulti {
-		repoKey := job.Repo
-		if repoKey == "" {
-			repoKey = job.RepoAlias
+		repoAlias := job.RepoAlias
+		if repoAlias == "" {
+			repoAlias = job.Repo
 		}
-		if repoKey == "" {
-			repoKey = "default"
+		if repoAlias == "" {
+			repoAlias = "default"
 		}
-		repoID := "repo:" + repoKey
+		repoID := "repo:" + repoAlias
 		var repoNode *TreeNode
 		for _, ch := range live.Children {
-			if ch.ID == repoID {
+			if ch.ID == repoID || (ch.NodeType == NodeRepo && (strings.TrimPrefix(ch.ID, "repo:") == repoAlias || ch.Label == repoAlias || strings.HasPrefix(ch.Label, repoAlias+" "))) {
 				repoNode = ch
 				break
 			}
@@ -1195,9 +1499,13 @@ func (m *DashboardModel) handleJobStart(job *monitor.JobInfo) {
 			if exp, ok := m.seenRepoExpansion[repoID]; ok {
 				expanded = exp
 			}
+			label := repoAlias
+			if m.supervisorStatus != nil {
+				label = formatRepoSlotLabel(repoAlias, "busy", 1, 1)
+			}
 			repoNode = &TreeNode{
 				ID:       repoID,
-				Label:    repoKey,
+				Label:    label,
 				Expanded: expanded,
 				NodeType: NodeRepo,
 			}
@@ -1271,7 +1579,7 @@ func (m *DashboardModel) handleJobFinish(jobID string, job *monitor.JobInfo) tea
 				if sub.ID == jobID || (job != nil && sub.ID == job.ID) {
 					target = sub
 					ch.Children = append(ch.Children[:j], ch.Children[j+1:]...)
-					if len(ch.Children) == 0 {
+					if m.supervisorStatus == nil && len(ch.Children) == 0 {
 						live.Children = append(live.Children[:i], live.Children[i+1:]...)
 					}
 					break
@@ -1287,12 +1595,13 @@ func (m *DashboardModel) handleJobFinish(jobID string, job *monitor.JobInfo) tea
 
 	if target == nil {
 		// Check if already in historical branch
-		for _, ch := range hist.Children {
-			if ch.ID == jobID || (job != nil && ch.ID == job.ID) {
-				target = ch
-				break
+		hist.Walk(func(n *TreeNode) bool {
+			if n.ID == jobID || (job != nil && n.ID == job.ID) {
+				target = n
+				return false
 			}
-		}
+			return true
+		})
 		if target == nil {
 			label := jobID
 			status := monitor.StatusSuccess
@@ -1348,16 +1657,54 @@ func (m *DashboardModel) handleJobFinish(jobID string, job *monitor.JobInfo) tea
 		}
 	}
 
-	alreadyInHist := false
+	// Group into repo node in HISTORICAL RUNS
+	alias := "default"
+	if job != nil && job.RepoAlias != "" {
+		alias = job.RepoAlias
+	} else if job != nil && job.Repo != "" {
+		alias = job.Repo
+	} else if target.Data != nil {
+		if ji, ok := target.Data.(*monitor.JobInfo); ok && ji != nil {
+			if ji.RepoAlias != "" {
+				alias = ji.RepoAlias
+			} else if ji.Repo != "" {
+				alias = ji.Repo
+			}
+		}
+	}
+
+	histRepoID := "hist-repo:" + alias
+	var repoNode *TreeNode
 	for _, ch := range hist.Children {
-		if ch == target {
+		if ch.ID == histRepoID || (ch.NodeType == NodeRepo && ch.Label == alias) {
+			repoNode = ch
+			break
+		}
+	}
+	if repoNode == nil {
+		expanded := true
+		if exp, ok := m.seenRepoExpansion[histRepoID]; ok {
+			expanded = exp
+		}
+		repoNode = &TreeNode{
+			ID:       histRepoID,
+			Label:    alias,
+			Expanded: expanded,
+			NodeType: NodeRepo,
+		}
+		hist.AddChild(repoNode)
+	}
+
+	alreadyInHist := false
+	for _, ch := range repoNode.Children {
+		if ch.ID == target.ID {
 			alreadyInHist = true
 			break
 		}
 	}
 	if !alreadyInHist {
-		target.Parent = hist
-		hist.Children = append([]*TreeNode{target}, hist.Children...)
+		target.Parent = repoNode
+		repoNode.Children = append([]*TreeNode{target}, repoNode.Children...)
 	}
 
 	m.updateBranchLabels()
@@ -1417,12 +1764,13 @@ func (m *DashboardModel) upsertStepNode(jobID string, step *monitor.StepInfo) {
 				}
 			}
 			if parentJob == nil {
-				for _, ch := range hist.Children {
-					if ch.ID == "active-job" || ch.ID == "job" {
-						parentJob = ch
-						break
+				hist.Walk(func(n *TreeNode) bool {
+					if n.ID == "active-job" || n.ID == "job" {
+						parentJob = n
+						return false
 					}
-				}
+					return true
+				})
 			}
 			if parentJob == nil {
 				parentJob = &TreeNode{
@@ -1489,18 +1837,30 @@ func (m *DashboardModel) renderRepoState(sel *TreeNode) string {
 		return ""
 	}
 	title := sel.Label
-	activeCount := len(sel.Children)
+	jobCount := len(sel.Children)
 	var sb strings.Builder
 	sb.WriteString("\n")
 	fmt.Fprintf(&sb, "  Repository: %s\n", title)
-	fmt.Fprintf(&sb, "  Active Jobs: %d\n", activeCount)
-	if activeCount > 0 {
-		sb.WriteString("  Jobs:\n")
-		for _, j := range sel.Children {
-			fmt.Fprintf(&sb, "    • %s [%s]\n", j.Label, j.Status)
+	if isHistoricalNode(sel) {
+		fmt.Fprintf(&sb, "  Historical Runs: %d\n", jobCount)
+		if jobCount > 0 {
+			sb.WriteString("  Runs:\n")
+			for _, j := range sel.Children {
+				fmt.Fprintf(&sb, "    • %s [%s]\n", j.Label, j.Status)
+			}
+		} else {
+			sb.WriteString("  Status: No historical runs recorded\n")
 		}
 	} else {
-		sb.WriteString("  Status: Idle (no active jobs running)\n")
+		fmt.Fprintf(&sb, "  Active Jobs: %d\n", jobCount)
+		if jobCount > 0 {
+			sb.WriteString("  Jobs:\n")
+			for _, j := range sel.Children {
+				fmt.Fprintf(&sb, "    • %s [%s]\n", j.Label, j.Status)
+			}
+		} else {
+			sb.WriteString("  Status: Idle (no active jobs running)\n")
+		}
 	}
 	return sb.String()
 }
@@ -1520,9 +1880,14 @@ func (m *DashboardModel) updateActiveStepLogs() tea.Cmd {
 		}
 
 		var lines []string
-		hasParentJob := sel.NodeType == NodeStep || (sel.Parent != nil && sel.Parent.NodeType == NodeJob) || (sel.Parent != nil && sel.Parent.ID != "" && sel.Parent.ID != "root" && sel.Parent.ID != "live-runs" && sel.Parent.ID != "historical-runs" && sel.Parent.NodeType != NodeRepo)
-		if hasParentJob && sel.Parent != nil {
-			lines = m.stepLogs[sel.Parent.ID+"/"+sel.ID]
+		parentJob := sel.FindParentJob()
+		if sel.NodeType == NodeStep && parentJob != nil {
+			lines = m.stepLogs[parentJob.ID+"/"+sel.ID]
+			if len(lines) == 0 && !isHistoricalNode(sel) {
+				lines = m.stepLogs[sel.ID]
+			}
+		} else if parentJob != nil && sel != parentJob {
+			lines = m.stepLogs[parentJob.ID+"/"+sel.ID]
 			if len(lines) == 0 && !isHistoricalNode(sel) {
 				lines = m.stepLogs[sel.ID]
 			}
@@ -1539,8 +1904,8 @@ func (m *DashboardModel) updateActiveStepLogs() tea.Cmd {
 		}
 
 		// If logs are not in memory, check if this is a historical step
-		if isHistoricalNode(sel) && sel.Parent != nil && sel.Parent.ID != "" && sel.Parent.ID != "historical-runs" && sel.Parent.NodeType != NodeRepo {
-			jobID := sel.Parent.ID
+		if isHistoricalNode(sel) && sel.NodeType == NodeStep && parentJob != nil {
+			jobID := parentJob.ID
 			stepID := sel.ID
 			// In offline mode with a direct history store, read immediately without IPC
 			if m.isOffline && m.historyStore != nil {

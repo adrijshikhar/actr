@@ -52,6 +52,46 @@ func (n *TreeNode) Walk(fn func(node *TreeNode) bool) {
 	}
 }
 
+// FindParentJob walks up the tree from n and returns the enclosing NodeJob, or nil if none found.
+// If n itself is a NodeJob, it returns n.
+func (n *TreeNode) FindParentJob() *TreeNode {
+	if n == nil {
+		return nil
+	}
+	if n.NodeType == NodeJob {
+		return n
+	}
+	for curr := n.Parent; curr != nil; curr = curr.Parent {
+		if curr.NodeType == NodeJob {
+			return curr
+		}
+		if curr.NodeType == NodeBranch || curr.ID == "root" || curr.ID == "live-runs" || curr.ID == "historical-runs" {
+			break
+		}
+	}
+	return nil
+}
+
+// FindParentRepo walks up the tree from n and returns the enclosing NodeRepo, or nil if none found.
+// If n itself is a NodeRepo, it returns n.
+func (n *TreeNode) FindParentRepo() *TreeNode {
+	if n == nil {
+		return nil
+	}
+	if n.NodeType == NodeRepo {
+		return n
+	}
+	for curr := n.Parent; curr != nil; curr = curr.Parent {
+		if curr.NodeType == NodeRepo {
+			return curr
+		}
+		if curr.NodeType == NodeBranch || curr.ID == "root" || curr.ID == "live-runs" || curr.ID == "historical-runs" {
+			break
+		}
+	}
+	return nil
+}
+
 // FlatRow holds a flattened tree node with its display depth.
 type FlatRow struct {
 	Node  *TreeNode
