@@ -280,12 +280,16 @@ func TestMultiRepo_EndToEnd_ConcurrentDispatch(t *testing.T) {
 	// Verify peak concurrent execution reached 2
 	assert.Equal(t, int32(2), peakExecuting.Load(), "both repositories should execute concurrently")
 
+	// Allow supervisor sync ticker to record post-execution idle state
+	time.Sleep(600 * time.Millisecond)
+
 	// Verify IPC snapshot status
 	client := monitor.NewClient(sockPath)
 	snap, err := client.GetSnapshot(context.Background())
 	require.NoError(t, err)
 	require.NotNil(t, snap.SupervisorStatus)
 	assert.Equal(t, 2, snap.SupervisorStatus.GlobalMaxJobs)
+	assert.Equal(t, 0, snap.SupervisorStatus.GlobalActive)
 
 	slots := make(map[string]*monitor.RepoSlotInfo)
 	for _, s := range snap.SupervisorStatus.RepoSlots {
@@ -293,6 +297,10 @@ func TestMultiRepo_EndToEnd_ConcurrentDispatch(t *testing.T) {
 	}
 	assert.Contains(t, slots, "aim")
 	assert.Contains(t, slots, "cxstatusline")
+	assert.Equal(t, 0, slots["aim"].ActiveJobs)
+	assert.Equal(t, "idle", slots["aim"].Status)
+	assert.Equal(t, 0, slots["cxstatusline"].ActiveJobs)
+	assert.Equal(t, "idle", slots["cxstatusline"].Status)
 
 	// Trigger graceful cancellation
 	cancel()

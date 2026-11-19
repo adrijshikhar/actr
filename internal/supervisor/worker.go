@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/adrijshikhar/actr/internal/config"
@@ -57,6 +58,7 @@ type RepoWorker struct {
 	runServiceClient RunServiceClientInterface
 	coordinator      JobExecutor
 	repoSem          chan struct{}
+	executingJobs    atomic.Int32
 	workFolder       string
 	serverURL        string
 	token            string
@@ -129,6 +131,9 @@ func NewRepoWorker(alias string, repoCfg config.RepoConfig, resMgr *ResourceMana
 	if w.workFolder == "" {
 		w.workFolder = "_work"
 	}
+	if !filepath.IsAbs(w.workFolder) && repoCfg.ConfigDir != "" {
+		w.workFolder = filepath.Join(repoCfg.ConfigDir, w.workFolder)
+	}
 
 	if w.coordinator == nil {
 		var protoRunClient *protocol.RunServiceClient
@@ -176,9 +181,7 @@ func (w *RepoWorker) ActiveJobs() int {
 	if w == nil {
 		return 0
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return len(w.repoSem)
+	return int(w.executingJobs.Load())
 }
 
 // Start begins the repository worker polling loop in a background goroutine.
@@ -358,9 +361,11 @@ func (w *RepoWorker) runLoop(ctx context.Context, pollingCtx context.Context) {
 		}
 
 		// Execute job in background goroutine with local slot held and jobWg tracking
+		w.executingJobs.Add(1)
 		w.jobWg.Add(1)
 		go func(ref JobRequestReference) {
 			defer w.jobWg.Done()
+			defer w.executingJobs.Add(-1)
 			defer func() { <-w.repoSem }()
 			_ = w.executeWithGuards(ctx, ref, func() error {
 				return w.dispatchJob(ctx, ref)
