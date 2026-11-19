@@ -98,6 +98,9 @@ func NewRepoWorker(alias string, repoCfg config.RepoConfig, resMgr *ResourceMana
 			runnerCfg, _ := config.LoadRunnerConfig(repoCfg.ConfigDir)
 			if runnerCfg != nil {
 				w.workFolder = runnerCfg.WorkFolder
+				if !filepath.IsAbs(w.workFolder) && repoCfg.ConfigDir != "" {
+					w.workFolder = filepath.Join(repoCfg.ConfigDir, w.workFolder)
+				}
 				w.serverURL = runnerCfg.ServerURL
 				w.agentName = runnerCfg.AgentName
 				w.agentID = runnerCfg.AgentID
