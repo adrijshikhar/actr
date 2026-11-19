@@ -1622,7 +1622,7 @@ func evaluateExpression(expr string, ctx map[string]any) string {
 	if strings.Contains(trimmed, "${{") && strings.Contains(trimmed, "}}") {
 		startIdx := strings.Index(trimmed, "${{")
 		endIdx := strings.Index(trimmed, "}}")
-		if !(startIdx == 0 && endIdx == len(trimmed)-2 && strings.Count(trimmed, "${{") == 1) {
+		if startIdx != 0 || endIdx != len(trimmed)-2 || strings.Count(trimmed, "${{") != 1 {
 			var sb strings.Builder
 			remaining := trimmed
 			for {
