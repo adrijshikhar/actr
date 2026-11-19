@@ -591,3 +591,31 @@ func TestTelemetryWidget_HistoricalMode_ViewCompact(t *testing.T) {
 	assert.Contains(t, viewCompact, "PEAK RAM:")
 	assert.Contains(t, viewCompact, "compact-hist")
 }
+
+func TestTelemetryWidget_SupervisorSlots(t *testing.T) {
+	tw := NewTelemetryWidget()
+	status := &monitor.SupervisorStatus{
+		GlobalMaxJobs: 2,
+		GlobalActive:  1,
+		RepoSlots: []*monitor.RepoSlotInfo{
+			{Alias: "aim", MaxJobs: 1, ActiveJobs: 1, Status: "busy"},
+			{Alias: "cxstatusline", MaxJobs: 1, ActiveJobs: 0, Status: "idle"},
+		},
+	}
+	tw.SetSupervisorStatus(status)
+
+	// 1. Idle state rendering
+	idleView := tw.View(80)
+	assert.Contains(t, idleView, "ACTIVE: aim (1/1 slots), cxstatusline (0/1 slots)")
+	idleCompact := tw.ViewCompact(80)
+	assert.Contains(t, idleCompact, "aim (1/1 slots)")
+
+	// 2. Active state rendering
+	tw.Update(&monitor.RunnerMetrics{
+		PID:          1234,
+		StepCPU:      40.0,
+		StepRSSBytes: 200 * 1024 * 1024,
+	})
+	activeView := tw.View(80)
+	assert.Contains(t, activeView, "ACTIVE: aim (1/1 slots), cxstatusline (0/1 slots)")
+}

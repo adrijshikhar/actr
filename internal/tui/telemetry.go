@@ -48,13 +48,14 @@ var (
 // TelemetryWidget renders real-time process and host resource telemetry gauges,
 // including CPU percentage, RSS memory consumption, and disk metrics.
 type TelemetryWidget struct {
-	cpuProg    progress.Model
-	memProg    progress.Model
-	diskProg   progress.Model
-	sample     *monitor.TelemetrySample
-	limits     *config.LimitsConfig
-	historical *HistoricalRunSummary
-	offline    bool
+	cpuProg          progress.Model
+	memProg          progress.Model
+	diskProg         progress.Model
+	sample           *monitor.TelemetrySample
+	limits           *config.LimitsConfig
+	historical       *HistoricalRunSummary
+	offline          bool
+	supervisorStatus *monitor.SupervisorStatus
 }
 
 // HistoricalRunSummary captures execution metadata and aggregate peak vitals for a historical run.
@@ -188,6 +189,27 @@ func formatBytes(b uint64) string {
 	return fmt.Sprintf("%.1f %cB", val, "KMGTPE"[exp])
 }
 
+// SetSupervisorStatus sets the multi-repo supervisor status for rendering slot summary.
+func (tw *TelemetryWidget) SetSupervisorStatus(status *monitor.SupervisorStatus) {
+	if tw == nil {
+		return
+	}
+	tw.supervisorStatus = status
+}
+
+func (tw *TelemetryWidget) formatSlotSummary() string {
+	if tw == nil || tw.supervisorStatus == nil || len(tw.supervisorStatus.RepoSlots) == 0 {
+		return ""
+	}
+	var slotParts []string
+	for _, slot := range tw.supervisorStatus.RepoSlots {
+		if slot != nil {
+			slotParts = append(slotParts, fmt.Sprintf("%s (%d/%d slots)", slot.Alias, slot.ActiveJobs, slot.MaxJobs))
+		}
+	}
+	return statKeyStyle.Render("ACTIVE: ") + statValStyle.Render(strings.Join(slotParts, ", "))
+}
+
 // View renders the telemetry widget into a monospace tabular HUD:
 // Line 1: ∿ SYSTEM VITALS & RADAR with status pill (● ACTIVE or ● IDLE)
 // Line 2: Monospace metadata with STEP, PID, TIME, and TRACE
@@ -224,12 +246,13 @@ func (tw *TelemetryWidget) View(width int) string {
 		metaLine := dimStyle.Render("PID: - | PGID: - | Host CPU: 0.0%")
 		statusLine := statKeyStyle.Render("STATUS: ") + statValStyle.Render("Awaiting step execution telemetry...")
 
-		return lipgloss.JoinVertical(lipgloss.Left,
-			topLine,
-			metaLine,
-			statusLine,
-			stateLine,
-		)
+		idleLines := []string{topLine, metaLine}
+		if slotSummary := tw.formatSlotSummary(); slotSummary != "" {
+			idleLines = append(idleLines, slotSummary)
+		}
+		idleLines = append(idleLines, statusLine, stateLine)
+
+		return lipgloss.JoinVertical(lipgloss.Left, idleLines...)
 	}
 
 	header := radarTitleStyle.Render("∿ SYSTEM VITALS & RADAR")
@@ -381,10 +404,11 @@ func (tw *TelemetryWidget) View(width int) string {
 	lines := []string{
 		topLine,
 		metaLine,
-		cpuLine,
-		memLine,
-		diskLine,
 	}
+	if slotSummary := tw.formatSlotSummary(); slotSummary != "" {
+		lines = append(lines, slotSummary)
+	}
+	lines = append(lines, cpuLine, memLine, diskLine)
 
 	if tw.sample.NetRxRate > 0 || tw.sample.NetTxRate > 0 || tw.sample.DiskWriteRate > 0 {
 		var ioParts []string
@@ -425,6 +449,9 @@ func (tw *TelemetryWidget) ViewCompact(width int) string {
 			subLine = dimStyle.Render("Awaiting step execution telemetry...")
 		}
 		topLine := header + " " + pill
+		if slotSummary := tw.formatSlotSummary(); slotSummary != "" {
+			return lipgloss.JoinVertical(lipgloss.Left, topLine, slotSummary, subLine)
+		}
 		return lipgloss.JoinVertical(lipgloss.Left, topLine, subLine)
 	}
 

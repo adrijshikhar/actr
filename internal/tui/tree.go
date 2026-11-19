@@ -8,6 +8,16 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
+// TreeNodeType represents the type and semantic level of a node in the tree hierarchy.
+type TreeNodeType int
+
+const (
+	NodeBranch TreeNodeType = iota
+	NodeRepo
+	NodeJob
+	NodeStep
+)
+
 // TreeNode represents a single node in the hierarchical tree structure.
 type TreeNode struct {
 	ID       string
@@ -18,6 +28,7 @@ type TreeNode struct {
 	Children []*TreeNode
 	Parent   *TreeNode
 	Data     any
+	NodeType TreeNodeType
 }
 
 // AddChild appends a child node, wires its Parent pointer, and returns the receiver for chaining.

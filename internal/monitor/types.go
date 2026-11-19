@@ -44,6 +44,7 @@ type JobInfo struct {
 	Name      string      `json:"name"`
 	Workflow  string      `json:"workflow"`
 	Repo      string      `json:"repo"`
+	RepoAlias string      `json:"repo_alias,omitempty"`
 	Owner     string      `json:"owner"`
 	Status    StepStatus  `json:"status"`
 	Steps     []*StepInfo `json:"steps"`
@@ -95,6 +96,7 @@ type TelemetrySample = RunnerMetrics
 type Event struct {
 	Type      EventType            `json:"type"`
 	JobID     string               `json:"job_id,omitempty"`
+	RepoAlias string               `json:"repo_alias,omitempty"`
 	StepID    string               `json:"step_id,omitempty"`
 	Job       *JobInfo             `json:"job,omitempty"`
 	Step      *StepInfo            `json:"step,omitempty"`
@@ -104,12 +106,27 @@ type Event struct {
 	Driver    string               `json:"driver,omitempty"`
 }
 
+type RepoSlotInfo struct {
+	Alias      string `json:"alias"`
+	MaxJobs    int    `json:"max_jobs"`
+	ActiveJobs int    `json:"active_jobs"`
+	Driver     string `json:"driver,omitempty"`
+	Status     string `json:"status,omitempty"` // "idle", "busy", "paused"
+}
+
+type SupervisorStatus struct {
+	GlobalMaxJobs int             `json:"global_max_jobs"`
+	GlobalActive  int             `json:"global_active"`
+	RepoSlots     []*RepoSlotInfo `json:"repo_slots"`
+}
+
 type Snapshot struct {
-	RunnerName string              `json:"runner_name"`
-	ActiveJobs []*JobInfo          `json:"active_jobs"`
-	RecentJobs []*JobInfo          `json:"recent_jobs"`
-	Telemetry  *TelemetrySample    `json:"telemetry,omitempty"`
-	StepLogs   map[string][]string `json:"step_logs,omitempty"`
+	RunnerName       string              `json:"runner_name"`
+	SupervisorStatus *SupervisorStatus   `json:"supervisor_status,omitempty"`
+	ActiveJobs       []*JobInfo          `json:"active_jobs"`
+	RecentJobs       []*JobInfo          `json:"recent_jobs"`
+	Telemetry        *TelemetrySample    `json:"telemetry,omitempty"`
+	StepLogs         map[string][]string `json:"step_logs,omitempty"`
 }
 
 // RunSummary represents a lightweight cached summary of a workflow run stored in index.json.
@@ -118,6 +135,7 @@ type RunSummary struct {
 	Name           string     `json:"name"`
 	Workflow       string     `json:"workflow"`
 	Repo           string     `json:"repo"`
+	RepoAlias      string     `json:"repo_alias,omitempty"`
 	Owner          string     `json:"owner"`
 	Status         StepStatus `json:"status"`
 	StartedAt      time.Time  `json:"started_at"`
@@ -160,6 +178,7 @@ type RunMetadata struct {
 	Name           string               `json:"name"`
 	Workflow       string               `json:"workflow"`
 	Repo           string               `json:"repo"`
+	RepoAlias      string               `json:"repo_alias,omitempty"`
 	Owner          string               `json:"owner"`
 	Status         StepStatus           `json:"status"`
 	StartedAt      time.Time            `json:"started_at"`

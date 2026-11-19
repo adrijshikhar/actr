@@ -1320,3 +1320,87 @@ func TestDashboard_HistoricalSelection_PeakVitalsHUD(t *testing.T) {
 	dashView = m.View()
 	assert.Contains(t, dashView, "∿ SYSTEM VITALS & RADAR")
 }
+
+func TestDashboard_MultiRepoTreeGrouping(t *testing.T) {
+	snap := &monitor.Snapshot{
+		RunnerName: "actr • multi-repo",
+		ActiveJobs: []*monitor.JobInfo{
+			{ID: "job-1", Repo: "adrijshikhar/aim", RepoAlias: "aim", Name: "CI Suite"},
+			{ID: "job-2", Repo: "adrijshikhar/cxstatusline", RepoAlias: "cxstatusline", Name: "Vitest"},
+		},
+	}
+
+	model := NewDashboardModel("/tmp/daemon.sock")
+	_ = model.ApplySnapshot(snap)
+
+	tree := model.Tree()
+	if tree == nil || tree.Root == nil {
+		t.Fatal("expected tree root")
+	}
+
+	liveNode := model.getLiveBranch()
+	if liveNode == nil {
+		t.Fatal("expected live-runs branch")
+	}
+
+	// Should contain 2 repo nodes under live-runs
+	if len(liveNode.Children) != 2 {
+		t.Fatalf("expected 2 repo nodes under live-runs, got %d", len(liveNode.Children))
+	}
+
+	repo1 := liveNode.Children[0]
+	if repo1.Label != "adrijshikhar/aim" && repo1.Label != "adrijshikhar/cxstatusline" {
+		t.Errorf("unexpected repo label %q", repo1.Label)
+	}
+}
+
+func TestDashboard_MultiRepoExpansionAndRepoSelection(t *testing.T) {
+	snap := &monitor.Snapshot{
+		RunnerName: "actr • multi-repo",
+		SupervisorStatus: &monitor.SupervisorStatus{
+			GlobalMaxJobs: 2,
+			GlobalActive:  1,
+			RepoSlots: []*monitor.RepoSlotInfo{
+				{Alias: "aim", MaxJobs: 1, ActiveJobs: 1, Status: "busy"},
+				{Alias: "cxstatusline", MaxJobs: 1, ActiveJobs: 0, Status: "idle"},
+			},
+		},
+		ActiveJobs: []*monitor.JobInfo{
+			{ID: "job-1", Repo: "adrijshikhar/aim", RepoAlias: "aim", Name: "CI Suite", Status: monitor.StatusRunning},
+		},
+	}
+
+	model := NewDashboardModel("/tmp/daemon.sock")
+	model.width = 100
+	model.height = 30
+	model.ready = true
+	_ = model.ApplySnapshot(snap)
+
+	// Verify HUD rendered slots
+	hud := model.telemetry.View(100)
+	assert.Contains(t, hud, "aim (1/1 slots)")
+	assert.Contains(t, hud, "cxstatusline (0/1 slots)")
+
+	// Navigate to repo node: root -> live-runs -> repo:adrijshikhar/aim
+	model.tree.SelectFirst(func(n *TreeNode) bool {
+		return n.NodeType == NodeRepo
+	})
+	_ = model.updateActiveStepLogs()
+
+	// Verify repo selection renders repository info in right pane
+	repoView := model.viewport.View()
+	assert.Contains(t, repoView, "Repository: adrijshikhar/aim")
+	assert.Contains(t, repoView, "Active Jobs: 1")
+
+	// Collapse repo node
+	repoNode := model.tree.SelectedNode()
+	require.NotNil(t, repoNode)
+	repoNode.Expanded = false
+	model.seenRepoExpansion[repoNode.ID] = false
+
+	// Re-apply snapshot: expansion state must be preserved
+	_ = model.ApplySnapshot(snap)
+	repoNodeAfter := model.tree.FindNode(repoNode.ID)
+	require.NotNil(t, repoNodeAfter)
+	assert.False(t, repoNodeAfter.Expanded, "expected collapsed state to be preserved across snapshot hydration")
+}

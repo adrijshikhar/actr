@@ -211,6 +211,7 @@ func (s *DiskStore) StartRun(job *monitor.JobInfo, limits *config.LimitsConfig, 
 		Name:        job.Name,
 		Workflow:    job.Workflow,
 		Repo:        job.Repo,
+		RepoAlias:   job.RepoAlias,
 		Owner:       job.Owner,
 		Status:      status,
 		StartedAt:   startedAt,
@@ -231,6 +232,7 @@ func (s *DiskStore) StartRun(job *monitor.JobInfo, limits *config.LimitsConfig, 
 		Name:        meta.Name,
 		Workflow:    meta.Workflow,
 		Repo:        meta.Repo,
+		RepoAlias:   meta.RepoAlias,
 		Owner:       meta.Owner,
 		Status:      meta.Status,
 		StartedAt:   meta.StartedAt,
@@ -369,14 +371,17 @@ func (s *DiskStore) FinishRun(jobID string, status monitor.StepStatus, metrics *
 
 	if target == nil {
 		target = &RunSummary{
-			ID:       meta.ID,
-			Name:     meta.Name,
-			Workflow: meta.Workflow,
-			Repo:     meta.Repo,
-			Owner:    meta.Owner,
-			Driver:   meta.Driver,
+			ID:        meta.ID,
+			Name:      meta.Name,
+			Workflow:  meta.Workflow,
+			Repo:      meta.Repo,
+			RepoAlias: meta.RepoAlias,
+			Owner:     meta.Owner,
+			Driver:    meta.Driver,
 		}
 		catalog.Runs = append(catalog.Runs, target)
+	} else if target.RepoAlias == "" && meta.RepoAlias != "" {
+		target.RepoAlias = meta.RepoAlias
 	}
 
 	target.Status = meta.Status

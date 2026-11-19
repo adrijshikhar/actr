@@ -1029,3 +1029,78 @@ func TestJobSpecification_UnmarshalJSON_MultipleContainersSelectAlias(t *testing
 	require.NotNil(t, spec.Container)
 	assert.Equal(t, "node:20", spec.Container.Image)
 }
+
+func TestParseAcquiredJob_StepReferencePreservation(t *testing.T) {
+	rawJSON := `{
+		"jobId": "job-market-1",
+		"jobName": "test-marketplace",
+		"steps": [
+			{
+				"id": "step-setup-go",
+				"name": "Set up Go",
+				"type": "uses",
+				"reference": {
+					"id": "ref-1",
+					"type": "repository",
+					"name": "actions/setup-go",
+					"version": "v5",
+					"ref": "cdcb360c5f153b3f9ff8182b8342530d0337c3b3",
+					"path": "action.yml"
+				},
+				"inputs": {
+					"go-version": "1.24",
+					"cache": "true"
+				}
+			},
+			{
+				"id": "step-version-only",
+				"name": "Checkout",
+				"reference": {
+					"name": "actions/checkout",
+					"version": "v4"
+				}
+			},
+			{
+				"id": "step-ref-only",
+				"name": "Cache",
+				"reference": {
+					"name": "actions/cache",
+					"ref": "v3"
+				}
+			}
+		]
+	}`
+
+	job, err := protocol.ParseAcquiredJob([]byte(rawJSON))
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	require.Len(t, job.Steps, 3)
+
+	// Step 0: full reference
+	s0 := job.Steps[0]
+	require.NotNil(t, s0.Reference)
+	assert.Equal(t, "ref-1", s0.Reference.ID)
+	assert.Equal(t, "actions/setup-go", s0.Reference.Name)
+	assert.Equal(t, "v5", s0.Reference.Version)
+	assert.Equal(t, "cdcb360c5f153b3f9ff8182b8342530d0337c3b3", s0.Reference.Ref)
+	assert.Equal(t, "repository", s0.Reference.Type)
+	assert.Equal(t, "action.yml", s0.Reference.Path)
+	assert.Equal(t, "1.24", s0.Inputs["go-version"])
+	assert.Equal(t, "uses", s0.Type)
+
+	// Step 1: version only -> ref should default to version
+	s1 := job.Steps[1]
+	require.NotNil(t, s1.Reference)
+	assert.Equal(t, "actions/checkout", s1.Reference.Name)
+	assert.Equal(t, "v4", s1.Reference.Version)
+	assert.Equal(t, "v4", s1.Reference.Ref)
+	assert.Equal(t, "uses", s1.Type)
+
+	// Step 2: ref only -> version should default to ref
+	s2 := job.Steps[2]
+	require.NotNil(t, s2.Reference)
+	assert.Equal(t, "actions/cache", s2.Reference.Name)
+	assert.Equal(t, "v3", s2.Reference.Version)
+	assert.Equal(t, "v3", s2.Reference.Ref)
+	assert.Equal(t, "uses", s2.Type)
+}

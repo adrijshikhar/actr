@@ -30,6 +30,8 @@ type Server struct {
 	activeJobs        []*JobInfo
 	stepLogs          map[string]*RingBuffer
 	telemetry         *TelemetrySample
+	supervisorStatus  *SupervisorStatus
+	reloadFn          func() error
 	historyStore      HistoryStore
 	maxRuns           int
 	maxDiskBytes      int64
@@ -83,6 +85,84 @@ func (s *Server) WithRetention(maxRuns int, maxDiskBytes int64) *Server {
 	return s
 }
 
+// WithReloadFunc sets a callback to be invoked when POST /reload is received.
+func (s *Server) WithReloadFunc(fn func() error) *Server {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reloadFn = fn
+	return s
+}
+
+// SetSupervisorStatus updates the multi-repo supervisor status.
+func (s *Server) SetSupervisorStatus(status *SupervisorStatus) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if status == nil {
+		s.supervisorStatus = nil
+		return
+	}
+	cp := *status
+	if status.RepoSlots != nil {
+		cp.RepoSlots = make([]*RepoSlotInfo, len(status.RepoSlots))
+		for i, slot := range status.RepoSlots {
+			if slot != nil {
+				sc := *slot
+				cp.RepoSlots[i] = &sc
+			}
+		}
+	}
+	s.supervisorStatus = &cp
+}
+
+// SupervisorStatus returns a deep copy of current supervisor status.
+func (s *Server) SupervisorStatus() *SupervisorStatus {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.supervisorStatus == nil {
+		return nil
+	}
+	cp := *s.supervisorStatus
+	if s.supervisorStatus.RepoSlots != nil {
+		cp.RepoSlots = make([]*RepoSlotInfo, len(s.supervisorStatus.RepoSlots))
+		for i, slot := range s.supervisorStatus.RepoSlots {
+			if slot != nil {
+				sc := *slot
+				cp.RepoSlots[i] = &sc
+			}
+		}
+	}
+	return &cp
+}
+
+// PeakMetricsForJob returns the recorded peak metrics for the specified job.
+func (s *Server) PeakMetricsForJob(jobID string) *RunMetricsSummary {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	metrics, ok := s.peakMetrics[jobID]
+	if !ok || metrics == nil {
+		return nil
+	}
+	cp := *metrics
+	return &cp
+}
+
+// SetJobTelemetry publishes a telemetry sample for a specific job and repo alias.
+func (s *Server) SetJobTelemetry(jobID, repoAlias string, t *TelemetrySample) {
+	s.mu.Lock()
+	if jobID != "" && repoAlias != "" {
+		if j, ok := s.jobs[jobID]; ok && j.RepoAlias == "" {
+			j.RepoAlias = repoAlias
+		}
+	}
+	s.mu.Unlock()
+	s.Publish(Event{
+		Type:      EventTelemetry,
+		JobID:     jobID,
+		RepoAlias: repoAlias,
+		Telemetry: t,
+	})
+}
+
 func (s *Server) hydrateFromStore() {
 	s.mu.RLock()
 	store := s.historyStore
@@ -132,6 +212,7 @@ func (s *Server) hydrateFromStore() {
 			Name:      r.Name,
 			Workflow:  r.Workflow,
 			Repo:      r.Repo,
+			RepoAlias: r.RepoAlias,
 			Owner:     r.Owner,
 			Status:    r.Status,
 			StartedAt: r.StartedAt,
@@ -189,6 +270,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("GET /snapshot", s.handleSnapshot)
 	mux.HandleFunc("GET /stream", s.handleStream)
 	mux.HandleFunc("GET /runs/{runID}/steps/{stepID}/logs", s.handleHistoricalStepLogs)
+	mux.HandleFunc("POST /reload", s.handleReload)
 
 	s.httpServer = &http.Server{
 		Handler:           mux,
@@ -281,6 +363,25 @@ func (s *Server) handleHistoricalStepLogs(w http.ResponseWriter, r *http.Request
 	_ = json.NewEncoder(w).Encode(lines)
 }
 
+func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	reloadFn := s.reloadFn
+	s.mu.RUnlock()
+
+	if reloadFn == nil {
+		http.Error(w, "reload not supported", http.StatusNotImplemented)
+		return
+	}
+
+	if err := reloadFn(); err != nil {
+		http.Error(w, fmt.Sprintf("reload failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"reloaded"}`))
+}
+
 func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	logsCopy := make(map[string][]string, len(s.stepLogs))
@@ -302,12 +403,28 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		recentJobsCopy[i] = &jCopy
 	}
 
+	var statusCopy *SupervisorStatus
+	if s.supervisorStatus != nil {
+		cp := *s.supervisorStatus
+		if s.supervisorStatus.RepoSlots != nil {
+			cp.RepoSlots = make([]*RepoSlotInfo, len(s.supervisorStatus.RepoSlots))
+			for i, slot := range s.supervisorStatus.RepoSlots {
+				if slot != nil {
+					sc := *slot
+					cp.RepoSlots[i] = &sc
+				}
+			}
+		}
+		statusCopy = &cp
+	}
+
 	snap := Snapshot{
-		RunnerName: s.runnerName,
-		ActiveJobs: activeJobsCopy,
-		RecentJobs: recentJobsCopy,
-		Telemetry:  s.telemetry,
-		StepLogs:   logsCopy,
+		RunnerName:       s.runnerName,
+		SupervisorStatus: statusCopy,
+		ActiveJobs:       activeJobsCopy,
+		RecentJobs:       recentJobsCopy,
+		Telemetry:        s.telemetry,
+		StepLogs:         logsCopy,
 	}
 	s.mu.RUnlock()
 
@@ -424,12 +541,16 @@ func (s *Server) Publish(ev Event) {
 				job.Name = ev.Job.Name
 				job.Workflow = ev.Job.Workflow
 				job.Repo = ev.Job.Repo
+				job.RepoAlias = ev.Job.RepoAlias
 				job.Owner = ev.Job.Owner
 				job.Status = ev.Job.Status
 				if !ev.Job.StartedAt.IsZero() {
 					job.StartedAt = ev.Job.StartedAt
 				}
 				job.Steps = append([]*StepInfo(nil), ev.Job.Steps...)
+			}
+			if ev.RepoAlias != "" {
+				job.RepoAlias = ev.RepoAlias
 			}
 			s.jobs[jobID] = job
 			found := false
@@ -476,6 +597,9 @@ func (s *Server) Publish(ev Event) {
 					}
 					if ev.Job.Name != "" {
 						j.Name = ev.Job.Name
+					}
+					if ev.Job.RepoAlias != "" {
+						j.RepoAlias = ev.Job.RepoAlias
 					}
 				} else {
 					j.Status = StatusSuccess
@@ -615,10 +739,8 @@ func (s *Server) Publish(ev Event) {
 			targetJobIDs := make([]string, 0, 1)
 			if ev.JobID != "" {
 				targetJobIDs = append(targetJobIDs, ev.JobID)
-			} else {
-				for _, aj := range s.activeJobs {
-					targetJobIDs = append(targetJobIDs, aj.ID)
-				}
+			} else if len(s.activeJobs) == 1 {
+				targetJobIDs = append(targetJobIDs, s.activeJobs[0].ID)
 			}
 			for _, jID := range targetJobIDs {
 				peak := s.peakMetrics[jID]

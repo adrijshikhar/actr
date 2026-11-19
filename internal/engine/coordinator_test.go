@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adrijshikhar/actr/internal/action"
 	"github.com/adrijshikhar/actr/internal/config"
 	"github.com/adrijshikhar/actr/internal/driver"
 	"github.com/adrijshikhar/actr/internal/monitor"
@@ -1824,5 +1825,834 @@ func TestCoordinator_ExecuteJob_TimeoutEnforced(t *testing.T) {
 	}
 	if completeReq.Conclusion != "cancelled" {
 		t.Errorf("expected Conclusion 'cancelled' on timeout, got %q", completeReq.Conclusion)
+	}
+}
+
+type mockActionResolver struct {
+	resolveFn func(ctx context.Context, ref *protocol.StepReference) (string, error)
+}
+
+func (m *mockActionResolver) Resolve(ctx context.Context, ref *protocol.StepReference) (string, error) {
+	if m.resolveFn != nil {
+		return m.resolveFn(ctx, ref)
+	}
+	return "", errors.New("not implemented")
+}
+
+func TestCoordinator_ExecuteJob_NodeActionStep(t *testing.T) {
+	detector := action.NewHostNodeDetector("")
+	if _, err := detector.Detect(context.Background()); err != nil {
+		t.Skipf("Node.js runtime not found on host, skipping: %v", err)
+	}
+
+	workDir := t.TempDir()
+	actionDir := filepath.Join(workDir, "mock-action")
+	if err := os.MkdirAll(actionDir, 0755); err != nil {
+		t.Fatalf("failed to create action dir: %v", err)
+	}
+
+	actionYAML := `
+name: "Mock Setup"
+runs:
+  using: "node20"
+  main: "index.js"
+inputs:
+  target-greeting:
+    default: "greetings"
+`
+	if err := os.WriteFile(filepath.Join(actionDir, "action.yml"), []byte(actionYAML), 0644); err != nil {
+		t.Fatalf("failed to write action.yml: %v", err)
+	}
+
+	actionJS := `
+const fs = require('fs');
+fs.appendFileSync(process.env.GITHUB_OUTPUT, 'out_val=hello_' + process.env['INPUT_TARGET-GREETING'] + '\n');
+fs.appendFileSync(process.env.GITHUB_ENV, 'NODE_ACTION_RAN=true\n');
+console.log("Mock action executed with input: " + process.env['INPUT_TARGET_GREETING']);
+`
+	if err := os.WriteFile(filepath.Join(actionDir, "index.js"), []byte(actionJS), 0644); err != nil {
+		t.Fatalf("failed to write index.js: %v", err)
+	}
+
+	mock := &mockDriver{}
+	coord := NewCoordinator(mock, nil, workDir).WithActionResolver(&mockActionResolver{
+		resolveFn: func(ctx context.Context, ref *protocol.StepReference) (string, error) {
+			if ref != nil && ref.Name == "actions/mock-setup" {
+				return actionDir, nil
+			}
+			return "", errors.New("action not found")
+		},
+	})
+
+	job := &protocol.JobSpecification{
+		JobID:   "job-node-action",
+		PlanID:  "plan-node-action",
+		JobName: "Node Action Job",
+		Steps: []protocol.JobStep{
+			{
+				ID:   "step-node",
+				Name: "Set up mock",
+				Type: "uses",
+				Reference: &protocol.StepReference{
+					Name:    "actions/mock-setup",
+					Version: "v1",
+				},
+				Inputs: map[string]string{
+					"target-greeting": "universe",
+				},
+			},
+			{
+				ID:     "step-verify",
+				Name:   "Verify step",
+				Type:   "script",
+				Script: "echo verified",
+			},
+		},
+	}
+
+	completeReq, err := coord.ExecuteJob(context.Background(), job, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error from ExecuteJob: %v", err)
+	}
+	if completeReq.Conclusion != "success" {
+		t.Errorf("expected Conclusion 'success', got %q", completeReq.Conclusion)
+	}
+	if completeReq.Outputs["out_val"] != "hello_universe" {
+		t.Errorf("expected output out_val 'hello_universe', got %q", completeReq.Outputs["out_val"])
+	}
+	if len(completeReq.StepResults) != 2 {
+		t.Fatalf("expected 2 step results, got %d", len(completeReq.StepResults))
+	}
+	if completeReq.StepResults[0].Conclusion != "success" || completeReq.StepResults[0].ExitCode != 0 {
+		t.Errorf("expected step 0 success, got %+v", completeReq.StepResults[0])
+	}
+
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if len(mock.stepsRun) != 1 {
+		t.Fatalf("expected 1 driver step run, got %d", len(mock.stepsRun))
+	}
+	if mock.stepsRun[0].Environment["NODE_ACTION_RAN"] != "true" {
+		t.Errorf("expected environment variable NODE_ACTION_RAN propagated to subsequent step, got %q", mock.stepsRun[0].Environment["NODE_ACTION_RAN"])
+	}
+}
+
+func TestCoordinator_ExecuteJob_NodeActionStep_ResolutionFailure(t *testing.T) {
+	workDir := t.TempDir()
+	mock := &mockDriver{}
+	coord := NewCoordinator(mock, nil, workDir).WithActionResolver(&mockActionResolver{
+		resolveFn: func(ctx context.Context, ref *protocol.StepReference) (string, error) {
+			return "", errors.New("download failed 404")
+		},
+	})
+
+	job := &protocol.JobSpecification{
+		JobID:   "job-action-fail",
+		PlanID:  "plan-action-fail",
+		JobName: "Fail Job",
+		Steps: []protocol.JobStep{
+			{
+				ID:   "step-1",
+				Name: "Missing Action",
+				Type: "uses",
+				Reference: &protocol.StepReference{
+					Name:    "actions/missing",
+					Version: "v1",
+				},
+			},
+		},
+	}
+
+	completeReq, err := coord.ExecuteJob(context.Background(), job, "", "")
+	if err != nil {
+		t.Fatalf("unexpected ExecuteJob error: %v", err)
+	}
+	if completeReq.Conclusion != "failure" {
+		t.Errorf("expected Conclusion 'failure', got %q", completeReq.Conclusion)
+	}
+	if len(completeReq.StepResults) != 1 || completeReq.StepResults[0].Conclusion != "failure" {
+		t.Errorf("expected step conclusion 'failure'")
+	}
+}
+
+func TestDynamicToolchainIngestion(t *testing.T) {
+	t.Run("IngestPathFile_CleanAndPrepend", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		pathFile := filepath.Join(tmpDir, "path.txt")
+
+		// 1. Initial path with dirty paths (extra slashes, dot-dot)
+		rawContent := "/opt/tools//bin/\n/custom/../other/bin\n\n/single/path\n"
+		if err := os.WriteFile(pathFile, []byte(rawContent), 0o600); err != nil {
+			t.Fatalf("failed to write path file: %v", err)
+		}
+
+		initialPath := filepath.Clean("/usr/bin") + string(filepath.ListSeparator) + filepath.Clean("/bin")
+		updatedPath, err := IngestPathFile(pathFile, initialPath)
+		if err != nil {
+			t.Fatalf("IngestPathFile failed: %v", err)
+		}
+
+		expectedCleaned1 := filepath.Clean("/opt/tools/bin")
+		expectedCleaned2 := filepath.Clean("/other/bin")
+		expectedCleaned3 := filepath.Clean("/single/path")
+		expectedPrefix := expectedCleaned1 + string(filepath.ListSeparator) +
+			expectedCleaned2 + string(filepath.ListSeparator) +
+			expectedCleaned3
+
+		if !strings.HasPrefix(updatedPath, expectedPrefix) {
+			t.Errorf("expected updatedPath to start with %q, got %q", expectedPrefix, updatedPath)
+		}
+		if !strings.HasSuffix(updatedPath, initialPath) {
+			t.Errorf("expected updatedPath to end with %q, got %q", initialPath, updatedPath)
+		}
+
+		// 2. Verify truncation: file must be empty after ingestion
+		fi, err := os.Stat(pathFile)
+		if err != nil {
+			t.Fatalf("failed to stat path file: %v", err)
+		}
+		if fi.Size() != 0 {
+			t.Errorf("expected path file to be truncated to 0 bytes, got %d bytes", fi.Size())
+		}
+
+		// 3. Second ingestion on truncated file should not alter the path
+		secondPath, err := IngestPathFile(pathFile, updatedPath)
+		if err != nil {
+			t.Fatalf("second IngestPathFile failed: %v", err)
+		}
+		if secondPath != updatedPath {
+			t.Errorf("expected unchanged path after re-ingesting truncated file, got %q vs %q", secondPath, updatedPath)
+		}
+
+		// 4. Ingestion into empty currentPath
+		singleFile := filepath.Join(tmpDir, "single.txt")
+		if err := os.WriteFile(singleFile, []byte("/only/path\n"), 0o600); err != nil {
+			t.Fatalf("failed to write single path file: %v", err)
+		}
+		emptyBase, err := IngestPathFile(singleFile, "")
+		if err != nil {
+			t.Fatalf("IngestPathFile with empty base failed: %v", err)
+		}
+		expectedSingle := filepath.Clean("/only/path")
+		if emptyBase != expectedSingle {
+			t.Errorf("expected %q, got %q", expectedSingle, emptyBase)
+		}
+
+		// 5. Non-existent file should be a no-op
+		nonExistentPath, err := IngestPathFile(filepath.Join(tmpDir, "does-not-exist.txt"), "/existing/path")
+		if err != nil {
+			t.Fatalf("IngestPathFile on non-existent file returned error: %v", err)
+		}
+		if nonExistentPath != "/existing/path" {
+			t.Errorf("expected /existing/path, got %q", nonExistentPath)
+		}
+	})
+
+	t.Run("IngestEnvFile_KeyValAndMultiline", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		envFile := filepath.Join(tmpDir, "env.txt")
+
+		content := strings.Join([]string{
+			"SIMPLE_KEY=simple_val",
+			"MULTILINE_VAR<<EOF",
+			"line one",
+			"line two with special chars: = < >",
+			"EOF",
+			"ANOTHER_KEY=another_val",
+			"DELIM_WITH_SPACES<<MY_DELIMITER",
+			"first line",
+			"second line",
+			"MY_DELIMITER",
+			"",
+		}, "\n")
+
+		if err := os.WriteFile(envFile, []byte(content), 0o600); err != nil {
+			t.Fatalf("failed to write env file: %v", err)
+		}
+
+		envMap := map[string]string{
+			"EXISTING": "original",
+		}
+
+		if err := IngestEnvFile(envFile, envMap); err != nil {
+			t.Fatalf("IngestEnvFile failed: %v", err)
+		}
+
+		if envMap["EXISTING"] != "original" {
+			t.Errorf("expected EXISTING to remain 'original', got %q", envMap["EXISTING"])
+		}
+		if envMap["SIMPLE_KEY"] != "simple_val" {
+			t.Errorf("expected SIMPLE_KEY='simple_val', got %q", envMap["SIMPLE_KEY"])
+		}
+		expectedMulti := "line one\nline two with special chars: = < >"
+		if envMap["MULTILINE_VAR"] != expectedMulti {
+			t.Errorf("expected MULTILINE_VAR=%q, got %q", expectedMulti, envMap["MULTILINE_VAR"])
+		}
+		if envMap["ANOTHER_KEY"] != "another_val" {
+			t.Errorf("expected ANOTHER_KEY='another_val', got %q", envMap["ANOTHER_KEY"])
+		}
+		expectedDelim := "first line\nsecond line"
+		if envMap["DELIM_WITH_SPACES"] != expectedDelim {
+			t.Errorf("expected DELIM_WITH_SPACES=%q, got %q", expectedDelim, envMap["DELIM_WITH_SPACES"])
+		}
+
+		// Verify truncation
+		fi, err := os.Stat(envFile)
+		if err != nil {
+			t.Fatalf("failed to stat env file: %v", err)
+		}
+		if fi.Size() != 0 {
+			t.Errorf("expected env file to be truncated to 0 bytes, got %d", fi.Size())
+		}
+
+		// Re-ingestion on truncated file should be a no-op
+		if err := IngestEnvFile(envFile, envMap); err != nil {
+			t.Fatalf("second IngestEnvFile failed: %v", err)
+		}
+
+		// Non-existent file should be a no-op
+		if err := IngestEnvFile(filepath.Join(tmpDir, "does-not-exist.txt"), envMap); err != nil {
+			t.Fatalf("IngestEnvFile on non-existent file failed: %v", err)
+		}
+	})
+
+	t.Run("CoordinatorJob_SubsequentStepsReceiveUpdatedEnvAndPath", func(t *testing.T) {
+		workDir := t.TempDir()
+
+		step1PathToAdd := filepath.Clean("/custom/toolchain/go/bin")
+		step2PathToAdd := filepath.Clean("/custom/toolchain/rust/bin")
+
+		mock := &mockDriver{
+			executeFunc: func(ctx context.Context, step *driver.StepSpec, stdout, stderr io.Writer) (*driver.StepResult, error) {
+				switch step.ID {
+				case "setup-step":
+					// Step 1 appends dirty path and multiline env
+					pathFile := step.Environment["GITHUB_PATH"]
+					if err := os.WriteFile(pathFile, []byte("/custom/toolchain/go//bin/\n"), 0o600); err != nil {
+						return nil, err
+					}
+
+					envFile := step.Environment["GITHUB_ENV"]
+					envContent := "GO_VERSION=1.23.0\nRELEASE_NOTES<<DELIM\nFirst line\nSecond line\nDELIM\n"
+					if err := os.WriteFile(envFile, []byte(envContent), 0o600); err != nil {
+						return nil, err
+					}
+					return &driver.StepResult{ExitCode: 0}, nil
+
+				case "build-step":
+					// Step 2 verifies it received step 1's path and env
+					gotPath := step.Environment["PATH"]
+					if !strings.HasPrefix(gotPath, step1PathToAdd) {
+						return nil, fmt.Errorf("build-step expected PATH to start with %s, got %s", step1PathToAdd, gotPath)
+					}
+					if step.Environment["GO_VERSION"] != "1.23.0" {
+						return nil, fmt.Errorf("build-step expected GO_VERSION=1.23.0, got %q", step.Environment["GO_VERSION"])
+					}
+					if step.Environment["RELEASE_NOTES"] != "First line\nSecond line" {
+						return nil, fmt.Errorf("build-step expected RELEASE_NOTES='First line\\nSecond line', got %q", step.Environment["RELEASE_NOTES"])
+					}
+
+					// Step 2 appends another path and env var
+					pathFile := step.Environment["GITHUB_PATH"]
+					if err := os.WriteFile(pathFile, []byte(step2PathToAdd+"\n"), 0o600); err != nil {
+						return nil, err
+					}
+					envFile := step.Environment["GITHUB_ENV"]
+					if err := os.WriteFile(envFile, []byte("CARGO_HOME=/custom/cargo\n"), 0o600); err != nil {
+						return nil, err
+					}
+					return &driver.StepResult{ExitCode: 0}, nil
+
+				case "test-step":
+					// Step 3 verifies step 2's additions are prepended before step 1's
+					gotPath := step.Environment["PATH"]
+					expectedPrefix := step2PathToAdd + string(filepath.ListSeparator) + step1PathToAdd
+					if !strings.HasPrefix(gotPath, expectedPrefix) {
+						return nil, fmt.Errorf("test-step expected PATH to start with %s, got %s", expectedPrefix, gotPath)
+					}
+					if step.Environment["GO_VERSION"] != "1.23.0" {
+						return nil, fmt.Errorf("test-step expected GO_VERSION=1.23.0, got %q", step.Environment["GO_VERSION"])
+					}
+					if step.Environment["CARGO_HOME"] != "/custom/cargo" {
+						return nil, fmt.Errorf("test-step expected CARGO_HOME=/custom/cargo, got %q", step.Environment["CARGO_HOME"])
+					}
+					return &driver.StepResult{ExitCode: 0}, nil
+
+				default:
+					return &driver.StepResult{ExitCode: 0}, nil
+				}
+			},
+		}
+
+		coord := NewCoordinator(mock, nil, workDir)
+
+		job := &protocol.JobSpecification{
+			JobID:   "job-toolchain-test",
+			JobName: "toolchain-job",
+			Steps: []protocol.JobStep{
+				{
+					ID:   "setup-step",
+					Name: "Setup Toolchain",
+				},
+				{
+					ID:   "build-step",
+					Name: "Build Application",
+				},
+				{
+					ID:   "test-step",
+					Name: "Test Application",
+				},
+			},
+		}
+
+		req, err := coord.ExecuteJob(context.Background(), job, "", "")
+		if err != nil {
+			t.Fatalf("ExecuteJob failed: %v", err)
+		}
+		if req.Conclusion != "success" {
+			t.Fatalf("expected job conclusion 'success', got %q", req.Conclusion)
+		}
+		if len(req.StepResults) != 3 {
+			t.Fatalf("expected 3 step results, got %d", len(req.StepResults))
+		}
+		for i, sr := range req.StepResults {
+			if sr.Conclusion != "success" {
+				t.Errorf("step %d (%s) failed: %+v", i, sr.ID, sr)
+			}
+		}
+	})
+}
+
+func TestIngestStateFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "state.txt")
+	content := "KEY1=VAL1\nKEY2<<EOF\nline1\nline2\nEOF\nKEY3=VAL3\n"
+	if err := os.WriteFile(stateFile, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := IngestStateFile(stateFile)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if state["KEY1"] != "VAL1" {
+		t.Errorf("expected KEY1=VAL1, got %q", state["KEY1"])
+	}
+	if state["KEY2"] != "line1\nline2" {
+		t.Errorf("expected KEY2 to be 'line1\\nline2', got %q", state["KEY2"])
+	}
+	if state["KEY3"] != "VAL3" {
+		t.Errorf("expected KEY3=VAL3, got %q", state["KEY3"])
+	}
+
+	info, err := os.Stat(stateFile)
+	if err != nil {
+		t.Fatalf("failed to stat state file: %v", err)
+	}
+	if info.Size() != 0 {
+		t.Errorf("expected state file to be truncated to 0 bytes, got %d", info.Size())
+	}
+}
+
+func TestPostStepExecution(t *testing.T) {
+	detector := action.NewHostNodeDetector("")
+	if _, err := detector.Detect(context.Background()); err != nil {
+		t.Skipf("Node.js runtime not found on host, skipping: %v", err)
+	}
+
+	t.Run("LIFO post-step hook execution order", func(t *testing.T) {
+		workDir := t.TempDir()
+		orderLog := filepath.Join(workDir, "execution_order.log")
+
+		// Create Action 1 with post script
+		action1Dir := filepath.Join(workDir, "action1")
+		if err := os.MkdirAll(action1Dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(action1Dir, "action.yml"), []byte(`
+name: "Action One"
+runs:
+  using: "node20"
+  main: "main.js"
+  post: "post.js"
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(action1Dir, "main.js"), []byte(`
+const fs = require('fs');
+fs.appendFileSync(process.env.ORDER_LOG, 'main-1\n');
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(action1Dir, "post.js"), []byte(`
+const fs = require('fs');
+fs.appendFileSync(process.env.ORDER_LOG, 'post-1\n');
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create Action 2 with post script
+		action2Dir := filepath.Join(workDir, "action2")
+		if err := os.MkdirAll(action2Dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(action2Dir, "action.yml"), []byte(`
+name: "Action Two"
+runs:
+  using: "node20"
+  main: "main.js"
+  post: "post.js"
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(action2Dir, "main.js"), []byte(`
+const fs = require('fs');
+fs.appendFileSync(process.env.ORDER_LOG, 'main-2\n');
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(action2Dir, "post.js"), []byte(`
+const fs = require('fs');
+fs.appendFileSync(process.env.ORDER_LOG, 'post-2\n');
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		mock := &mockDriver{}
+		coord := NewCoordinator(mock, nil, workDir).WithActionResolver(&mockActionResolver{
+			resolveFn: func(ctx context.Context, ref *protocol.StepReference) (string, error) {
+				if ref.Name == "actions/action1" {
+					return action1Dir, nil
+				}
+				if ref.Name == "actions/action2" {
+					return action2Dir, nil
+				}
+				return "", errors.New("not found")
+			},
+		})
+
+		job := &protocol.JobSpecification{
+			JobID:   "job-lifo",
+			JobName: "LIFO Job",
+			Variables: map[string]string{
+				"ORDER_LOG": orderLog,
+			},
+			Steps: []protocol.JobStep{
+				{
+					ID:   "step-1",
+					Name: "First Action",
+					Type: "uses",
+					Reference: &protocol.StepReference{
+						Name:    "actions/action1",
+						Version: "v1",
+					},
+				},
+				{
+					ID:   "step-2",
+					Name: "Second Action",
+					Type: "uses",
+					Reference: &protocol.StepReference{
+						Name:    "actions/action2",
+						Version: "v1",
+					},
+				},
+			},
+		}
+
+		completeReq, err := coord.ExecuteJob(context.Background(), job, "", "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if completeReq.Conclusion != "success" {
+			t.Fatalf("expected success, got %q", completeReq.Conclusion)
+		}
+
+		data, err := os.ReadFile(orderLog)
+		if err != nil {
+			t.Fatalf("failed to read order log: %v", err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		expected := []string{"main-1", "main-2", "post-2", "post-1"}
+		if len(lines) != len(expected) {
+			t.Fatalf("expected %d entries %v, got %d %v", len(expected), expected, len(lines), lines)
+		}
+		for i, exp := range expected {
+			if lines[i] != exp {
+				t.Errorf("at index %d: expected %q, got %q", i, exp, lines[i])
+			}
+		}
+	})
+
+	t.Run("Execution under cancelled job context", func(t *testing.T) {
+		workDir := t.TempDir()
+		postLog := filepath.Join(workDir, "cancelled_post.log")
+
+		actionDir := filepath.Join(workDir, "action-cancel")
+		if err := os.MkdirAll(actionDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(actionDir, "action.yml"), []byte(`
+name: "Cancel Action"
+runs:
+  using: "node20"
+  main: "main.js"
+  post: "post.js"
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(actionDir, "main.js"), []byte(`
+console.log("main ran successfully");
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(actionDir, "post.js"), []byte(`
+const fs = require('fs');
+fs.writeFileSync(process.env.POST_LOG, 'post-ran-despite-cancel\n');
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+
+		mock := &mockDriver{
+			executeFunc: func(stepCtx context.Context, spec *driver.StepSpec, stdout, stderr io.Writer) (*driver.StepResult, error) {
+				// Cancel context when step 2 starts
+				cancel()
+				<-stepCtx.Done()
+				return &driver.StepResult{ExitCode: 1, Error: stepCtx.Err()}, stepCtx.Err()
+			},
+		}
+
+		coord := NewCoordinator(mock, nil, workDir).WithActionResolver(&mockActionResolver{
+			resolveFn: func(ctx context.Context, ref *protocol.StepReference) (string, error) {
+				if ref.Name == "actions/cancel" {
+					return actionDir, nil
+				}
+				return "", errors.New("not found")
+			},
+		})
+
+		job := &protocol.JobSpecification{
+			JobID:   "job-cancel",
+			JobName: "Cancel Job",
+			Variables: map[string]string{
+				"POST_LOG": postLog,
+			},
+			Steps: []protocol.JobStep{
+				{
+					ID:   "step-1",
+					Name: "Action step",
+					Type: "uses",
+					Reference: &protocol.StepReference{
+						Name:    "actions/cancel",
+						Version: "v1",
+					},
+				},
+				{
+					ID:     "step-2",
+					Name:   "Long step to be cancelled",
+					Type:   "script",
+					Script: "sleep 10",
+				},
+			},
+		}
+
+		completeReq, err := coord.ExecuteJob(ctx, job, "", "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if completeReq.Conclusion != "cancelled" {
+			t.Fatalf("expected conclusion 'cancelled', got %q", completeReq.Conclusion)
+		}
+
+		// Post hook MUST have run despite cancellation
+		data, err := os.ReadFile(postLog)
+		if err != nil {
+			t.Fatalf("post hook did not run, failed to read log: %v", err)
+		}
+		if strings.TrimSpace(string(data)) != "post-ran-despite-cancel" {
+			t.Fatalf("expected 'post-ran-despite-cancel', got %q", string(data))
+		}
+	})
+
+	t.Run("STATE injection into post step environment", func(t *testing.T) {
+		workDir := t.TempDir()
+		stateOutputLog := filepath.Join(workDir, "state_output.log")
+
+		actionDir := filepath.Join(workDir, "action-state")
+		if err := os.MkdirAll(actionDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(actionDir, "action.yml"), []byte(`
+name: "State Action"
+runs:
+  using: "node20"
+  main: "main.js"
+  post: "post.js"
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(actionDir, "main.js"), []byte(`
+const fs = require('fs');
+// Single line state
+fs.appendFileSync(process.env.GITHUB_STATE, 'auth_token=secret_token_123\n');
+fs.appendFileSync(process.env.GITHUB_STATE, 'my key=spaced value\n');
+// Multiline delimiter state
+fs.appendFileSync(process.env.GITHUB_STATE, 'cert<<EOF\nline1\nline2\nEOF\n');
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(actionDir, "post.js"), []byte(`
+const fs = require('fs');
+const token = process.env['STATE_AUTH_TOKEN'] || '';
+const spaced = process.env['STATE_MY_KEY'] || '';
+const cert = process.env['STATE_CERT'] || '';
+const out = JSON.stringify({
+  token: token,
+  spaced: spaced,
+  cert: cert
+});
+fs.writeFileSync(process.env.STATE_OUT_LOG, out);
+`), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		mock := &mockDriver{}
+		coord := NewCoordinator(mock, nil, workDir).WithActionResolver(&mockActionResolver{
+			resolveFn: func(ctx context.Context, ref *protocol.StepReference) (string, error) {
+				if ref.Name == "actions/state" {
+					return actionDir, nil
+				}
+				return "", errors.New("not found")
+			},
+		})
+
+		job := &protocol.JobSpecification{
+			JobID:   "job-state",
+			JobName: "State Job",
+			Variables: map[string]string{
+				"STATE_OUT_LOG": stateOutputLog,
+			},
+			Steps: []protocol.JobStep{
+				{
+					ID:   "step-state",
+					Name: "State step",
+					Type: "uses",
+					Reference: &protocol.StepReference{
+						Name:    "actions/state",
+						Version: "v1",
+					},
+				},
+			},
+		}
+
+		completeReq, err := coord.ExecuteJob(context.Background(), job, "", "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if completeReq.Conclusion != "success" {
+			t.Fatalf("expected success, got %q", completeReq.Conclusion)
+		}
+
+		data, err := os.ReadFile(stateOutputLog)
+		if err != nil {
+			t.Fatalf("failed to read state output log: %v", err)
+		}
+		var parsed map[string]string
+		if err := json.Unmarshal(data, &parsed); err != nil {
+			t.Fatalf("failed to parse json output: %v, raw: %s", err, string(data))
+		}
+		if parsed["token"] != "secret_token_123" {
+			t.Errorf("expected token 'secret_token_123', got %q", parsed["token"])
+		}
+		if parsed["spaced"] != "spaced value" {
+			t.Errorf("expected spaced 'spaced value', got %q", parsed["spaced"])
+		}
+		if parsed["cert"] != "line1\nline2" {
+			t.Errorf("expected cert 'line1\\nline2', got %q", parsed["cert"])
+		}
+	})
+}
+
+func TestIngestEnvFile_BlocksForbiddenKeys(t *testing.T) {
+	tempDir := t.TempDir()
+	envFile := filepath.Join(tempDir, "github_env.txt")
+
+	envContent := `SAFE_VAR=hello_safe
+NODE_OPTIONS=--require /tmp/evil.js
+LD_PRELOAD=/tmp/evil.so
+DYLD_INSERT_LIBRARIES=/tmp/evil.dylib
+PATH=/tmp/evil_bin:/usr/bin
+GITHUB_ENV=/tmp/evil_env
+RUNNER_TEMP=/tmp/evil_temp
+ANOTHER_SAFE=world_123
+`
+	if err := os.WriteFile(envFile, []byte(envContent), 0644); err != nil {
+		t.Fatalf("failed to write test env file: %v", err)
+	}
+
+	cumulative := make(map[string]string)
+	if err := IngestEnvFile(envFile, cumulative); err != nil {
+		t.Fatalf("IngestEnvFile failed: %v", err)
+	}
+
+	// Safe variables must be preserved
+	if cumulative["SAFE_VAR"] != "hello_safe" {
+		t.Errorf("expected SAFE_VAR 'hello_safe', got %q", cumulative["SAFE_VAR"])
+	}
+	if cumulative["ANOTHER_SAFE"] != "world_123" {
+		t.Errorf("expected ANOTHER_SAFE 'world_123', got %q", cumulative["ANOTHER_SAFE"])
+	}
+
+	// Forbidden dangerous injection keys must be blocked
+	forbidden := []string{
+		"NODE_OPTIONS",
+		"LD_PRELOAD",
+		"DYLD_INSERT_LIBRARIES",
+		"PATH",
+		"GITHUB_ENV",
+		"RUNNER_TEMP",
+	}
+	for _, key := range forbidden {
+		if val, exists := cumulative[key]; exists {
+			t.Errorf("forbidden key %q was injected with value %q", key, val)
+		}
+	}
+}
+
+func TestResolveActionScriptPath_PathTraversalRejection(t *testing.T) {
+	tempDir := t.TempDir()
+	actionDir := filepath.Join(tempDir, "actions", "checkout")
+	if err := os.MkdirAll(actionDir, 0755); err != nil {
+		t.Fatalf("failed to create action dir: %v", err)
+	}
+
+	// Valid in-directory script
+	validRel := "dist/index.js"
+	cleanPath, err := resolveActionScriptPath(actionDir, validRel)
+	if err != nil {
+		t.Fatalf("unexpected error for valid path: %v", err)
+	}
+	expected := filepath.Join(actionDir, "dist", "index.js")
+	if cleanPath != expected {
+		t.Errorf("expected %q, got %q", expected, cleanPath)
+	}
+
+	// Traversal attacks escaping actionDir
+	escapes := []string{
+		"../../evil.js",
+		"../../../tmp/evil.js",
+		"dist/../../../../etc/passwd",
+	}
+	for _, esc := range escapes {
+		_, err := resolveActionScriptPath(actionDir, esc)
+		if err == nil {
+			t.Errorf("expected error for escaping path %q, got nil", esc)
+		}
+	}
+
+	// Empty path
+	if _, err := resolveActionScriptPath(actionDir, ""); err == nil {
+		t.Error("expected error for empty script path, got nil")
 	}
 }
