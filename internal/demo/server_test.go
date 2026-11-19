@@ -93,8 +93,10 @@ func TestStartServer_DemoMetrics(t *testing.T) {
 
 func TestSeedHistoryStore(t *testing.T) {
 	tmpDir := t.TempDir()
-	store, err := history.NewDiskStore(tmpDir)
+	dbPath := filepath.Join(tmpDir, "demo_history.db")
+	store, err := history.NewSQLiteStore(dbPath)
 	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
 
 	err = SeedHistoryStore(store)
 	require.NoError(t, err)

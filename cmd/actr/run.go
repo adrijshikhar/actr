@@ -119,6 +119,52 @@ func resolveConfigDir(dir string, explicitlySet bool) string {
 	return config.DefaultConfigDir()
 }
 
+// purgeLegacyJSONRuns inspects runsDir for legacy DiskStore artifacts (index.json or subdirectories containing meta.json)
+// and deletes the entire directory to remove stale mock runs.
+func purgeLegacyJSONRuns(runsDir string) error {
+	if runsDir == "" {
+		return nil
+	}
+	info, err := os.Stat(runsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if !info.IsDir() {
+		return nil
+	}
+
+	indexPath := filepath.Join(runsDir, "index.json")
+	hasLegacyIndex := false
+	if _, err := os.Stat(indexPath); err == nil {
+		hasLegacyIndex = true
+	}
+
+	hasLegacyRuns := false
+	entries, err := os.ReadDir(runsDir)
+	if err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				metaPath := filepath.Join(runsDir, entry.Name(), "meta.json")
+				if _, err := os.Stat(metaPath); err == nil {
+					hasLegacyRuns = true
+					break
+				}
+			}
+		}
+	}
+
+	if hasLegacyIndex || hasLegacyRuns {
+		logger.Info("Purging legacy JSON runs directory", "path", runsDir)
+		if err := os.RemoveAll(runsDir); err != nil {
+			return fmt.Errorf("purge legacy runs dir %q: %w", runsDir, err)
+		}
+	}
+	return nil
+}
+
 func runnerOS() string {
 	switch runtime.GOOS {
 	case "darwin":
@@ -175,6 +221,16 @@ func newRunCmd() *cobra.Command {
 
 			cfgDir := resolveConfigDir(configDirFlag, cmd.Flags().Changed("config-dir"))
 
+			// Purge legacy JSON runs directory if present
+			if err := purgeLegacyJSONRuns(filepath.Join(cfgDir, "runs")); err != nil {
+				logger.Warn("failed to purge legacy runs directory", "error", err)
+			}
+			if runsDirFlag != "" && runsDirFlag != filepath.Join(cfgDir, "runs") {
+				if err := purgeLegacyJSONRuns(runsDirFlag); err != nil {
+					logger.Warn("failed to purge custom legacy runs directory", "error", err)
+				}
+			}
+
 			// Load YAML config if present (e.g. config.yaml or config.yml)
 			var yamlCfg *config.RunnerYAMLConfig
 			for _, name := range []string{"config.yaml", "config.yml"} {
@@ -221,15 +277,24 @@ func newRunCmd() *cobra.Command {
 					return fmt.Errorf("initialize supervisor: %w", err)
 				}
 
-				// Wire history store and retention to supervisor monitor server
-				runsDir := runsDirFlag
-				if runsDir == "" {
-					runsDir = filepath.Join(cfgDir, "runs")
+				// Wire SQLite history store and retention to supervisor monitor server
+				dbPath := filepath.Join(cfgDir, "history.db")
+				if runsDirFlag != "" && !cmd.Flags().Changed("config-dir") {
+					if strings.HasSuffix(runsDirFlag, ".db") {
+						dbPath = runsDirFlag
+					} else {
+						dbPath = filepath.Join(runsDirFlag, "history.db")
+					}
 				}
 				if srv := sup.MonitorServer(); srv != nil {
-					if histStore, err := history.NewDiskStore(runsDir); err != nil {
-						logger.Warn("failed to initialize history store, continuing without persistence", "error", err)
+					if histStore, err := history.NewSQLiteStore(dbPath); err != nil {
+						logger.Warn("failed to initialize sqlite history store, continuing without persistence", "error", err)
 					} else {
+						defer func() {
+							if err := histStore.Close(); err != nil {
+								logger.Error("failed to close sqlite history store", "error", err)
+							}
+						}()
 						srv.WithHistoryStore(histStore)
 						maxRuns := 50
 						var maxDiskBytes int64 = 500 * 1024 * 1024
@@ -423,15 +488,23 @@ func newRunCmd() *cobra.Command {
 				}
 			}
 
-			runsDir := runsDirFlag
-			if runsDir == "" {
-				runsDir = filepath.Join(cfgDir, "runs")
-			}
-
 			monServer := monitor.NewServer(filepath.Join(cfgDir, "daemon.sock"), cfg.AgentName)
-			if histStore, err := history.NewDiskStore(runsDir); err != nil {
-				logger.Warn("failed to initialize history store, continuing without persistence", "error", err)
+			dbPath := filepath.Join(cfgDir, "history.db")
+			if runsDirFlag != "" && !cmd.Flags().Changed("config-dir") {
+				if strings.HasSuffix(runsDirFlag, ".db") {
+					dbPath = runsDirFlag
+				} else {
+					dbPath = filepath.Join(runsDirFlag, "history.db")
+				}
+			}
+			if histStore, err := history.NewSQLiteStore(dbPath); err != nil {
+				logger.Warn("failed to initialize sqlite history store, continuing without persistence", "error", err)
 			} else {
+				defer func() {
+					if err := histStore.Close(); err != nil {
+						logger.Error("failed to close sqlite history store", "error", err)
+					}
+				}()
 				monServer.WithHistoryStore(histStore)
 				maxRuns := 50
 				var maxDiskBytes int64 = 200 * 1024 * 1024

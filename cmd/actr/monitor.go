@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/adrijshikhar/actr/internal/config"
@@ -38,17 +39,47 @@ func newMonitorCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfgDir := resolveConfigDir(configDirFlag, cmd.Flags().Changed("config-dir"))
 
-			runsDir := runsDirFlag
-			if runsDir == "" {
-				runsDir = filepath.Join(cfgDir, "runs")
-			}
-
 			var store history.Store
-			if s, err := history.NewDiskStore(runsDir); err == nil {
-				store = s
-				if demoFlag {
-					_ = demo.SeedHistoryStore(store)
+			var cleanupStore func()
+
+			if demoFlag {
+				tmpDemoDir, err := os.MkdirTemp("", "actr-demo-*")
+				if err != nil {
+					return fmt.Errorf("create demo temp dir: %w", err)
 				}
+				s, err := history.NewSQLiteStore(filepath.Join(tmpDemoDir, "demo_history.db"))
+				if err != nil {
+					_ = os.RemoveAll(tmpDemoDir)
+					return fmt.Errorf("create demo sqlite store: %w", err)
+				}
+				store = s
+				if err := demo.SeedHistoryStore(store); err != nil {
+					_ = s.Close()
+					_ = os.RemoveAll(tmpDemoDir)
+					return fmt.Errorf("seed demo history store: %w", err)
+				}
+				cleanupStore = func() {
+					_ = s.Close()
+					_ = os.RemoveAll(tmpDemoDir)
+				}
+			} else {
+				dbPath := filepath.Join(cfgDir, "history.db")
+				if runsDirFlag != "" && !cmd.Flags().Changed("config-dir") {
+					if strings.HasSuffix(runsDirFlag, ".db") {
+						dbPath = runsDirFlag
+					} else {
+						dbPath = filepath.Join(runsDirFlag, "history.db")
+					}
+				}
+				if s, err := history.NewSQLiteStore(dbPath); err == nil {
+					store = s
+					cleanupStore = func() {
+						_ = s.Close()
+					}
+				}
+			}
+			if cleanupStore != nil {
+				defer cleanupStore()
 			}
 
 			var srv *monitor.Server
@@ -87,13 +118,22 @@ func newMonitorCmd() *cobra.Command {
 					model.SetHistoryStore(store)
 				}
 			} else {
-				// Offline mode fallback: load historical runs directly from disk store
+				// Offline mode fallback: load historical runs directly from sqlite store
 				if store == nil {
-					var err error
-					store, err = history.NewDiskStore(runsDir)
-					if err != nil {
-						return fmt.Errorf("initialize history store at %s: %w", runsDir, err)
+					dbPath := filepath.Join(cfgDir, "history.db")
+					if runsDirFlag != "" && !cmd.Flags().Changed("config-dir") {
+						if strings.HasSuffix(runsDirFlag, ".db") {
+							dbPath = runsDirFlag
+						} else {
+							dbPath = filepath.Join(runsDirFlag, "history.db")
+						}
 					}
+					s, err := history.NewSQLiteStore(dbPath)
+					if err != nil {
+						return fmt.Errorf("initialize history store at %s: %w", dbPath, err)
+					}
+					store = s
+					defer func() { _ = s.Close() }()
 				}
 				snap, err := tui.HydrateSnapshotFromStore(store, 50)
 				if err != nil {
