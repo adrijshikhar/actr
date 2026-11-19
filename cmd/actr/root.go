@@ -10,7 +10,7 @@ import (
 
 var (
 	versionMu sync.RWMutex
-	Version   = "v0.1.0"
+	Version   = "v0.2.0"
 	Commit    = "none"
 	Date      = "unknown"
 
