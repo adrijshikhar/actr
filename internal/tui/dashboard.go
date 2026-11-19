@@ -1129,6 +1129,7 @@ func (m *DashboardModel) handleEvent(ev monitor.Event) tea.Cmd {
 					Label:    ev.JobID,
 					Status:   monitor.StatusRunning,
 					Expanded: true,
+					NodeType: NodeJob,
 				}
 				live.AddChild(target)
 			} else {
@@ -1389,17 +1390,28 @@ func (m *DashboardModel) upsertStepNode(jobID string, step *monitor.StepInfo) {
 				ID:       jobID,
 				Label:    jobID,
 				Expanded: true,
+				NodeType: NodeJob,
 			}
 			live.AddChild(parentJob)
 			m.updateBranchLabels()
 		}
 	} else {
 		// jobID is empty (e.g. from coordinator.NotifyStepStart)
-		if len(live.Children) == 1 {
+		if len(live.Children) == 1 && live.Children[0].NodeType != NodeRepo {
 			parentJob = live.Children[0]
 		} else {
 			for _, ch := range live.Children {
-				if ch.ID == "active-job" || ch.ID == "job" || ch.Status == monitor.StatusRunning {
+				if ch.NodeType == NodeRepo {
+					for _, sub := range ch.Children {
+						if sub.ID == "active-job" || sub.ID == "job" || sub.Status == monitor.StatusRunning {
+							parentJob = sub
+							break
+						}
+					}
+					if parentJob != nil {
+						break
+					}
+				} else if ch.ID == "active-job" || ch.ID == "job" || ch.Status == monitor.StatusRunning {
 					parentJob = ch
 					break
 				}
@@ -1417,6 +1429,7 @@ func (m *DashboardModel) upsertStepNode(jobID string, step *monitor.StepInfo) {
 					ID:       "active-job",
 					Label:    "Active Job",
 					Expanded: true,
+					NodeType: NodeJob,
 				}
 				live.AddChild(parentJob)
 				m.updateBranchLabels()
@@ -1448,9 +1461,10 @@ func (m *DashboardModel) upsertStepNode(jobID string, step *monitor.StepInfo) {
 		label = step.ID
 	}
 	targetStep := &TreeNode{
-		ID:     step.ID,
-		Label:  label,
-		Status: step.Status,
+		ID:       step.ID,
+		Label:    label,
+		Status:   step.Status,
+		NodeType: NodeStep,
 	}
 	parentJob.AddChild(targetStep)
 	m.tree.Rebuild()
