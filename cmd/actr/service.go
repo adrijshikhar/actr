@@ -62,7 +62,15 @@ func newServiceCmd() *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			runnerPath := filepath.Join(config.DefaultConfigDir(), ".runner")
-			if _, err := os.Stat(runnerPath); os.IsNotExist(err) {
+			multiRepoCfg := filepath.Join(config.DefaultConfigDir(), "config.yaml")
+			isConfigured := false
+			if _, err := os.Stat(runnerPath); err == nil {
+				isConfigured = true
+			} else if config.IsMultiRepoConfig(multiRepoCfg) {
+				isConfigured = true
+			}
+
+			if !isConfigured {
 				if isTerminalFunc(os.Stdin.Fd()) {
 					reader := bufio.NewReader(cmd.InOrStdin())
 					registerNow, promptErr := registration.PromptConfirm(

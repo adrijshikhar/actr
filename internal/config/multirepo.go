@@ -132,3 +132,19 @@ func LoadSupervisorConfig(configPath string) (*SupervisorConfig, error) {
 
 	return &cfg, nil
 }
+
+// SaveSupervisorConfig writes the supervisor configuration to configPath atomically.
+func SaveSupervisorConfig(configPath string, cfg *SupervisorConfig) error {
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("marshal supervisor config: %w", err)
+	}
+	tmpPath := configPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return fmt.Errorf("write tmp supervisor config: %w", err)
+	}
+	if err := os.Rename(tmpPath, configPath); err != nil {
+		return fmt.Errorf("rename supervisor config: %w", err)
+	}
+	return nil
+}

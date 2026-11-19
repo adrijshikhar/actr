@@ -825,3 +825,84 @@ func TestRegister_ExistingRunner_ForceFlag_SkipsPrompt(t *testing.T) {
 		t.Errorf("expected AgentID 4242, got %d", cfg.AgentID)
 	}
 }
+
+func TestRegisterCmd_MultiRepoAlias(t *testing.T) {
+	expectedToken := "test-token-alias"
+	ts, _, _ := newMockRegistrationServer(t, &expectedToken)
+	defer ts.Close()
+
+	tmpDir := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	ctx := WithHTTPClient(context.Background(), ts.Client())
+
+	code := dispatchWithContext(ctx, []string{
+		"register",
+		"--url", ts.URL + "/adrijshikhar/cxstatusline",
+		"--token", expectedToken,
+		"--repo-alias", "cxstatusline",
+		"--limit-cpu", "2.0",
+		"--limit-memory", "3GB",
+		"--config-dir", tmpDir,
+	}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("expected code 0, got %d. stderr: %s", code, stderr.String())
+	}
+
+	// Verify credentials exist in ~/.actr/repos/cxstatusline/
+	repoDir := filepath.Join(tmpDir, "repos", "cxstatusline")
+	cfg, err := config.LoadRunnerConfig(repoDir)
+	if err != nil {
+		t.Fatalf("failed to load runner config in repoDir: %v", err)
+	}
+	if cfg.AgentID != 4242 {
+		t.Errorf("expected agent ID 4242, got %d", cfg.AgentID)
+	}
+
+	// Verify ~/.actr/config.yaml created
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+	supCfg, err := config.LoadSupervisorConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("failed to load supervisor config: %v", err)
+	}
+	if supCfg.Version != "1" {
+		t.Errorf("expected version '1', got %q", supCfg.Version)
+	}
+	repo, ok := supCfg.Repos["cxstatusline"]
+	if !ok {
+		t.Fatalf("expected cxstatusline in supervisor repos, got: %v", supCfg.Repos)
+	}
+	if repo.Limits.Memory != "3GB" {
+		t.Errorf("expected memory limit 3GB, got %v", repo.Limits.Memory)
+	}
+}
+
+func TestRegisterCmd_TokenStdin(t *testing.T) {
+	expectedToken := "stdin-secret-token"
+	ts, _, _ := newMockRegistrationServer(t, &expectedToken)
+	defer ts.Close()
+
+	tmpDir := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	ctx := WithHTTPClient(context.Background(), ts.Client())
+
+	stdin := bytes.NewBufferString(expectedToken + "\n")
+	code := dispatchWithContextAndIn(ctx, stdin, []string{
+		"register",
+		"--url", ts.URL + "/org/repo",
+		"--token-stdin",
+		"--config-dir", tmpDir,
+	}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("expected code 0, got %d. stderr: %s", code, stderr.String())
+	}
+
+	cfg, err := config.LoadRunnerConfig(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to load runner config: %v", err)
+	}
+	if cfg.AgentID != 4242 {
+		t.Errorf("expected agent ID 4242, got %d", cfg.AgentID)
+	}
+}

@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/adrijshikhar/actr/internal/config"
@@ -21,6 +23,7 @@ import (
 	"github.com/adrijshikhar/actr/internal/monitor"
 	"github.com/adrijshikhar/actr/internal/protocol"
 	"github.com/adrijshikhar/actr/internal/registration"
+	"github.com/adrijshikhar/actr/internal/supervisor"
 	"github.com/spf13/cobra"
 )
 
@@ -195,6 +198,65 @@ func newRunCmd() *cobra.Command {
 			resolvedDriver, err := resolveDriver(cmd, yamlCfg, driverFlag)
 			if err != nil {
 				return err
+			}
+
+			// Check for multi-repo supervisor configuration (e.g. config.yaml with version: "1" and repos:)
+			var multiRepoConfigPath string
+			for _, name := range []string{"config.yaml", "config.yml"} {
+				p := filepath.Join(cfgDir, name)
+				if config.IsMultiRepoConfig(p) {
+					multiRepoConfigPath = p
+					break
+				}
+			}
+
+			if multiRepoConfigPath != "" {
+				supCfg, err := config.LoadSupervisorConfig(multiRepoConfigPath)
+				if err != nil {
+					return fmt.Errorf("load multi-repo supervisor config %q: %w", multiRepoConfigPath, err)
+				}
+				sockPath := filepath.Join(cfgDir, "daemon.sock")
+				sup, err := supervisor.NewSupervisor(supCfg, sockPath)
+				if err != nil {
+					return fmt.Errorf("initialize supervisor: %w", err)
+				}
+
+				// Wire supervisor reload on monitor POST /reload
+				sup.MonitorServer().WithReloadFunc(func() error {
+					logger.Info("Reloading supervisor configuration", "path", multiRepoConfigPath)
+					newCfg, err := config.LoadSupervisorConfig(multiRepoConfigPath)
+					if err != nil {
+						return err
+					}
+					return sup.Reload(newCfg)
+				})
+
+				// SIGHUP listener for daemon configuration reload
+				sigCh := make(chan os.Signal, 1)
+				signal.Notify(sigCh, syscall.SIGHUP)
+				go func() {
+					for {
+						select {
+						case <-ctx.Done():
+							signal.Stop(sigCh)
+							return
+						case <-sigCh:
+							logger.Info("Received SIGHUP, reloading supervisor configuration...")
+							newCfg, err := config.LoadSupervisorConfig(multiRepoConfigPath)
+							if err != nil {
+								logger.Error("Failed to reload supervisor config on SIGHUP", "error", err)
+								continue
+							}
+							if err := sup.Reload(newCfg); err != nil {
+								logger.Error("Supervisor reload failed on SIGHUP", "error", err)
+							} else {
+								logger.Info("Supervisor configuration reloaded successfully via SIGHUP")
+							}
+						}
+					}
+				}()
+
+				return sup.Start(ctx)
 			}
 
 			runnerPath := filepath.Join(cfgDir, ".runner")

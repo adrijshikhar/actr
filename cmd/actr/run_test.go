@@ -1094,3 +1094,53 @@ func TestRunCommand_DockerDriverWiring_MockClient(t *testing.T) {
 		t.Errorf("expected driver name 'docker', got %s", recCoord.receivedDocker.Name())
 	}
 }
+
+func TestRunCmd_MultiRepoMode(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgYAML := `version: "1"
+global:
+  max_concurrent_jobs: 2
+repos:
+  aim:
+    url: https://github.com/adrijshikhar/aim
+`
+	_ = os.WriteFile(filepath.Join(tmpDir, "config.yaml"), []byte(cfgYAML), 0644)
+
+	// Create mock credentials for the repo
+	repoDir := filepath.Join(tmpDir, "repos", "aim")
+	_ = os.MkdirAll(repoDir, 0700)
+	_ = config.SaveRunnerConfig(repoDir, &config.RunnerConfig{
+		AgentID:    101,
+		AgentName:  "aim-runner",
+		PoolID:     1,
+		ServerURL:  "https://github.com/adrijshikhar/aim",
+		GitHubURL:  "https://github.com/adrijshikhar/aim",
+		WorkFolder: filepath.Join(repoDir, "_work"),
+	})
+	_ = config.SaveCredentials(repoDir, &config.Credentials{
+		ClientID:  "client-aim",
+		IDToken:   "id-token-aim",
+		SessionID: "session-aim",
+	})
+	rsaKey, _ := protocol.GenerateRSAKeyPair(2048)
+	rsaBytes, _ := json.Marshal(protocol.ExportRSAParameters(rsaKey))
+	_ = os.WriteFile(filepath.Join(repoDir, ".credentials_rsaparams"), rsaBytes, 0600)
+
+	cmd := newRunCmd()
+	cmd.SetArgs([]string{"--config-dir", tmpDir})
+
+	// Verify detection logic identifies multi-repo mode
+	isMulti := config.IsMultiRepoConfig(filepath.Join(tmpDir, "config.yaml"))
+	if !isMulti {
+		t.Fatal("expected IsMultiRepoConfig to return true")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	cmd.SetContext(ctx)
+
+	err := cmd.Execute()
+	if err != nil && strings.Contains(err.Error(), "run 'actr register' first") {
+		t.Fatalf("expected multi-repo dispatch, but got single-repo missing .runner error: %v", err)
+	}
+}
