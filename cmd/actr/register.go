@@ -60,6 +60,18 @@ func newRegisterCmd() *cobra.Command {
 				ctx = context.Background()
 			}
 
+			// Pre-validate resource limit flags if provided
+			if limitCPU != "" {
+				if _, err := config.ParseCPU(limitCPU); err != nil {
+					return fmt.Errorf("invalid --limit-cpu: %w", err)
+				}
+			}
+			if limitMemory != "" {
+				if _, err := config.ParseMemory(limitMemory); err != nil {
+					return fmt.Errorf("invalid --limit-memory: %w", err)
+				}
+			}
+
 			// Resolve --token-stdin
 			if tokenStdin {
 				scanner := bufio.NewScanner(cmd.InOrStdin())
@@ -105,7 +117,7 @@ func newRegisterCmd() *cobra.Command {
 			var checkedTargetDir string
 			if repoAlias != "" {
 				checkedTargetDir = filepath.Join(configDir, "repos", repoAlias)
-			} else if !isMultiRepoDir {
+			} else if !isMultiRepoDir && limitCPU == "" && limitMemory == "" {
 				checkedTargetDir = configDir
 			}
 
@@ -185,7 +197,7 @@ func newRegisterCmd() *cobra.Command {
 			var alias string
 			if repoAlias != "" {
 				alias = repoAlias
-			} else if isMultiRepoDir {
+			} else if isMultiRepoDir || limitCPU != "" || limitMemory != "" {
 				if cmd.Flags().Changed("name") && name != "actr" {
 					alias = name
 				} else if target != nil && target.Repo != "" {
@@ -205,6 +217,9 @@ func newRegisterCmd() *cobra.Command {
 					if err == nil && strings.TrimSpace(promptedAlias) != "" {
 						alias = strings.TrimSpace(promptedAlias)
 					}
+				}
+				if alias == "" {
+					alias = name
 				}
 			}
 

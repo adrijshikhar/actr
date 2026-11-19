@@ -221,6 +221,28 @@ func newRunCmd() *cobra.Command {
 					return fmt.Errorf("initialize supervisor: %w", err)
 				}
 
+				// Wire history store and retention to supervisor monitor server
+				runsDir := runsDirFlag
+				if runsDir == "" {
+					runsDir = filepath.Join(cfgDir, "runs")
+				}
+				if srv := sup.MonitorServer(); srv != nil {
+					if histStore, err := history.NewDiskStore(runsDir); err != nil {
+						logger.Warn("failed to initialize history store, continuing without persistence", "error", err)
+					} else {
+						srv.WithHistoryStore(histStore)
+						maxRuns := 50
+						var maxDiskBytes int64 = 500 * 1024 * 1024
+						if supCfg.Global.Retention.MaxRuns > 0 {
+							maxRuns = supCfg.Global.Retention.MaxRuns
+						}
+						if supCfg.Global.Retention.MaxDiskMB > 0 {
+							maxDiskBytes = supCfg.Global.Retention.MaxDiskMB * 1024 * 1024
+						}
+						srv.WithRetention(maxRuns, maxDiskBytes)
+					}
+				}
+
 				// Wire supervisor reload on monitor POST /reload
 				sup.MonitorServer().WithReloadFunc(func() error {
 					logger.Info("Reloading supervisor configuration", "path", multiRepoConfigPath)
@@ -232,13 +254,17 @@ func newRunCmd() *cobra.Command {
 				})
 
 				// SIGHUP listener for daemon configuration reload
+				supCtx, supCancel := context.WithCancel(ctx)
+				defer supCancel()
+
 				sigCh := make(chan os.Signal, 1)
 				signal.Notify(sigCh, syscall.SIGHUP)
+				defer signal.Stop(sigCh)
+
 				go func() {
 					for {
 						select {
-						case <-ctx.Done():
-							signal.Stop(sigCh)
+						case <-supCtx.Done():
 							return
 						case <-sigCh:
 							logger.Info("Received SIGHUP, reloading supervisor configuration...")
