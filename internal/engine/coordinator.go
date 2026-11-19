@@ -470,11 +470,36 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	if job.Variables != nil {
 		for k, v := range job.Variables {
 			cumulativeEnv[k] = v
-			if strings.HasPrefix(k, "system.github.") {
-				sub := strings.TrimPrefix(k, "system.github.")
+			lowerK := strings.ToLower(k)
+			if strings.HasPrefix(lowerK, "system.github.") {
+				sub := lowerK[len("system.github."):]
+				switch sub {
+				case "runid":
+					sub = "run_id"
+				case "runnumber":
+					sub = "run_number"
+				case "runattempt":
+					sub = "run_attempt"
+				}
 				upperKey := "GITHUB_" + strings.ToUpper(sub)
 				if cumulativeEnv[upperKey] == "" {
 					cumulativeEnv[upperKey] = v
+				}
+			} else if strings.HasPrefix(lowerK, "system.") {
+				sub := lowerK[len("system."):]
+				switch sub {
+				case "runid", "run_id":
+					if cumulativeEnv["GITHUB_RUN_ID"] == "" {
+						cumulativeEnv["GITHUB_RUN_ID"] = v
+					}
+				case "runnumber", "run_number":
+					if cumulativeEnv["GITHUB_RUN_NUMBER"] == "" {
+						cumulativeEnv["GITHUB_RUN_NUMBER"] = v
+					}
+				case "runattempt", "run_attempt":
+					if cumulativeEnv["GITHUB_RUN_ATTEMPT"] == "" {
+						cumulativeEnv["GITHUB_RUN_ATTEMPT"] = v
+					}
 				}
 			}
 		}
@@ -558,44 +583,36 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		ghCtx = make(map[string]any)
 		parsedContext["github"] = ghCtx
 	}
-	if ghCtx["token"] == nil && cumulativeEnv["GITHUB_TOKEN"] != "" {
-		ghCtx["token"] = cumulativeEnv["GITHUB_TOKEN"]
+	githubEnvPairs := []struct {
+		ctxKey string
+		envKey string
+	}{
+		{"token", "GITHUB_TOKEN"},
+		{"sha", "GITHUB_SHA"},
+		{"ref", "GITHUB_REF"},
+		{"ref_name", "GITHUB_REF_NAME"},
+		{"ref_type", "GITHUB_REF_TYPE"},
+		{"repository", "GITHUB_REPOSITORY"},
+		{"repository_owner", "GITHUB_REPOSITORY_OWNER"},
+		{"event_name", "GITHUB_EVENT_NAME"},
+		{"server_url", "GITHUB_SERVER_URL"},
+		{"api_url", "GITHUB_API_URL"},
+		{"graphql_url", "GITHUB_GRAPHQL_URL"},
+		{"run_id", "GITHUB_RUN_ID"},
+		{"run_number", "GITHUB_RUN_NUMBER"},
+		{"run_attempt", "GITHUB_RUN_ATTEMPT"},
+		{"actor", "GITHUB_ACTOR"},
+		{"workflow", "GITHUB_WORKFLOW"},
+		{"workflow_ref", "GITHUB_WORKFLOW_REF"},
+		{"job", "GITHUB_JOB"},
 	}
-	if cumulativeEnv["GITHUB_TOKEN"] == "" && ghCtx["token"] != nil {
-		cumulativeEnv["GITHUB_TOKEN"] = fmt.Sprint(ghCtx["token"])
-	}
-	if cumulativeEnv["GITHUB_SHA"] == "" && ghCtx["sha"] != nil {
-		cumulativeEnv["GITHUB_SHA"] = fmt.Sprint(ghCtx["sha"])
-	}
-	if ghCtx["sha"] == nil && cumulativeEnv["GITHUB_SHA"] != "" {
-		ghCtx["sha"] = cumulativeEnv["GITHUB_SHA"]
-	}
-	if cumulativeEnv["GITHUB_REF"] == "" && ghCtx["ref"] != nil {
-		cumulativeEnv["GITHUB_REF"] = fmt.Sprint(ghCtx["ref"])
-	}
-	if ghCtx["ref"] == nil && cumulativeEnv["GITHUB_REF"] != "" {
-		ghCtx["ref"] = cumulativeEnv["GITHUB_REF"]
-	}
-	if ghCtx["repository"] == nil && cumulativeEnv["GITHUB_REPOSITORY"] != "" {
-		ghCtx["repository"] = cumulativeEnv["GITHUB_REPOSITORY"]
-	}
-	if cumulativeEnv["GITHUB_REPOSITORY"] == "" && ghCtx["repository"] != nil {
-		cumulativeEnv["GITHUB_REPOSITORY"] = fmt.Sprint(ghCtx["repository"])
-	}
-	if ghCtx["event_name"] == nil && cumulativeEnv["GITHUB_EVENT_NAME"] != "" {
-		ghCtx["event_name"] = cumulativeEnv["GITHUB_EVENT_NAME"]
-	}
-	if cumulativeEnv["GITHUB_EVENT_NAME"] == "" && ghCtx["event_name"] != nil {
-		cumulativeEnv["GITHUB_EVENT_NAME"] = fmt.Sprint(ghCtx["event_name"])
-	}
-	if ghCtx["server_url"] == nil && cumulativeEnv["GITHUB_SERVER_URL"] != "" {
-		ghCtx["server_url"] = cumulativeEnv["GITHUB_SERVER_URL"]
-	}
-	if ghCtx["api_url"] == nil && cumulativeEnv["GITHUB_API_URL"] != "" {
-		ghCtx["api_url"] = cumulativeEnv["GITHUB_API_URL"]
-	}
-	if ghCtx["graphql_url"] == nil && cumulativeEnv["GITHUB_GRAPHQL_URL"] != "" {
-		ghCtx["graphql_url"] = cumulativeEnv["GITHUB_GRAPHQL_URL"]
+	for _, pair := range githubEnvPairs {
+		if ghCtx[pair.ctxKey] == nil && cumulativeEnv[pair.envKey] != "" {
+			ghCtx[pair.ctxKey] = cumulativeEnv[pair.envKey]
+		}
+		if cumulativeEnv[pair.envKey] == "" && ghCtx[pair.ctxKey] != nil {
+			cumulativeEnv[pair.envKey] = fmt.Sprint(ghCtx[pair.ctxKey])
+		}
 	}
 	runnerName := c.runnerName
 	if runnerName == "" {

@@ -2767,3 +2767,48 @@ func TestEvaluateExpression_ContextPathVsLiteral(t *testing.T) {
 		t.Errorf("evaluateExpression(needs.detect.outputs.nonexistent) = %q, want empty", got)
 	}
 }
+
+func TestCoordinator_GitHubContextAndEnvSync(t *testing.T) {
+	d := &mockDriver{}
+	tmpWorkDir := t.TempDir()
+	c := NewCoordinator(d, nil, tmpWorkDir)
+
+	job := &protocol.JobSpecification{
+		JobID:   "test-env-sync",
+		JobName: "test-env-sync",
+		Variables: map[string]string{
+			"system.github.runid":      "12345678",
+			"system.github.runnumber":  "42",
+			"system.github.runattempt": "1",
+			"system.github.actor":      "test-actor",
+			"system.github.repository": "org/repo",
+		},
+		Steps: []protocol.JobStep{
+			{ID: "s1", Name: "step 1", Script: "echo test"},
+		},
+	}
+
+	_, err := c.ExecuteJob(context.Background(), job, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(d.stepsRun) != 1 {
+		t.Fatalf("expected 1 step run, got %d", len(d.stepsRun))
+	}
+
+	env := d.stepsRun[0].Environment
+	expected := map[string]string{
+		"GITHUB_RUN_ID":     "12345678",
+		"GITHUB_RUN_NUMBER": "42",
+		"GITHUB_RUN_ATTEMPT": "1",
+		"GITHUB_ACTOR":      "test-actor",
+		"GITHUB_REPOSITORY": "org/repo",
+	}
+
+	for k, expectedVal := range expected {
+		if got := env[k]; got != expectedVal {
+			t.Errorf("expected env %q = %q, got %q", k, expectedVal, got)
+		}
+	}
+}
