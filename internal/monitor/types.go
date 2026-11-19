@@ -45,6 +45,7 @@ type JobInfo struct {
 	Workflow  string      `json:"workflow"`
 	Repo      string      `json:"repo"`
 	RepoAlias string      `json:"repo_alias,omitempty"`
+	RepoURL   string      `json:"repo_url,omitempty"`
 	Owner     string      `json:"owner"`
 	Status    StepStatus  `json:"status"`
 	Steps     []*StepInfo `json:"steps"`
@@ -136,6 +137,7 @@ type RunSummary struct {
 	Workflow       string     `json:"workflow"`
 	Repo           string     `json:"repo"`
 	RepoAlias      string     `json:"repo_alias,omitempty"`
+	RepoURL        string     `json:"repo_url,omitempty"`
 	Owner          string     `json:"owner"`
 	Status         StepStatus `json:"status"`
 	StartedAt      time.Time  `json:"started_at"`
@@ -179,6 +181,7 @@ type RunMetadata struct {
 	Workflow       string               `json:"workflow"`
 	Repo           string               `json:"repo"`
 	RepoAlias      string               `json:"repo_alias,omitempty"`
+	RepoURL        string               `json:"repo_url,omitempty"`
 	Owner          string               `json:"owner"`
 	Status         StepStatus           `json:"status"`
 	StartedAt      time.Time            `json:"started_at"`
@@ -206,12 +209,13 @@ type LogStore interface {
 
 // Pruner defines the interface for retention pruning and crash recovery.
 type Pruner interface {
-	Prune(maxRuns int, maxDiskBytes int64) (prunedCount int, err error)
+	Prune(maxRuns int, maxDiskBytes ...int64) (prunedCount int, err error)
 	RecoverInterruptedRuns() (recoveredCount int, err error)
 }
 
 // HistoryStore defines the interface for local run history persistence.
 type HistoryStore interface {
+	io.Closer
 	LogStore
 	Pruner
 	StartRun(job *JobInfo, limits *config.LimitsConfig, driver string) error

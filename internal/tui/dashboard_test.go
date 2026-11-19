@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -15,6 +17,7 @@ import (
 	"github.com/adrijshikhar/actr/internal/monitor"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -994,14 +997,21 @@ func TestDashboard_UnifiedTree_LiveAndHistoricalBranches(t *testing.T) {
 	if histBranch.Label != "HISTORICAL RUNS (2 past runs)" {
 		t.Fatalf("expected historical branch label 'HISTORICAL RUNS (2 past runs)', got %q", histBranch.Label)
 	}
-	if len(histBranch.Children) != 2 {
-		t.Fatalf("expected 2 historical jobs under historical branch, got %d", len(histBranch.Children))
+	if len(histBranch.Children) != 1 {
+		t.Fatalf("expected 1 repo group under historical branch, got %d", len(histBranch.Children))
 	}
-	if histBranch.Children[0].ID != "job-hist-1" {
-		t.Fatalf("expected first historical job ID 'job-hist-1', got %q", histBranch.Children[0].ID)
+	defaultRepo := histBranch.Children[0]
+	if defaultRepo.NodeType != NodeRepo || defaultRepo.Label != "default" {
+		t.Fatalf("expected default repo node, got %+v", defaultRepo)
 	}
-	if histBranch.Children[1].ID != "job-hist-2" {
-		t.Fatalf("expected second historical job ID 'job-hist-2', got %q", histBranch.Children[1].ID)
+	if len(defaultRepo.Children) != 2 {
+		t.Fatalf("expected 2 historical jobs under default repo node, got %d", len(defaultRepo.Children))
+	}
+	if defaultRepo.Children[0].ID != "job-hist-1" {
+		t.Fatalf("expected first historical job ID 'job-hist-1', got %q", defaultRepo.Children[0].ID)
+	}
+	if defaultRepo.Children[1].ID != "job-hist-2" {
+		t.Fatalf("expected second historical job ID 'job-hist-2', got %q", defaultRepo.Children[1].ID)
 	}
 
 	view := m.tree.View(60)
@@ -1054,7 +1064,10 @@ func TestDashboard_LiveJobTransitionsToHistoricalOnFinish(t *testing.T) {
 	liveBranch := m.tree.Root.Children[0]
 	histBranch := m.tree.Root.Children[1]
 	if len(liveBranch.Children) != 2 || len(histBranch.Children) != 1 {
-		t.Fatalf("expected 2 live and 1 historical job, got %d and %d", len(liveBranch.Children), len(histBranch.Children))
+		t.Fatalf("expected 2 live and 1 historical repo, got %d and %d", len(liveBranch.Children), len(histBranch.Children))
+	}
+	if len(histBranch.Children[0].Children) != 1 {
+		t.Fatalf("expected 1 historical job in default repo, got %d", len(histBranch.Children[0].Children))
 	}
 
 	// 1. EventJobStart adds a new job under LIVE RUNS
@@ -1103,14 +1116,18 @@ func TestDashboard_LiveJobTransitionsToHistoricalOnFinish(t *testing.T) {
 		}
 	}
 
-	if len(histBranch.Children) != 2 {
-		t.Fatalf("expected 2 historical jobs after job-1 finished, got %d", len(histBranch.Children))
+	if len(histBranch.Children) != 1 {
+		t.Fatalf("expected 1 historical repo after job-1 finished, got %d", len(histBranch.Children))
 	}
-	if histBranch.Children[0].ID != "job-1" {
-		t.Fatalf("expected job-1 prepended as first historical job, got %q", histBranch.Children[0].ID)
+	defaultRepo := histBranch.Children[0]
+	if len(defaultRepo.Children) != 2 {
+		t.Fatalf("expected 2 historical jobs after job-1 finished, got %d", len(defaultRepo.Children))
 	}
-	if histBranch.Children[0].Status != monitor.StatusSuccess {
-		t.Fatalf("expected job-1 status success, got %v", histBranch.Children[0].Status)
+	if defaultRepo.Children[0].ID != "job-1" {
+		t.Fatalf("expected job-1 prepended as first historical job, got %q", defaultRepo.Children[0].ID)
+	}
+	if defaultRepo.Children[0].Status != monitor.StatusSuccess {
+		t.Fatalf("expected job-1 status success, got %v", defaultRepo.Children[0].Status)
 	}
 
 	if liveBranch.Label != "LIVE RUNS (2 active)" {
@@ -1177,8 +1194,8 @@ func TestDashboard_HistoricalStepSelection_LoadsLogs(t *testing.T) {
 	}
 
 	// Expand historical job to expose its steps
-	histBranch := m.tree.Root.Children[1]
-	jobNode := histBranch.Children[0]
+	jobNode := m.tree.FindNode("job-hist-1")
+	require.NotNil(t, jobNode, "job-hist-1 must exist in tree")
 	jobNode.Expanded = true
 	m.tree.Rebuild()
 
@@ -1294,8 +1311,8 @@ func TestDashboard_HistoricalSelection_PeakVitalsHUD(t *testing.T) {
 	assert.Contains(t, dashView, "DISK WR: 84 MB")
 
 	// 3. Expand historical job and select step-h1: telemetry remains in Peak Vitals mode
-	histBranch := m.tree.Root.Children[1]
-	jobNode := histBranch.Children[0]
+	jobNode := m.tree.FindNode("job-hist-1")
+	require.NotNil(t, jobNode, "job-hist-1 must exist in tree")
 	jobNode.Expanded = true
 	m.tree.Rebuild()
 	foundStep := m.tree.SelectFirst(func(n *TreeNode) bool { return n.ID == "step-h1" })
@@ -1389,7 +1406,7 @@ func TestDashboard_MultiRepoExpansionAndRepoSelection(t *testing.T) {
 
 	// Verify repo selection renders repository info in right pane
 	repoView := model.viewport.View()
-	assert.Contains(t, repoView, "Repository: adrijshikhar/aim")
+	assert.Contains(t, repoView, "Repository: aim")
 	assert.Contains(t, repoView, "Active Jobs: 1")
 
 	// Collapse repo node
@@ -1403,4 +1420,903 @@ func TestDashboard_MultiRepoExpansionAndRepoSelection(t *testing.T) {
 	repoNodeAfter := model.tree.FindNode(repoNode.ID)
 	require.NotNil(t, repoNodeAfter)
 	assert.False(t, repoNodeAfter.Expanded, "expected collapsed state to be preserved across snapshot hydration")
+}
+
+func TestDashboard_AlwaysVisibleLiveRepos_ZeroAndNonZeroActive(t *testing.T) {
+	// 1. With 0 active jobs, both configured repos are visible under LIVE RUNS with idle badges
+	snap0 := &monitor.Snapshot{
+		RunnerName: "actr • multi-repo",
+		SupervisorStatus: &monitor.SupervisorStatus{
+			GlobalMaxJobs: 2,
+			GlobalActive:  0,
+			RepoSlots: []*monitor.RepoSlotInfo{
+				{Alias: "cxstatusline", MaxJobs: 1, ActiveJobs: 0, Status: "idle"},
+				{Alias: "aim", MaxJobs: 1, ActiveJobs: 0, Status: "idle"},
+			},
+		},
+		ActiveJobs: []*monitor.JobInfo{},
+	}
+
+	model := NewDashboardModel("/tmp/daemon.sock")
+	model.ready = true
+	_ = model.ApplySnapshot(snap0)
+
+	liveNode := model.getLiveBranch()
+	require.NotNil(t, liveNode)
+	assert.Equal(t, "LIVE RUNS (0 active)", liveNode.Label)
+
+	// Repos should be sorted by alias ascending: aim then cxstatusline
+	require.Len(t, liveNode.Children, 2)
+	assert.Equal(t, "repo:aim", liveNode.Children[0].ID)
+	assert.Equal(t, "aim (idle • 0/1 slots)", liveNode.Children[0].Label)
+	assert.Empty(t, liveNode.Children[0].Children)
+
+	assert.Equal(t, "repo:cxstatusline", liveNode.Children[1].ID)
+	assert.Equal(t, "cxstatusline (idle • 0/1 slots)", liveNode.Children[1].Label)
+	assert.Empty(t, liveNode.Children[1].Children)
+
+	// 2. With 1 active job for aim, aim becomes busy with the job nested, cxstatusline remains idle
+	snap1 := &monitor.Snapshot{
+		RunnerName: "actr • multi-repo",
+		SupervisorStatus: &monitor.SupervisorStatus{
+			GlobalMaxJobs: 2,
+			GlobalActive:  1,
+			RepoSlots: []*monitor.RepoSlotInfo{
+				{Alias: "aim", MaxJobs: 1, ActiveJobs: 1, Status: "busy"},
+				{Alias: "cxstatusline", MaxJobs: 1, ActiveJobs: 0, Status: "idle"},
+			},
+		},
+		ActiveJobs: []*monitor.JobInfo{
+			{
+				ID:        "job-aim-1",
+				Name:      "CI Test",
+				RepoAlias: "aim",
+				Status:    monitor.StatusRunning,
+				Steps: []*monitor.StepInfo{
+					{ID: "step-1", Name: "Run Tests", Status: monitor.StatusRunning},
+				},
+			},
+		},
+	}
+	_ = model.ApplySnapshot(snap1)
+	liveNode = model.getLiveBranch()
+	require.NotNil(t, liveNode)
+
+	assert.Equal(t, "LIVE RUNS (1 active)", liveNode.Label)
+	require.Len(t, liveNode.Children, 2)
+
+	assert.Equal(t, "aim (busy • 1/1 slots)", liveNode.Children[0].Label)
+	require.Len(t, liveNode.Children[0].Children, 1)
+	assert.Equal(t, "job-aim-1", liveNode.Children[0].Children[0].ID)
+	require.Len(t, liveNode.Children[0].Children[0].Children, 1)
+	assert.Equal(t, "step-1", liveNode.Children[0].Children[0].Children[0].ID)
+
+	assert.Equal(t, "cxstatusline (idle • 0/1 slots)", liveNode.Children[1].Label)
+	assert.Empty(t, liveNode.Children[1].Children)
+}
+
+func TestDashboard_HierarchicalHistoricalRuns_GroupedByRepoAlias(t *testing.T) {
+	snap := &monitor.Snapshot{
+		RunnerName: "actr • multi-repo",
+		RecentJobs: []*monitor.JobInfo{
+			{
+				ID:        "hist-1",
+				Name:      "Aim Build",
+				RepoAlias: "aim",
+				Status:    monitor.StatusSuccess,
+			},
+			{
+				ID:        "hist-2",
+				Name:      "CX Lint",
+				RepoAlias: "cxstatusline",
+				Status:    monitor.StatusSuccess,
+			},
+			{
+				ID:        "hist-3",
+				Name:      "Legacy Job",
+				RepoAlias: "", // Empty should fallback to "default"
+				Status:    monitor.StatusFailed,
+			},
+			{
+				ID:        "hist-4",
+				Name:      "Aim Tests",
+				RepoAlias: "aim",
+				Status:    monitor.StatusSuccess,
+			},
+		},
+	}
+
+	model := NewDashboardModel("/tmp/daemon.sock")
+	model.ready = true
+	_ = model.ApplySnapshot(snap)
+
+	histNode := model.getHistoricalBranch()
+	require.NotNil(t, histNode)
+	// 4 total past runs across 3 distinct repo groups
+	assert.Equal(t, "HISTORICAL RUNS (4 past runs)", histNode.Label)
+
+	// Repos sorted alphabetically: aim, cxstatusline, default
+	require.Len(t, histNode.Children, 3)
+
+	// aim
+	aimGroup := histNode.Children[0]
+	assert.Equal(t, "hist-repo:aim", aimGroup.ID)
+	assert.Equal(t, "aim", aimGroup.Label)
+	assert.Equal(t, NodeRepo, aimGroup.NodeType)
+	require.Len(t, aimGroup.Children, 2)
+	assert.Equal(t, "hist-1", aimGroup.Children[0].ID)
+	assert.Equal(t, "hist-4", aimGroup.Children[1].ID)
+
+	// cxstatusline
+	cxGroup := histNode.Children[1]
+	assert.Equal(t, "hist-repo:cxstatusline", cxGroup.ID)
+	assert.Equal(t, "cxstatusline", cxGroup.Label)
+	assert.Equal(t, NodeRepo, cxGroup.NodeType)
+	require.Len(t, cxGroup.Children, 1)
+	assert.Equal(t, "hist-2", cxGroup.Children[0].ID)
+
+	// default
+	defaultGroup := histNode.Children[2]
+	assert.Equal(t, "hist-repo:default", defaultGroup.ID)
+	assert.Equal(t, "default", defaultGroup.Label)
+	assert.Equal(t, NodeRepo, defaultGroup.NodeType)
+	require.Len(t, defaultGroup.Children, 1)
+	assert.Equal(t, "hist-3", defaultGroup.Children[0].ID)
+}
+
+func TestDashboard_NodeTraversalAndStepSelection(t *testing.T) {
+	snap := &monitor.Snapshot{
+		RunnerName: "actr • multi-repo",
+		RecentJobs: []*monitor.JobInfo{
+			{
+				ID:        "job-aim-h1",
+				Name:      "Aim Pipeline",
+				RepoAlias: "aim",
+				Status:    monitor.StatusSuccess,
+				Steps: []*monitor.StepInfo{
+					{ID: "step-aim-s1", Name: "Build Artifact", Status: monitor.StatusSuccess},
+				},
+			},
+		},
+		StepLogs: map[string][]string{
+			"job-aim-h1/step-aim-s1": {"compiled successfully", "exit code 0"},
+		},
+	}
+
+	model := NewDashboardModel("/tmp/daemon.sock")
+	model.width = 100
+	model.height = 30
+	model.ready = true
+	_ = model.ApplySnapshot(snap)
+
+	histSummary := &HistoricalRunSummary{
+		JobName:        "Aim Pipeline",
+		Status:         monitor.StatusSuccess,
+		DurationSec:    45,
+		PeakCPUPercent: 78.5,
+	}
+	model.SetHistoricalRunSummary("job-aim-h1", histSummary)
+
+	// 1. Select the repo group node: HUD should NOT treat it as a job
+	foundRepo := model.tree.SelectFirst(func(n *TreeNode) bool { return n.ID == "hist-repo:aim" })
+	require.True(t, foundRepo)
+	_ = model.updateActiveStepLogs()
+	assert.Nil(t, findHistoricalJobNode(model.tree.SelectedNode()))
+	assert.False(t, model.telemetry.IsHistorical())
+
+	// Viewport should show historical repository info
+	repoView := model.viewport.View()
+	assert.Contains(t, repoView, "Repository: aim")
+	assert.Contains(t, repoView, "Historical Runs: 1")
+
+	// 2. Select the historical job node: HUD switches to historical Peak Vitals mode
+	foundJob := model.tree.SelectFirst(func(n *TreeNode) bool { return n.ID == "job-aim-h1" })
+	require.True(t, foundJob)
+	_ = model.updateActiveStepLogs()
+	assert.Equal(t, "job-aim-h1", findHistoricalJobNode(model.tree.SelectedNode()).ID)
+	assert.True(t, model.telemetry.IsHistorical())
+
+	// 3. Expand the job and select its step: step node resolves enclosing parent job through repo branch
+	jobNode := model.tree.FindNode("job-aim-h1")
+	require.NotNil(t, jobNode)
+	jobNode.Expanded = true
+	model.tree.Rebuild()
+
+	foundStep := model.tree.SelectFirst(func(n *TreeNode) bool { return n.ID == "step-aim-s1" })
+	require.True(t, foundStep)
+	_ = model.updateActiveStepLogs()
+
+	stepNode := model.tree.SelectedNode()
+	require.NotNil(t, stepNode)
+	assert.Equal(t, "step-aim-s1", stepNode.ID)
+
+	// Traversal resolves enclosing job
+	resolvedJob := findHistoricalJobNode(stepNode)
+	require.NotNil(t, resolvedJob)
+	assert.Equal(t, "job-aim-h1", resolvedJob.ID)
+
+	// HUD stays in Historical mode for the enclosing job
+	assert.True(t, model.telemetry.IsHistorical())
+
+	// Viewport contains step logs resolved by jobID/stepID key
+	vp := model.viewport.View()
+	assert.Contains(t, vp, "compiled successfully")
+	assert.Contains(t, vp, "exit code 0")
+}
+
+func TestDashboard_SidebarSearch(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	newModel, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m = newModel.(*DashboardModel)
+
+	// Build a snapshot with two repos: aim (with job containing smoke step) and cxstatusline
+	now := time.Now()
+	snap := &monitor.Snapshot{
+		RunnerName: "actr",
+		ActiveJobs: []*monitor.JobInfo{
+			{
+				ID:        "job-aim",
+				Name:      "CI Test",
+				RepoAlias: "aim",
+				Repo:      "aim",
+				Status:    monitor.StatusRunning,
+				StartedAt: now,
+				Steps: []*monitor.StepInfo{
+					{ID: "s1", Name: "Setup", Status: monitor.StatusSuccess},
+					{ID: "s2", Name: "Smoke Tests", Status: monitor.StatusRunning},
+				},
+			},
+			{
+				ID:        "job-cx",
+				Name:      "Lint Check",
+				RepoAlias: "cxstatusline",
+				Repo:      "cxstatusline",
+				Status:    monitor.StatusRunning,
+				StartedAt: now,
+				Steps: []*monitor.StepInfo{
+					{ID: "s3", Name: "Run Linter", Status: monitor.StatusSuccess},
+				},
+			},
+		},
+	}
+	m.ApplySnapshot(snap)
+
+	// Verify initial state
+	assert.False(t, m.IsTreeSearching())
+	assert.Equal(t, "", m.Tree().Filter())
+
+	// 1. Press '/' to activate search mode
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = newModel.(*DashboardModel)
+	assert.True(t, m.IsTreeSearching())
+	assert.Contains(t, m.View(), "Search:")
+
+	// 2. Type "smoke" into search input
+	for _, r := range "smoke" {
+		newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = newModel.(*DashboardModel)
+	}
+
+	assert.Equal(t, "smoke", m.Tree().Filter())
+	dashView := m.View()
+	assert.Contains(t, dashView, "Smoke Tests")
+	assert.NotContains(t, dashView, "cxstatusline")
+	assert.NotContains(t, dashView, "Run Linter")
+
+	// 3. Press Enter to commit search and return to tree navigation
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = newModel.(*DashboardModel)
+	assert.False(t, m.IsTreeSearching())
+	assert.Equal(t, "smoke", m.Tree().Filter())
+
+	// Navigate with down arrow among filtered rows
+	initialCursor := m.Tree().Cursor
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = newModel.(*DashboardModel)
+	assert.GreaterOrEqual(t, m.Tree().Cursor, initialCursor)
+
+	// 4. Press Esc to clear filter and restore full tree
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = newModel.(*DashboardModel)
+	assert.False(t, m.IsTreeSearching())
+	assert.Equal(t, "", m.Tree().Filter())
+
+	restoredView := m.View()
+	assert.Contains(t, restoredView, "cxstatusline")
+
+	// 5. Press '/' then immediately 'Esc' cancels search
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = newModel.(*DashboardModel)
+	assert.True(t, m.IsTreeSearching())
+
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = newModel.(*DashboardModel)
+	assert.False(t, m.IsTreeSearching())
+	assert.Equal(t, "", m.Tree().Filter())
+}
+
+func TestDashboard_LogSearch_ActivationAndNavigation(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	newModel, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+	m = newModel.(*DashboardModel)
+
+	// Create 50 log lines with matches at lines 2, 25, and 45
+	lines := make([]string, 50)
+	for i := 0; i < 50; i++ {
+		lines[i] = fmt.Sprintf("line %02d: info output log", i)
+	}
+	lines[2] = "line 02: test_error: assertion failed in module_a"
+	lines[25] = "line 25: test_error: timeout in module_c"
+	lines[45] = "line 45: test_error: final summary with 2 failures"
+
+	snap := &monitor.Snapshot{
+		RunnerName: "actr",
+		ActiveJobs: []*monitor.JobInfo{
+			{
+				ID:     "job-1",
+				Name:   "Test Job",
+				Status: monitor.StatusRunning,
+				Steps: []*monitor.StepInfo{
+					{ID: "step-1", Name: "Run Tests", Status: monitor.StatusRunning},
+				},
+			},
+		},
+		StepLogs: map[string][]string{
+			"job-1/step-1": lines,
+		},
+	}
+	m.ApplySnapshot(snap)
+
+	found := m.Tree().SelectFirst(func(n *TreeNode) bool {
+		return n.ID == "step-1"
+	})
+	require.True(t, found, "step-1 should be selectable in tree")
+	m.updateActiveStepLogs()
+
+	// Initial assertions
+	assert.False(t, m.IsLogSearching())
+	assert.Equal(t, "", m.SearchQuery())
+	assert.Empty(t, m.SearchMatches())
+
+	// 1. Activate log search with Ctrl+F
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlF})
+	m = newModel.(*DashboardModel)
+	assert.True(t, m.IsLogSearching())
+	assert.Equal(t, FocusViewport, m.Focus())
+
+	view := m.View()
+	assert.Contains(t, view, "Find in logs:")
+	assert.Contains(t, view, "(No matches)")
+
+	// 2. Type "test_error"
+	query := "test_error"
+	for _, r := range query {
+		newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = newModel.(*DashboardModel)
+	}
+
+	assert.Equal(t, query, m.SearchQuery())
+	expectedMatches := []int{2, 25, 45}
+	assert.Equal(t, expectedMatches, m.SearchMatches())
+	assert.Equal(t, 0, m.CurrentMatchIdx())
+
+	view = m.View()
+	assert.Contains(t, view, "(Match 1 of 3)")
+
+	// 3. Press Enter to commit search and transition to match navigation
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = newModel.(*DashboardModel)
+	assert.False(t, m.IsLogSearching())
+	assert.Equal(t, query, m.SearchQuery())
+	assert.Equal(t, expectedMatches, m.SearchMatches())
+	assert.Contains(t, m.View(), "(Match 1 of 3)")
+
+	// 4. Navigate matches with 'n' and test scrolling
+	// Next -> match index 1 (line 25)
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = newModel.(*DashboardModel)
+	assert.Equal(t, 1, m.CurrentMatchIdx())
+	assert.Contains(t, m.View(), "(Match 2 of 3)")
+	assert.Greater(t, m.Viewport().YOffset, 0, "viewport should scroll down for match at line 25")
+
+	// Next -> match index 2 (line 45)
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = newModel.(*DashboardModel)
+	assert.Equal(t, 2, m.CurrentMatchIdx())
+	assert.Contains(t, m.View(), "(Match 3 of 3)")
+	assert.Greater(t, m.Viewport().YOffset, 20, "viewport should scroll further down for match at line 45")
+
+	// Next -> wraps to match index 0 (line 2)
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = newModel.(*DashboardModel)
+	assert.Equal(t, 0, m.CurrentMatchIdx())
+	assert.Contains(t, m.View(), "(Match 1 of 3)")
+	assert.Equal(t, 0, m.Viewport().YOffset, "viewport should scroll back to top for line 2")
+
+	// 5. Navigate backwards with 'N'
+	// Prev -> wraps to match index 2 (line 45)
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'N'}})
+	m = newModel.(*DashboardModel)
+	assert.Equal(t, 2, m.CurrentMatchIdx())
+	assert.Contains(t, m.View(), "(Match 3 of 3)")
+	assert.Greater(t, m.Viewport().YOffset, 20)
+
+	// Prev -> match index 1 (line 25)
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'N'}})
+	m = newModel.(*DashboardModel)
+	assert.Equal(t, 1, m.CurrentMatchIdx())
+	assert.Contains(t, m.View(), "(Match 2 of 3)")
+
+	// 6. Test streaming new log event while search active: adds match without breaking current index
+	newModel, _ = m.Update(EventMsg(monitor.Event{
+		Type:    monitor.EventStepLog,
+		JobID:   "job-1",
+		StepID:  "step-1",
+		LogLine: "line 50: test_error: appended stream log",
+	}))
+	m = newModel.(*DashboardModel)
+	assert.Equal(t, 1, m.CurrentMatchIdx())
+	assert.Equal(t, []int{2, 25, 45, 50}, m.SearchMatches())
+	assert.Contains(t, m.View(), "(Match 2 of 4)")
+
+	// 7. Dismiss search with Esc
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = newModel.(*DashboardModel)
+	assert.False(t, m.IsLogSearching())
+	assert.Equal(t, "", m.SearchQuery())
+	assert.Empty(t, m.SearchMatches())
+	assert.NotContains(t, m.View(), "Find in logs:")
+
+	// 8. Test activation via '/' when focus is FocusViewport
+	m.SetFocus(FocusViewport)
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = newModel.(*DashboardModel)
+	assert.True(t, m.IsLogSearching())
+	assert.Contains(t, m.View(), "Find in logs:")
+
+	// Dismiss with Esc while typing
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = newModel.(*DashboardModel)
+	assert.False(t, m.IsLogSearching())
+	assert.NotContains(t, m.View(), "Find in logs:")
+}
+
+func TestDashboard_LogSearch_Highlighting(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	t.Cleanup(func() {
+		lipgloss.SetColorProfile(termenv.Ascii)
+	})
+
+	m := NewDashboardModel("/tmp/test.sock")
+	newModel, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m = newModel.(*DashboardModel)
+
+	snap := &monitor.Snapshot{
+		RunnerName: "actr",
+		ActiveJobs: []*monitor.JobInfo{
+			{
+				ID:     "job-1",
+				Name:   "Test Job",
+				Status: monitor.StatusRunning,
+				Steps: []*monitor.StepInfo{
+					{ID: "step-1", Name: "Run Tests", Status: monitor.StatusRunning},
+				},
+			},
+		},
+		StepLogs: map[string][]string{
+			"job-1/step-1": {
+				"line 0: starting build",
+				"line 1: connection failure in db",
+				"line 2: retrying...",
+				"line 3: fatal failure in network",
+			},
+		},
+	}
+	m.ApplySnapshot(snap)
+
+	found := m.Tree().SelectFirst(func(n *TreeNode) bool {
+		return n.ID == "step-1"
+	})
+	require.True(t, found)
+	m.updateActiveStepLogs()
+
+	// Initial clean content should not contain search highlight ANSI sequences
+	initialView := m.Viewport().View()
+	assert.Contains(t, initialView, "connection failure in db")
+	assert.Contains(t, initialView, "fatal failure in network")
+
+	// Activate search and search for "failure"
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlF})
+	m = newModel.(*DashboardModel)
+	for _, r := range "failure" {
+		newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = newModel.(*DashboardModel)
+	}
+
+	// Active match on line 1, normal match on line 3
+	vpContent := m.Viewport().View()
+	assert.Contains(t, vpContent, "failure")
+
+	// Rendered active match uses activeMatchStyle (Background 208)
+	expectedActive := activeMatchStyle.Render("failure")
+	// Rendered normal match uses normalMatchStyle (Background 226)
+	expectedNormal := normalMatchStyle.Render("failure")
+
+	assert.Contains(t, vpContent, expectedActive, "active match line should have activeMatchStyle (orange/208)")
+	assert.Contains(t, vpContent, expectedNormal, "other match line should have normalMatchStyle (yellow/226)")
+
+	// Commit search and advance to next match with 'n'
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = newModel.(*DashboardModel)
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = newModel.(*DashboardModel)
+
+	vpContentAfterNext := m.Viewport().View()
+	assert.Contains(t, vpContentAfterNext, expectedActive)
+	assert.Contains(t, vpContentAfterNext, expectedNormal)
+
+	// Dismiss search with Esc: highlights removed
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = newModel.(*DashboardModel)
+
+	vpContentClean := m.Viewport().View()
+	assert.NotContains(t, vpContentClean, expectedActive)
+	assert.NotContains(t, vpContentClean, expectedNormal)
+	assert.Contains(t, vpContentClean, "connection failure in db")
+	assert.Contains(t, vpContentClean, "fatal failure in network")
+}
+
+func TestDashboard_MouseTreeSelection(t *testing.T) {
+	m := NewDashboardModel(testSocketPath(t))
+	m.ready = true
+	resModel, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = resModel.(*DashboardModel)
+
+	snap := &monitor.Snapshot{
+		RunnerName: "test-runner",
+		ActiveJobs: []*monitor.JobInfo{
+			{
+				ID:       "job-1",
+				Name:     "Build Job",
+				Workflow: "ci.yml",
+				Repo:     "adrijshikhar/actr",
+				Status:   monitor.StatusRunning,
+				Steps: []*monitor.StepInfo{
+					{ID: "step-1", Name: "Checkout", Status: monitor.StatusSuccess},
+					{ID: "step-2", Name: "Compile", Status: monitor.StatusRunning},
+				},
+			},
+		},
+	}
+	m.ApplySnapshot(snap)
+	m.stepLogs["job-1/step-1"] = []string{"checkout finished successfully"}
+	m.stepLogs["job-1/step-2"] = []string{"compiling binary..."}
+
+	// Visible rows in tree:
+	// row 0: root ("actr")
+	// row 1: live-runs ("LIVE RUNS (1 active)")
+	// row 2: repo ("adrijshikhar/actr")
+	// row 3: job-1 ("Build Job")
+	// row 4: step-1 ("Checkout")
+	// row 5: step-2 ("Compile")
+	rows := m.Tree().Rows()
+	require.GreaterOrEqual(t, len(rows), 6)
+
+	// treeTopOffset is 1 when not searching (Y=0 is top border, Y=1 is row 0)
+	// Click on row 4 (step-1) at X=10, Y=5 (row = 5 - 1 = 4)
+	newModel, _ := m.Update(tea.MouseMsg{
+		X:      10,
+		Y:      5,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	m = newModel.(*DashboardModel)
+
+	assert.Equal(t, FocusTree, m.Focus())
+	assert.Equal(t, 4, m.Tree().Cursor)
+	assert.Equal(t, "step-1", m.Tree().SelectedNode().ID)
+	assert.Contains(t, m.Viewport().View(), "checkout finished successfully")
+
+	// Click on row 3 (job-1) label at X=15, Y=4 (row = 4 - 1 = 3)
+	jobNode := m.Tree().NodeAtRow(3)
+	require.NotNil(t, jobNode)
+	assert.True(t, jobNode.Expanded)
+
+	newModel, _ = m.Update(tea.MouseMsg{
+		X:      15,
+		Y:      4,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	m = newModel.(*DashboardModel)
+	assert.Equal(t, 3, m.Tree().Cursor)
+
+	// Double click: click again within 350ms -> toggles expand
+	newModel, _ = m.Update(tea.MouseMsg{
+		X:      15,
+		Y:      4,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	m = newModel.(*DashboardModel)
+	assert.False(t, jobNode.Expanded, "double clicking should collapse the node")
+
+	// Wait past the 350ms double-click window to verify chevron click independently
+	time.Sleep(400 * time.Millisecond)
+
+	// Chevron click on row 3: job-1 is depth 3 (indent = 6 spaces, chevron around X=7..9)
+	// Click chevron at X=7, Y=4
+	newModel, _ = m.Update(tea.MouseMsg{
+		X:      7,
+		Y:      4,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	assert.NotNil(t, newModel)
+	assert.True(t, jobNode.Expanded, "clicking on chevron should expand the node immediately")
+}
+
+func TestDashboard_MouseWheelScrolling(t *testing.T) {
+	m := NewDashboardModel(testSocketPath(t))
+	m.ready = true
+	resModel, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = resModel.(*DashboardModel)
+
+	snap := &monitor.Snapshot{
+		RunnerName: "test-runner",
+		ActiveJobs: []*monitor.JobInfo{
+			{
+				ID:       "job-1",
+				Name:     "Build Job",
+				Workflow: "ci.yml",
+				Repo:     "adrijshikhar/actr",
+				Status:   monitor.StatusRunning,
+				Steps: []*monitor.StepInfo{
+					{ID: "step-1", Name: "Checkout", Status: monitor.StatusSuccess},
+					{ID: "step-2", Name: "Compile", Status: monitor.StatusRunning},
+				},
+			},
+		},
+	}
+	m.ApplySnapshot(snap)
+
+	var manyLogs []string
+	for i := 1; i <= 50; i++ {
+		manyLogs = append(manyLogs, fmt.Sprintf("Log line %02d", i))
+	}
+	m.stepLogs["job-1/step-2"] = manyLogs
+
+	// Select step-2
+	m.Tree().SelectRow(5)
+	_ = m.updateActiveStepLogs()
+
+	treeWidth := m.calcTreeWidth()
+	sidebarWidth := treeWidth + 2
+
+	// 1. Wheel over sidebar (X < sidebarWidth)
+	assert.Equal(t, 5, m.Tree().Cursor)
+	newModel, _ := m.Update(tea.MouseMsg{
+		X:      5,
+		Y:      5,
+		Button: tea.MouseButtonWheelUp,
+	})
+	m = newModel.(*DashboardModel)
+	assert.Equal(t, 4, m.Tree().Cursor, "wheel up over tree should move cursor up")
+
+	newModel, _ = m.Update(tea.MouseMsg{
+		X:      5,
+		Y:      5,
+		Button: tea.MouseButtonWheelDown,
+	})
+	m = newModel.(*DashboardModel)
+	assert.Equal(t, 5, m.Tree().Cursor, "wheel down over tree should move cursor down")
+
+	// 2. Wheel over viewport (X >= sidebarWidth)
+	m.autoFollow = true
+	m.viewport.GotoBottom()
+	initYOffset := m.viewport.YOffset
+
+	newModel, _ = m.Update(tea.MouseMsg{
+		X:      sidebarWidth + 5,
+		Y:      10,
+		Button: tea.MouseButtonWheelUp,
+	})
+	m = newModel.(*DashboardModel)
+	assert.False(t, m.autoFollow, "wheel scrolling viewport should disable autoFollow")
+	assert.Less(t, m.viewport.YOffset, initYOffset, "wheel up should scroll viewport up")
+
+	prevYOffset := m.viewport.YOffset
+	newModel, _ = m.Update(tea.MouseMsg{
+		X:      sidebarWidth + 5,
+		Y:      10,
+		Button: tea.MouseButtonWheelDown,
+	})
+	m = newModel.(*DashboardModel)
+	assert.GreaterOrEqual(t, m.viewport.YOffset, prevYOffset, "wheel down should scroll viewport down")
+}
+
+func TestDashboard_DragToCopySelection(t *testing.T) {
+	oldWriter := clipboardWriter
+	oldGOOS := currentGOOS
+	defer func() {
+		clipboardWriter = oldWriter
+		currentGOOS = oldGOOS
+	}()
+
+	currentGOOS = "linux"
+	var clipBuf bytes.Buffer
+	clipboardWriter = &clipBuf
+
+	m := NewDashboardModel(testSocketPath(t))
+	m.ready = true
+	resModel, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = resModel.(*DashboardModel)
+
+	snap := &monitor.Snapshot{
+		RunnerName: "test-runner",
+		ActiveJobs: []*monitor.JobInfo{
+			{
+				ID:       "job-1",
+				Name:     "Build Job",
+				Workflow: "ci.yml",
+				Repo:     "adrijshikhar/actr",
+				Status:   monitor.StatusRunning,
+				Steps: []*monitor.StepInfo{
+					{ID: "step-1", Name: "Build", Status: monitor.StatusRunning},
+				},
+			},
+		},
+	}
+	m.ApplySnapshot(snap)
+
+	lines := []string{
+		"Starting build process",
+		"Step 1: dependencies downloaded",
+		"Step 2: compiling packages",
+		"Step 3: tests executed",
+		"Build succeeded completely",
+	}
+	m.stepLogs["job-1/step-1"] = lines
+	m.Tree().SelectRow(4) // select step-1
+	_ = m.updateActiveStepLogs()
+
+	treeWidth := m.calcTreeWidth()
+	sidebarWidth := treeWidth + 2
+
+	// Viewport Y bounds: telemOuterHeight = 6, viewportTop = 7
+	viewportTop := 7
+
+	// 1. Mouse press inside viewport to start drag selection at line 1
+	newModel, _ := m.Update(tea.MouseMsg{
+		X:      sidebarWidth + 5,
+		Y:      viewportTop + 1, // line 1: "Step 1: dependencies downloaded"
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	m = newModel.(*DashboardModel)
+
+	assert.Equal(t, FocusViewport, m.Focus())
+	assert.True(t, m.IsSelecting())
+	startLine, endLine := m.DragSelection()
+	assert.Equal(t, 1, startLine)
+	assert.Equal(t, 1, endLine)
+
+	// 2. Mouse motion to line 3 ("Step 3: tests executed")
+	newModel, _ = m.Update(tea.MouseMsg{
+		X:      sidebarWidth + 5,
+		Y:      viewportTop + 3,
+		Action: tea.MouseActionMotion,
+	})
+	m = newModel.(*DashboardModel)
+
+	assert.True(t, m.IsSelecting())
+	startLine, endLine = m.DragSelection()
+	assert.Equal(t, 1, startLine)
+	assert.Equal(t, 3, endLine)
+
+	// Viewport content should show selection styling
+	vpView := m.Viewport().View()
+	assert.Contains(t, vpView, selectedLogStyle.Render("Step 1: dependencies downloaded"))
+
+	// 3. Mouse release: copies lines 1..3 to clipboard, sets HUD toast
+	newModel, _ = m.Update(tea.MouseMsg{
+		X:      sidebarWidth + 5,
+		Y:      viewportTop + 3,
+		Action: tea.MouseActionRelease,
+		Button: tea.MouseButtonNone,
+	})
+	m = newModel.(*DashboardModel)
+
+	assert.False(t, m.IsSelecting(), "selection should end on release")
+	assert.Equal(t, "✓ Copied selection to clipboard", m.ToastMsg())
+	assert.Contains(t, m.View(), "✓ Copied selection to clipboard")
+
+	// Verify clipboard output
+	clipOutput := clipBuf.String()
+	assert.Contains(t, clipOutput, "\x1b]52;c;")
+	expectedSelected := strings.Join(lines[1:4], "\n")
+	b64Expected := base64.StdEncoding.EncodeToString([]byte(expectedSelected))
+	assert.Contains(t, clipOutput, b64Expected)
+}
+
+func TestDashboard_KeyboardCopyShortcut(t *testing.T) {
+	oldWriter := clipboardWriter
+	oldGOOS := currentGOOS
+	defer func() {
+		clipboardWriter = oldWriter
+		currentGOOS = oldGOOS
+	}()
+
+	currentGOOS = "linux"
+	var clipBuf bytes.Buffer
+	clipboardWriter = &clipBuf
+
+	m := NewDashboardModel(testSocketPath(t))
+	m.ready = true
+	resModel, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = resModel.(*DashboardModel)
+
+	snap := &monitor.Snapshot{
+		RunnerName: "test-runner",
+		ActiveJobs: []*monitor.JobInfo{
+			{
+				ID:       "job-1",
+				Name:     "Build Job",
+				Workflow: "ci.yml",
+				Repo:     "adrijshikhar/actr",
+				Status:   monitor.StatusRunning,
+				Steps: []*monitor.StepInfo{
+					{ID: "step-1", Name: "Build", Status: monitor.StatusRunning},
+				},
+			},
+		},
+	}
+	m.ApplySnapshot(snap)
+
+	lines := []string{
+		"first line",
+		"second line",
+		"third line",
+	}
+	m.stepLogs["job-1/step-1"] = lines
+	m.Tree().SelectRow(4) // select step-1
+	_ = m.updateActiveStepLogs()
+
+	// Press 'c' to copy entire step log
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = newModel.(*DashboardModel)
+
+	expectedToast := fmt.Sprintf("✓ Copied %d lines to clipboard", len(lines))
+	assert.Equal(t, expectedToast, m.ToastMsg())
+	assert.Contains(t, m.View(), expectedToast)
+
+	// Verify clipboard content
+	clipOutput := clipBuf.String()
+	assert.Contains(t, clipOutput, "\x1b]52;c;")
+	b64Expected := base64.StdEncoding.EncodeToString([]byte(strings.Join(lines, "\n")))
+	assert.Contains(t, clipOutput, b64Expected)
+
+	// Pressing another navigation key clears the toast
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = newModel.(*DashboardModel)
+	assert.Empty(t, m.ToastMsg(), "toast should clear on next navigation key")
+	assert.NotContains(t, m.View(), expectedToast)
+}
+
+func TestDashboard_ToastNotificationLifecycle(t *testing.T) {
+	m := NewDashboardModel(testSocketPath(t))
+	m.ready = true
+	resModel, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = resModel.(*DashboardModel)
+
+	m.setToast("✓ Copied 42 lines to clipboard")
+	assert.Equal(t, "✓ Copied 42 lines to clipboard", m.ToastMsg())
+
+	view := m.View()
+	assert.Contains(t, view, "✓ Copied 42 lines to clipboard")
+
+	// Trigger clearToastMsg
+	newModel, _ := m.Update(clearToastMsg{id: m.toastID})
+	m = newModel.(*DashboardModel)
+	assert.Empty(t, m.ToastMsg(), "toast should be empty after clearToastMsg")
 }

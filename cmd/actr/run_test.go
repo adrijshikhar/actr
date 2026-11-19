@@ -23,6 +23,7 @@ import (
 
 	"github.com/adrijshikhar/actr/internal/config"
 	"github.com/adrijshikhar/actr/internal/driver"
+	"github.com/adrijshikhar/actr/internal/history"
 	"github.com/adrijshikhar/actr/internal/protocol"
 	"github.com/spf13/cobra"
 )
@@ -1142,5 +1143,99 @@ repos:
 	err := cmd.Execute()
 	if err != nil && strings.Contains(err.Error(), "run 'actr register' first") {
 		t.Fatalf("expected multi-repo dispatch, but got single-repo missing .runner error: %v", err)
+	}
+}
+
+func TestPurgeLegacyJSONRuns(t *testing.T) {
+	// 1. Non-existent path returns nil
+	nonExistent := filepath.Join(t.TempDir(), "nonexistent")
+	if err := purgeLegacyJSONRuns(nonExistent); err != nil {
+		t.Fatalf("expected nil for non-existent path, got: %v", err)
+	}
+
+	// 2. Empty directory is not deleted
+	emptyDir := t.TempDir()
+	if err := purgeLegacyJSONRuns(emptyDir); err != nil {
+		t.Fatalf("expected nil for empty dir, got: %v", err)
+	}
+	if _, err := os.Stat(emptyDir); os.IsNotExist(err) {
+		t.Fatalf("expected empty directory to not be deleted")
+	}
+
+	// 3. Unrelated directory without legacy markers is not deleted
+	unrelatedDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(unrelatedDir, "somefile.txt"), []byte("data"), 0644)
+	if err := purgeLegacyJSONRuns(unrelatedDir); err != nil {
+		t.Fatalf("expected nil for unrelated dir, got: %v", err)
+	}
+	if _, err := os.Stat(unrelatedDir); os.IsNotExist(err) {
+		t.Fatalf("expected unrelated directory to not be deleted")
+	}
+
+	// 4. Directory containing index.json is purged
+	legacyIndexDir := filepath.Join(t.TempDir(), "runs")
+	_ = os.MkdirAll(legacyIndexDir, 0755)
+	_ = os.WriteFile(filepath.Join(legacyIndexDir, "index.json"), []byte(`{"runs":[]}`), 0644)
+	if err := purgeLegacyJSONRuns(legacyIndexDir); err != nil {
+		t.Fatalf("expected nil when purging legacy dir with index.json, got: %v", err)
+	}
+	if _, err := os.Stat(legacyIndexDir); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy index dir to be removed")
+	}
+
+	// 5. Directory containing run subfolder with meta.json is purged
+	legacyRunsDir := filepath.Join(t.TempDir(), "runs")
+	_ = os.MkdirAll(filepath.Join(legacyRunsDir, "flaky-integration-test"), 0755)
+	_ = os.WriteFile(filepath.Join(legacyRunsDir, "flaky-integration-test", "meta.json"), []byte(`{"id":"flaky-integration-test"}`), 0644)
+	if err := purgeLegacyJSONRuns(legacyRunsDir); err != nil {
+		t.Fatalf("expected nil when purging legacy dir with meta.json, got: %v", err)
+	}
+	if _, err := os.Stat(legacyRunsDir); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy runs dir to be removed")
+	}
+}
+
+func TestRunCommand_WiresSQLiteStoreAndPurgesLegacyRuns(t *testing.T) {
+	configDir, server, _, _ := setupMockRunEnvironment(t)
+	defer server.Close()
+
+	// Seed legacy mock runs dir
+	legacyRunsDir := filepath.Join(configDir, "runs")
+	_ = os.MkdirAll(filepath.Join(legacyRunsDir, "flaky-integration-test"), 0755)
+	_ = os.WriteFile(filepath.Join(legacyRunsDir, "index.json"), []byte(`{"runs":[]}`), 0644)
+	_ = os.WriteFile(filepath.Join(legacyRunsDir, "flaky-integration-test", "meta.json"), []byte(`{"id":"flaky-integration-test"}`), 0644)
+
+	recCoord := &recordingCoordinator{}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ctx = WithCoordinator(ctx, recCoord)
+
+	var stdout, stderr bytes.Buffer
+	code := dispatchWithContext(ctx, []string{"run", "--config-dir", configDir, "--once"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d. stderr: %s", code, stderr.String())
+	}
+
+	// 1. Verify legacy runs directory was purged
+	if _, err := os.Stat(legacyRunsDir); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy runs dir %s to be purged, but it still exists", legacyRunsDir)
+	}
+
+	// 2. Verify history.db was initialized
+	dbPath := filepath.Join(configDir, "history.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("expected history.db to exist at %s, got err: %v", dbPath, err)
+	}
+
+	// 3. Verify SQLiteStore can open and query the database
+	store, err := history.NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open history.db: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	_, err = store.ListRuns(10)
+	if err != nil {
+		t.Fatalf("failed to query runs from history.db: %v", err)
 	}
 }

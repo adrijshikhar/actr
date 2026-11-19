@@ -403,3 +403,337 @@ func TestTreeWidget_SelectionBackground(t *testing.T) {
 		t.Fatalf("expected selected line to fill full width %d, got %d", width, visibleWidth)
 	}
 }
+
+func TestTreeNode_FindParentJobAndRepo(t *testing.T) {
+	root := &TreeNode{ID: "root", Label: "root", NodeType: NodeBranch}
+	liveBranch := &TreeNode{ID: "live-runs", Label: "LIVE RUNS", NodeType: NodeBranch}
+	root.AddChild(liveBranch)
+
+	repoNode := &TreeNode{ID: "repo:aim", Label: "aim (busy • 1/1 slots)", NodeType: NodeRepo}
+	liveBranch.AddChild(repoNode)
+
+	jobNode := &TreeNode{ID: "job-100", Label: "CI Test", NodeType: NodeJob}
+	repoNode.AddChild(jobNode)
+
+	stepNode := &TreeNode{ID: "step-1", Label: "Checkout", NodeType: NodeStep}
+	jobNode.AddChild(stepNode)
+
+	// Step resolves parent job and parent repo
+	if stepNode.FindParentJob() != jobNode {
+		t.Fatalf("expected step to resolve jobNode, got %v", stepNode.FindParentJob())
+	}
+	if stepNode.FindParentRepo() != repoNode {
+		t.Fatalf("expected step to resolve repoNode, got %v", stepNode.FindParentRepo())
+	}
+
+	// Job resolves itself as job and resolves parent repo
+	if jobNode.FindParentJob() != jobNode {
+		t.Fatalf("expected job to resolve itself, got %v", jobNode.FindParentJob())
+	}
+	if jobNode.FindParentRepo() != repoNode {
+		t.Fatalf("expected job to resolve repoNode, got %v", jobNode.FindParentRepo())
+	}
+
+	// Repo resolves itself as repo and has no parent job
+	if repoNode.FindParentJob() != nil {
+		t.Fatalf("expected repo to have nil parent job, got %v", repoNode.FindParentJob())
+	}
+	if repoNode.FindParentRepo() != repoNode {
+		t.Fatalf("expected repo to resolve itself, got %v", repoNode.FindParentRepo())
+	}
+
+	// Branch nodes have neither
+	if liveBranch.FindParentJob() != nil || liveBranch.FindParentRepo() != nil {
+		t.Fatalf("expected branch node to return nil for both job and repo")
+	}
+
+	// Nil safety
+	var nilNode *TreeNode
+	if nilNode.FindParentJob() != nil || nilNode.FindParentRepo() != nil {
+		t.Fatalf("expected nil safety on FindParentJob and FindParentRepo")
+	}
+}
+
+func TestTreeWidget_FilterMatching(t *testing.T) {
+	root := &TreeNode{
+		ID:       "root",
+		Label:    "actr",
+		Expanded: true,
+		NodeType: NodeBranch,
+	}
+	liveNode := &TreeNode{
+		ID:       "live-runs",
+		Label:    "LIVE RUNS",
+		Expanded: true,
+		NodeType: NodeBranch,
+	}
+	root.AddChild(liveNode)
+
+	aimRepo := &TreeNode{
+		ID:       "repo:aim",
+		Label:    "aim (busy • 1/1 slots)",
+		Expanded: false,
+		NodeType: NodeRepo,
+	}
+	liveNode.AddChild(aimRepo)
+
+	job1 := &TreeNode{
+		ID:       "job-1",
+		Label:    "CI Test",
+		Expanded: false,
+		NodeType: NodeJob,
+	}
+	aimRepo.AddChild(job1)
+
+	step1 := &TreeNode{ID: "s1", Label: "Checkout", Status: monitor.StatusSuccess, NodeType: NodeStep}
+	step2 := &TreeNode{ID: "s2", Label: "Run smoke tests", Status: monitor.StatusRunning, NodeType: NodeStep}
+	job1.AddChild(step1).AddChild(step2)
+
+	otherRepo := &TreeNode{
+		ID:       "repo:cxstatusline",
+		Label:    "cxstatusline",
+		Expanded: true,
+		NodeType: NodeRepo,
+	}
+	liveNode.AddChild(otherRepo)
+
+	job2 := &TreeNode{
+		ID:       "job-2",
+		Label:    "Lint",
+		Expanded: true,
+		NodeType: NodeJob,
+	}
+	otherRepo.AddChild(job2)
+	step3 := &TreeNode{ID: "s3", Label: "golangci-lint", Status: monitor.StatusSuccess, NodeType: NodeStep}
+	job2.AddChild(step3)
+
+	tw := NewTreeWidget(root)
+	if len(tw.Rows()) == 0 {
+		t.Fatalf("expected non-empty initial rows")
+	}
+
+	// 1. Filter by "smoke"
+	tw.RebuildWithFilter("smoke")
+	rows := tw.Rows()
+
+	// Should contain root, live-runs, repo:aim, job-1, step2
+	var ids []string
+	for _, r := range rows {
+		ids = append(ids, r.Node.ID)
+	}
+
+	expectedIDs := []string{"root", "live-runs", "repo:aim", "job-1", "s2"}
+	if len(ids) != len(expectedIDs) {
+		t.Fatalf("expected filtered rows %v, got %v", expectedIDs, ids)
+	}
+	for i, id := range expectedIDs {
+		if ids[i] != id {
+			t.Errorf("row %d: expected %s, got %s", i, id, ids[i])
+		}
+	}
+
+	// Ancestors must be expanded
+	if !aimRepo.Expanded {
+		t.Errorf("expected repo:aim to be auto-expanded")
+	}
+	if !job1.Expanded {
+		t.Errorf("expected job-1 to be auto-expanded")
+	}
+
+	// View should contain "smoke" and not cxstatusline
+	view := tw.View(40)
+	if !strings.Contains(view, "smoke") {
+		t.Fatalf("expected view to contain 'smoke', got:\n%s", view)
+	}
+	if strings.Contains(view, "cxstatusline") {
+		t.Fatalf("expected view NOT to contain 'cxstatusline', got:\n%s", view)
+	}
+
+	// 2. Clear filter
+	tw.RebuildWithFilter("")
+	if tw.Filter() != "" {
+		t.Fatalf("expected empty filter after clear, got %q", tw.Filter())
+	}
+
+	// repo:aim was originally collapsed (Expanded = false); verify it is restored
+	if aimRepo.Expanded {
+		t.Errorf("expected repo:aim to be restored to collapsed after clearing filter")
+	}
+
+	// cxstatusline should be visible again
+	clearView := tw.View(40)
+	if !strings.Contains(clearView, "cxstatusline") {
+		t.Fatalf("expected view to contain 'cxstatusline' after clearing filter, got:\n%s", clearView)
+	}
+}
+
+func TestTreeWidget_StatusFilter(t *testing.T) {
+	root := &TreeNode{
+		ID:       "root",
+		Label:    "actr",
+		Expanded: true,
+		NodeType: NodeBranch,
+	}
+	job := &TreeNode{
+		ID:       "job-1",
+		Label:    "BuildJob",
+		Expanded: true,
+		NodeType: NodeJob,
+	}
+	root.AddChild(job)
+
+	stepPass := &TreeNode{ID: "s_ok", Label: "Compile", Status: monitor.StatusSuccess, NodeType: NodeStep}
+	stepFail := &TreeNode{ID: "s_err", Label: "Test", Status: monitor.StatusFailed, NodeType: NodeStep}
+	job.AddChild(stepPass).AddChild(stepFail)
+
+	tw := NewTreeWidget(root)
+
+	// Filter by "fail"
+	tw.RebuildWithFilter("fail")
+	rows := tw.Rows()
+
+	var ids []string
+	for _, r := range rows {
+		ids = append(ids, r.Node.ID)
+	}
+	expected := []string{"root", "job-1", "s_err"}
+	if len(ids) != len(expected) {
+		t.Fatalf("expected rows %v, got %v", expected, ids)
+	}
+	for i, id := range expected {
+		if ids[i] != id {
+			t.Errorf("row %d: expected %s, got %s", i, id, ids[i])
+		}
+	}
+}
+
+func TestTreeWidget_SelectRowAndNodeAtRow(t *testing.T) {
+	root := &TreeNode{
+		ID:       "root",
+		Label:    "actr",
+		Expanded: true,
+		NodeType: NodeBranch,
+	}
+	job := &TreeNode{
+		ID:       "job-1",
+		Label:    "BuildJob",
+		Expanded: true,
+		NodeType: NodeJob,
+	}
+	step := &TreeNode{
+		ID:       "step-1",
+		Label:    "Compile",
+		NodeType: NodeStep,
+	}
+	job.AddChild(step)
+	root.AddChild(job)
+
+	tw := NewTreeWidget(root)
+	// Rows: 0: root, 1: job-1, 2: step-1
+
+	// Initial cursor is 0
+	if tw.Cursor != 0 {
+		t.Fatalf("expected cursor 0, got %d", tw.Cursor)
+	}
+
+	// Select row 2 (step-1) -> cursor changes
+	changed := tw.SelectRow(2)
+	if !changed {
+		t.Fatalf("expected SelectRow(2) to return true (cursor changed)")
+	}
+	if tw.Cursor != 2 {
+		t.Fatalf("expected cursor 2, got %d", tw.Cursor)
+	}
+	if node := tw.NodeAtRow(2); node == nil || node.ID != "step-1" {
+		t.Fatalf("expected NodeAtRow(2) to be 'step-1', got %v", node)
+	}
+
+	// Select row 2 again -> cursor does NOT change
+	changed = tw.SelectRow(2)
+	if changed {
+		t.Fatalf("expected SelectRow(2) again to return false (cursor unchanged)")
+	}
+
+	// Out of bounds checks
+	if tw.SelectRow(-1) {
+		t.Fatalf("expected SelectRow(-1) to return false")
+	}
+	if tw.SelectRow(100) {
+		t.Fatalf("expected SelectRow(100) to return false")
+	}
+	if tw.NodeAtRow(-1) != nil {
+		t.Fatalf("expected NodeAtRow(-1) to be nil")
+	}
+	if tw.NodeAtRow(100) != nil {
+		t.Fatalf("expected NodeAtRow(100) to be nil")
+	}
+
+	// Nil safety
+	var nilTree *TreeWidget
+	if nilTree.SelectRow(0) {
+		t.Fatalf("expected nilTree.SelectRow to return false")
+	}
+	if nilTree.NodeAtRow(0) != nil {
+		t.Fatalf("expected nilTree.NodeAtRow to return nil")
+	}
+}
+
+func TestTreeWidget_ToggleExpandSelected(t *testing.T) {
+	root := &TreeNode{
+		ID:       "root",
+		Label:    "actr",
+		Expanded: true,
+		NodeType: NodeBranch,
+	}
+	job := &TreeNode{
+		ID:       "job-1",
+		Label:    "BuildJob",
+		Expanded: true,
+		NodeType: NodeJob,
+	}
+	step := &TreeNode{
+		ID:       "step-1",
+		Label:    "Compile",
+		NodeType: NodeStep,
+	}
+	job.AddChild(step)
+	root.AddChild(job)
+
+	tw := NewTreeWidget(root)
+	// Cursor on root (0)
+	// Select job-1 (1)
+	tw.SelectRow(1)
+	if !job.Expanded {
+		t.Fatalf("expected job to be expanded initially")
+	}
+
+	// Toggle expansion of job-1 -> collapses
+	tw.ToggleExpandSelected()
+	if job.Expanded {
+		t.Fatalf("expected job to be collapsed after ToggleExpandSelected")
+	}
+	// Verify step-1 is no longer visible in rows
+	if len(tw.Rows()) != 2 {
+		t.Fatalf("expected 2 visible rows when job collapsed, got %d", len(tw.Rows()))
+	}
+
+	// Toggle again -> expands
+	tw.ToggleExpandSelected()
+	if !job.Expanded {
+		t.Fatalf("expected job to be expanded after second ToggleExpandSelected")
+	}
+	if len(tw.Rows()) != 3 {
+		t.Fatalf("expected 3 visible rows when job expanded, got %d", len(tw.Rows()))
+	}
+
+	// Leaf node toggle does nothing
+	tw.SelectRow(2) // step-1
+	tw.ToggleExpandSelected()
+	if len(tw.Rows()) != 3 {
+		t.Fatalf("expected row count unchanged when toggling leaf, got %d", len(tw.Rows()))
+	}
+
+	// Nil safety
+	var nilTree *TreeWidget
+	nilTree.ToggleExpandSelected() // should not panic
+}

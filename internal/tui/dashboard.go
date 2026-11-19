@@ -3,14 +3,24 @@ package tui
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/adrijshikhar/actr/internal/monitor"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+)
+
+// FocusPanel indicates which pane currently has keyboard focus.
+type FocusPanel int
+
+const (
+	FocusTree FocusPanel = iota
+	FocusViewport
 )
 
 // EventMsg wraps an incoming monitor.Event for the Bubbletea event loop.
@@ -45,6 +55,11 @@ type historicalLogsLoadedMsg struct {
 	err    error
 }
 
+// clearToastMsg signals that a HUD toast notification has expired.
+type clearToastMsg struct {
+	id int
+}
+
 const (
 	StatusBadgeConnected = "● CONNECTED (LIVE)"
 	StatusBadgeOffline   = "◉ OFFLINE (HISTORY)"
@@ -63,6 +78,34 @@ type DashboardModel struct {
 	isZoomed   bool
 	autoFollow bool
 
+	focus           FocusPanel
+	treeSearchInput textinput.Model
+	treeSearching   bool
+
+	logSearchInput  textinput.Model
+	logSearching    bool
+	searchQuery     string
+	searchMatches   []int
+	currentMatchIdx int
+
+	// Mouse drag selection state
+	isSelecting   bool
+	dragStartLine int
+	dragEndLine   int
+	dragStartX    int
+	dragStartY    int
+	dragCurX      int
+	dragCurY      int
+
+	// Sidebar click tracking for double-click detection
+	lastTreeClickTime   time.Time
+	lastTreeClickNodeID string
+
+	// HUD toast notification
+	toastMsg       string
+	toastExpiresAt time.Time
+	toastID        int
+
 	width        int
 	height       int
 	ready        bool
@@ -78,12 +121,21 @@ type DashboardModel struct {
 	historicalSummaries map[string]*HistoricalRunSummary
 	seenRepoExpansion   map[string]bool
 
-	historyStore monitor.HistoryStore
-	isOffline    bool
+	historyStore     monitor.HistoryStore
+	clipboard        Clipboard
+	supervisorStatus *monitor.SupervisorStatus
+	isOffline        bool
 
 	events <-chan monitor.Event
 	errs   <-chan error
 }
+
+var (
+	normalMatchStyle = lipgloss.NewStyle().Background(lipgloss.Color("226")).Foreground(lipgloss.Color("0"))
+	activeMatchStyle = lipgloss.NewStyle().Background(lipgloss.Color("208")).Foreground(lipgloss.Color("0")).Bold(true)
+	selectedLogStyle = lipgloss.NewStyle().Background(lipgloss.Color("#2563EB")).Foreground(lipgloss.Color("#FFFFFF"))
+	toastStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#22C55E")).Bold(true)
+)
 
 // NewDashboardModel creates a new DashboardModel configured to connect to the given socket.
 func NewDashboardModel(sockPath string) *DashboardModel {
@@ -108,17 +160,176 @@ func NewDashboardModel(sockPath string) *DashboardModel {
 	root.AddChild(liveNode)
 	root.AddChild(histNode)
 
+	ti := textinput.New()
+	ti.Prompt = "Search: "
+	ti.Placeholder = "[ query ]"
+	ti.CharLimit = 64
+	ti.PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#38BDF8")).Bold(true)
+	ti.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF"))
+	ti.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#64748B"))
+
+	lti := textinput.New()
+	lti.Prompt = "Find in logs: "
+	lti.Placeholder = "[ query ]"
+	lti.CharLimit = 64
+	lti.PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#38BDF8")).Bold(true)
+	lti.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF"))
+	lti.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#64748B"))
+
 	return &DashboardModel{
 		sockPath:            sockPath,
 		client:              monitor.NewClient(sockPath),
 		tree:                NewTreeWidget(root),
+		clipboard:           DefaultClipboard,
 		telemetry:           NewTelemetryWidget(),
 		viewport:            viewport.New(0, 0),
 		autoFollow:          true,
 		stepLogs:            make(map[string][]string),
 		historicalSummaries: make(map[string]*HistoricalRunSummary),
 		seenRepoExpansion:   make(map[string]bool),
+		focus:               FocusTree,
+		treeSearchInput:     ti,
+		treeSearching:       false,
+		logSearchInput:      lti,
+		logSearching:        false,
+		searchQuery:         "",
+		searchMatches:       nil,
+		currentMatchIdx:     0,
 	}
+}
+
+// Focus returns the currently focused panel.
+func (m *DashboardModel) Focus() FocusPanel {
+	if m == nil {
+		return FocusTree
+	}
+	return m.focus
+}
+
+// SetFocus sets the currently focused panel.
+func (m *DashboardModel) SetFocus(f FocusPanel) {
+	if m != nil {
+		m.focus = f
+	}
+}
+
+// IsTreeSearching returns whether the dashboard is currently in tree search mode.
+func (m *DashboardModel) IsTreeSearching() bool {
+	if m == nil {
+		return false
+	}
+	return m.treeSearching
+}
+
+// TreeSearchInput returns a pointer to the tree search input model.
+func (m *DashboardModel) TreeSearchInput() *textinput.Model {
+	if m == nil {
+		return nil
+	}
+	return &m.treeSearchInput
+}
+
+// IsLogSearching returns whether the dashboard is currently in log search mode.
+func (m *DashboardModel) IsLogSearching() bool {
+	if m == nil {
+		return false
+	}
+	return m.logSearching
+}
+
+// LogSearchInput returns a pointer to the log search input model.
+func (m *DashboardModel) LogSearchInput() *textinput.Model {
+	if m == nil {
+		return nil
+	}
+	return &m.logSearchInput
+}
+
+// SearchQuery returns the active log search query string.
+func (m *DashboardModel) SearchQuery() string {
+	if m == nil {
+		return ""
+	}
+	return m.searchQuery
+}
+
+// SearchMatches returns the 0-indexed line numbers of matching lines in the active step logs.
+func (m *DashboardModel) SearchMatches() []int {
+	if m == nil {
+		return nil
+	}
+	return m.searchMatches
+}
+
+// CurrentMatchIdx returns the index in SearchMatches for the currently focused match.
+func (m *DashboardModel) CurrentMatchIdx() int {
+	if m == nil {
+		return 0
+	}
+	return m.currentMatchIdx
+}
+
+// NextMatch advances to the next search match and scrolls it into view.
+func (m *DashboardModel) NextMatch() {
+	if len(m.searchMatches) == 0 {
+		return
+	}
+	m.currentMatchIdx = (m.currentMatchIdx + 1) % len(m.searchMatches)
+	m.autoFollow = false
+	m.refreshHighlightedLogs()
+	m.scrollToMatch(m.searchMatches[m.currentMatchIdx])
+}
+
+// PrevMatch moves to the previous search match and scrolls it into view.
+func (m *DashboardModel) PrevMatch() {
+	if len(m.searchMatches) == 0 {
+		return
+	}
+	m.currentMatchIdx = (m.currentMatchIdx - 1 + len(m.searchMatches)) % len(m.searchMatches)
+	m.autoFollow = false
+	m.refreshHighlightedLogs()
+	m.scrollToMatch(m.searchMatches[m.currentMatchIdx])
+}
+
+// setToast sets a temporary HUD toast message in the dashboard footer.
+func (m *DashboardModel) setToast(msg string) tea.Cmd {
+	if m == nil {
+		return nil
+	}
+	m.toastMsg = msg
+	m.toastExpiresAt = time.Now().Add(3 * time.Second)
+	m.toastID++
+	currID := m.toastID
+	return tea.Tick(3*time.Second, func(time.Time) tea.Msg {
+		return clearToastMsg{id: currID}
+	})
+}
+
+// ToastMsg returns the active HUD toast notification message, if any.
+func (m *DashboardModel) ToastMsg() string {
+	if m == nil {
+		return ""
+	}
+	if !m.toastExpiresAt.IsZero() && time.Now().After(m.toastExpiresAt) {
+		m.toastMsg = ""
+	}
+	return m.toastMsg
+}
+
+// IsSelecting returns whether mouse text drag-selection is currently active.
+func (m *DashboardModel) IsSelecting() bool {
+	if m == nil {
+		return false
+	}
+	return m.isSelecting
+}
+
+// DragSelection returns the start and end line indices of the current drag selection.
+func (m *DashboardModel) DragSelection() (startLine, endLine int) {
+	if m == nil {
+		return 0, 0
+	}
+	return m.dragStartLine, m.dragEndLine
 }
 
 // AutoFocusRunningStep enables auto-focusing the active running step on initial snapshot.
@@ -168,6 +379,29 @@ func (m *DashboardModel) WithHistoryStore(store monitor.HistoryStore) *Dashboard
 		m.historyStore = store
 	}
 	return m
+}
+
+// SetClipboard sets the clipboard implementation for copying logs and selections.
+func (m *DashboardModel) SetClipboard(c Clipboard) {
+	if m == nil {
+		return
+	}
+	m.clipboard = c
+}
+
+// WithClipboard sets the clipboard implementation and returns m for chaining.
+func (m *DashboardModel) WithClipboard(c Clipboard) *DashboardModel {
+	if m != nil {
+		m.clipboard = c
+	}
+	return m
+}
+
+func (m *DashboardModel) copyText(text string) error {
+	if m != nil && m.clipboard != nil {
+		return m.clipboard.Copy(text)
+	}
+	return DefaultClipboard.Copy(text)
 }
 
 // ApplySnapshot applies a monitor.Snapshot to rebuild tree and update telemetry.
@@ -264,6 +498,7 @@ func HydrateSnapshotFromStore(store monitor.HistoryStore, limit int) (*monitor.S
 			Name:      r.Name,
 			Workflow:  r.Workflow,
 			Repo:      r.Repo,
+			RepoAlias: r.RepoAlias,
 			Owner:     r.Owner,
 			Status:    r.Status,
 			StartedAt: r.StartedAt,
@@ -376,12 +611,155 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ready = true
 
 	case tea.KeyMsg:
+		if m.treeSearching {
+			switch msg.Type {
+			case tea.KeyEsc:
+				m.treeSearching = false
+				m.treeSearchInput.Blur()
+				m.treeSearchInput.SetValue("")
+				m.tree.RebuildWithFilter("")
+				return m, m.updateActiveStepLogs()
+			case tea.KeyEnter:
+				m.treeSearching = false
+				m.treeSearchInput.Blur()
+				return m, m.updateActiveStepLogs()
+			case tea.KeyCtrlC:
+				if m.cancel != nil {
+					m.cancel()
+				}
+				return m, tea.Quit
+			default:
+				var cmd tea.Cmd
+				prevVal := m.treeSearchInput.Value()
+				m.treeSearchInput, cmd = m.treeSearchInput.Update(msg)
+				newVal := m.treeSearchInput.Value()
+				if newVal != prevVal {
+					m.tree.RebuildWithFilter(newVal)
+					fetchCmd := m.updateActiveStepLogs()
+					if fetchCmd != nil {
+						cmd = tea.Batch(cmd, fetchCmd)
+					}
+				}
+				return m, cmd
+			}
+		}
+
+		if m.logSearching {
+			switch msg.Type {
+			case tea.KeyEsc:
+				m.logSearching = false
+				m.logSearchInput.Blur()
+				m.logSearchInput.SetValue("")
+				m.searchQuery = ""
+				m.searchMatches = nil
+				m.currentMatchIdx = 0
+				m.refreshHighlightedLogs()
+				return m, nil
+			case tea.KeyEnter:
+				m.logSearching = false
+				m.logSearchInput.Blur()
+				m.focus = FocusViewport
+				return m, nil
+			case tea.KeyCtrlC:
+				if m.cancel != nil {
+					m.cancel()
+				}
+				return m, tea.Quit
+			default:
+				var cmd tea.Cmd
+				prevVal := m.logSearchInput.Value()
+				m.logSearchInput, cmd = m.logSearchInput.Update(msg)
+				newVal := m.logSearchInput.Value()
+				if newVal != prevVal {
+					m.searchQuery = newVal
+					m.currentMatchIdx = 0
+					lines := m.activeStepLogLines()
+					m.updateSearchMatches(lines)
+					m.refreshHighlightedLogs()
+					if len(m.searchMatches) > 0 {
+						m.autoFollow = false
+						m.scrollToMatch(m.searchMatches[0])
+					}
+				}
+				return m, cmd
+			}
+		}
+
+		if msg.String() != "c" && msg.String() != "C" && m.toastMsg != "" {
+			m.toastMsg = ""
+		}
+
 		switch msg.String() {
 		case "q", "ctrl+c":
 			if m.cancel != nil {
 				m.cancel()
 			}
 			return m, tea.Quit
+		case "c", "C":
+			logs := m.activeStepLogLines()
+			if len(logs) > 0 {
+				cleanLogs := make([]string, len(logs))
+				for i, l := range logs {
+					cleanLogs[i] = ansi.Strip(l)
+				}
+				if err := m.copyText(strings.Join(cleanLogs, "\n")); err != nil {
+					cmd := m.setToast("✖ Failed to copy to clipboard")
+					return m, cmd
+				}
+				cmd := m.setToast(fmt.Sprintf("✓ Copied %d lines to clipboard", len(logs)))
+				return m, cmd
+			}
+			return m, nil
+		case "tab":
+			if m.focus == FocusTree {
+				m.focus = FocusViewport
+			} else {
+				m.focus = FocusTree
+			}
+			return m, nil
+		case "ctrl+f":
+			m.logSearching = true
+			m.focus = FocusViewport
+			cmd := m.logSearchInput.Focus()
+			return m, cmd
+		case "/":
+			if m.focus == FocusViewport || m.isZoomed {
+				m.logSearching = true
+				cmd := m.logSearchInput.Focus()
+				return m, cmd
+			}
+			if !m.isZoomed && m.focus == FocusTree {
+				m.treeSearching = true
+				cmd := m.treeSearchInput.Focus()
+				return m, cmd
+			}
+		case "n":
+			if len(m.searchMatches) > 0 {
+				m.NextMatch()
+				return m, nil
+			}
+		case "N":
+			if len(m.searchMatches) > 0 {
+				m.PrevMatch()
+				return m, nil
+			}
+		case "esc":
+			m.focus = FocusTree
+			if m.searchQuery != "" || len(m.searchMatches) > 0 {
+				m.logSearching = false
+				m.logSearchInput.Blur()
+				m.logSearchInput.SetValue("")
+				m.searchQuery = ""
+				m.searchMatches = nil
+				m.currentMatchIdx = 0
+				m.refreshHighlightedLogs()
+				return m, nil
+			}
+			if m.tree != nil && (m.tree.Filter() != "" || m.treeSearchInput.Value() != "") {
+				m.treeSearchInput.SetValue("")
+				m.tree.RebuildWithFilter("")
+				return m, m.updateActiveStepLogs()
+			}
 		case "z":
 			m.isZoomed = !m.isZoomed
 			m.updateSizes()
@@ -393,16 +771,19 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "k", "up":
+			m.focus = FocusTree
 			if !m.isZoomed {
 				m.tree.Up()
 				return m, m.updateActiveStepLogs()
 			}
 		case "j", "down":
+			m.focus = FocusTree
 			if !m.isZoomed {
 				m.tree.Down()
 				return m, m.updateActiveStepLogs()
 			}
 		case "enter", " ":
+			m.focus = FocusTree
 			if !m.isZoomed {
 				m.tree.Toggle()
 				if sel := m.tree.SelectedNode(); sel != nil && sel.NodeType == NodeRepo {
@@ -411,6 +792,7 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.updateActiveStepLogs()
 			}
 		case "h", "left":
+			m.focus = FocusTree
 			if !m.isZoomed {
 				m.tree.Collapse()
 				if sel := m.tree.SelectedNode(); sel != nil && sel.NodeType == NodeRepo {
@@ -419,6 +801,7 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.updateActiveStepLogs()
 			}
 		case "l", "right":
+			m.focus = FocusTree
 			if !m.isZoomed {
 				m.tree.Expand()
 				if sel := m.tree.SelectedNode(); sel != nil && sel.NodeType == NodeRepo {
@@ -434,6 +817,195 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			var cmd tea.Cmd
 			m.viewport, cmd = m.viewport.Update(msg)
 			return m, cmd
+		}
+
+	case clearToastMsg:
+		if msg.id == m.toastID {
+			m.toastMsg = ""
+		}
+		return m, nil
+
+	case tea.MouseMsg:
+		if m.toastMsg != "" && !m.toastExpiresAt.IsZero() && time.Now().After(m.toastExpiresAt) {
+			m.toastMsg = ""
+		}
+
+		sidebarWidth := 0
+		if !m.isZoomed {
+			sidebarWidth = m.calcTreeWidth() + 2
+		}
+
+		// Handle mouse wheel scrolling
+		if tea.MouseEvent(msg).IsWheel() || msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
+			isUp := msg.Button == tea.MouseButtonWheelUp
+			if !m.isZoomed && msg.X < sidebarWidth {
+				if isUp {
+					m.tree.Up()
+				} else {
+					m.tree.Down()
+				}
+				return m, m.updateActiveStepLogs()
+			}
+			// Viewport scrolling
+			m.autoFollow = false
+			if isUp {
+				m.viewport.LineUp(3)
+			} else {
+				m.viewport.LineDown(3)
+			}
+			return m, nil
+		}
+
+		// Calculate viewport vertical bounds
+		viewportTop := 1
+		if !m.isZoomed {
+			telemOuterHeight := 6
+			if m.height < 18 {
+				telemOuterHeight = 4
+			}
+			viewportTop = telemOuterHeight + 1
+		}
+		viewportBottom := viewportTop + m.viewport.Height
+
+		// Release event: finalize drag selection if in progress
+		if msg.Action == tea.MouseActionRelease {
+			if m.isSelecting {
+				m.isSelecting = false
+				didDrag := (m.dragStartLine != m.dragEndLine || m.dragStartX != msg.X || m.dragStartY != msg.Y)
+				lines := m.activeStepLogLines()
+				var cmd tea.Cmd
+				if didDrag && len(lines) > 0 {
+					minLine := m.dragStartLine
+					maxLine := m.dragEndLine
+					if minLine > maxLine {
+						minLine, maxLine = maxLine, minLine
+					}
+					if minLine < 0 {
+						minLine = 0
+					}
+					if maxLine >= len(lines) {
+						maxLine = len(lines) - 1
+					}
+					if minLine <= maxLine && minLine < len(lines) {
+						cleanLines := make([]string, 0, maxLine-minLine+1)
+						for _, l := range lines[minLine : maxLine+1] {
+							cleanLines = append(cleanLines, ansi.Strip(l))
+						}
+						selected := strings.Join(cleanLines, "\n")
+						if selected != "" {
+							if err := m.copyText(selected); err != nil {
+								cmd = m.setToast("✖ Failed to copy to clipboard")
+							} else {
+								cmd = m.setToast("✓ Copied selection to clipboard")
+							}
+						}
+					}
+				}
+				m.refreshHighlightedLogs()
+				return m, cmd
+			}
+		}
+
+		// Motion event: update selection range while dragging
+		if msg.Action == tea.MouseActionMotion {
+			if m.isSelecting {
+				m.dragCurX = msg.X
+				m.dragCurY = msg.Y
+				relY := msg.Y - viewportTop
+				if relY < 0 {
+					relY = 0
+				}
+				if relY >= m.viewport.Height && m.viewport.Height > 0 {
+					relY = m.viewport.Height - 1
+				}
+				curLine := m.viewport.YOffset + relY
+				if curLine < 0 {
+					curLine = 0
+				}
+				m.dragEndLine = curLine
+				m.refreshHighlightedLogs()
+				return m, nil
+			}
+		}
+
+		// Press event (left click)
+		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+
+			if !m.isZoomed && msg.X < sidebarWidth {
+				// Click in Sidebar Tree
+				m.focus = FocusTree
+
+				treeTopOffset := 1
+				if m.treeSearching || m.treeSearchInput.Value() != "" {
+					treeTopOffset = 2
+					if msg.Y == 1 {
+						m.treeSearching = true
+						cmd := m.treeSearchInput.Focus()
+						return m, cmd
+					}
+				}
+
+				row := msg.Y - treeTopOffset
+				if row >= 0 && row < len(m.tree.Rows()) {
+					clickedNode := m.tree.NodeAtRow(row)
+
+					// Double click detection: same node within 350ms
+					isDoubleClick := !m.lastTreeClickTime.IsZero() &&
+						time.Since(m.lastTreeClickTime) <= 350*time.Millisecond &&
+						clickedNode != nil && m.lastTreeClickNodeID == clickedNode.ID
+
+					// Chevron click detection: indent + glyph
+					isChevron := false
+					if clickedNode != nil && len(clickedNode.Children) > 0 {
+						chevronStart := 1 + clickedNode.Depth*2
+						chevronEnd := chevronStart + 2
+						if msg.X >= 1 && msg.X <= chevronEnd {
+							isChevron = true
+						}
+					}
+
+					m.tree.SelectRow(row)
+					if isDoubleClick || isChevron {
+						m.tree.ToggleExpandSelected()
+					}
+					if clickedNode != nil && clickedNode.NodeType == NodeRepo {
+						m.seenRepoExpansion[clickedNode.ID] = clickedNode.Expanded
+					}
+
+					m.lastTreeClickTime = time.Now()
+					if clickedNode != nil {
+						m.lastTreeClickNodeID = clickedNode.ID
+					}
+
+					return m, m.updateActiveStepLogs()
+				}
+				return m, nil
+			}
+
+			// Click in Viewport
+			m.focus = FocusViewport
+
+			if msg.Y >= viewportTop && msg.Y < viewportBottom {
+				relY := msg.Y - viewportTop
+				startLine := m.viewport.YOffset + relY
+				if startLine < 0 {
+					startLine = 0
+				}
+				m.isSelecting = true
+				m.dragStartLine = startLine
+				m.dragEndLine = startLine
+				m.dragStartX = msg.X
+				m.dragStartY = msg.Y
+				m.dragCurX = msg.X
+				m.dragCurY = msg.Y
+				m.refreshHighlightedLogs()
+				return m, nil
+			}
+
+			if m.logSearching && msg.Y == viewportBottom {
+				cmd := m.logSearchInput.Focus()
+				return m, cmd
+			}
 		}
 
 	case SnapshotMsg:
@@ -557,7 +1129,7 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.stepLogs[msg.stepID] = logs
 			sel := m.tree.SelectedNode()
 			if sel != nil && sel.ID == msg.stepID && (sel.Parent == nil || sel.Parent.ID == msg.runID) {
-				m.viewport.SetContent(strings.Join(logs, "\n"))
+				m.renderAndSetLogs(logs)
 				if m.autoFollow {
 					m.viewport.GotoBottom()
 				}
@@ -653,9 +1225,21 @@ func (m *DashboardModel) calcDimensions() (treeWidth, rightWidth, targetOuterHei
 }
 
 func (m *DashboardModel) updateSizes() {
-	_, rightWidth, _, logHeight := m.calcDimensions()
+	treeWidth, rightWidth, _, logHeight := m.calcDimensions()
 	m.viewport.Width = rightWidth
 	m.viewport.Height = logHeight
+	m.treeSearchInput.Width = treeWidth - 9
+	if m.treeSearchInput.Width < 5 {
+		m.treeSearchInput.Width = 5
+	}
+	logInputW := rightWidth - 45
+	if logInputW < 10 {
+		logInputW = 10
+	}
+	if logInputW > 40 {
+		logInputW = 40
+	}
+	m.logSearchInput.Width = logInputW
 }
 
 func (m *DashboardModel) applySnapshot(snap *monitor.Snapshot) tea.Cmd {
@@ -666,6 +1250,7 @@ func (m *DashboardModel) applySnapshot(snap *monitor.Snapshot) tea.Cmd {
 		m.telemetry.Update(snap.Telemetry)
 	}
 	if snap.SupervisorStatus != nil {
+		m.supervisorStatus = snap.SupervisorStatus
 		m.telemetry.SetSupervisorStatus(snap.SupervisorStatus)
 	}
 	for stepKey, lines := range snap.StepLogs {
@@ -750,6 +1335,24 @@ func (m *DashboardModel) ensureBranches() (*TreeNode, *TreeNode) {
 	return live, hist
 }
 
+func formatRepoSlotLabel(alias, status string, active, max int) string {
+	if status == "" {
+		if active > 0 {
+			status = "busy"
+		} else {
+			status = "idle"
+		}
+	}
+	if max <= 0 {
+		if active > 0 {
+			max = active
+		} else {
+			max = 1
+		}
+	}
+	return fmt.Sprintf("%s (%s • %d/%d slots)", alias, status, active, max)
+}
+
 func (m *DashboardModel) updateBranchLabels() {
 	live := m.getLiveBranch()
 	if live != nil {
@@ -765,11 +1368,60 @@ func (m *DashboardModel) updateBranchLabels() {
 				}
 			}
 			live.Label = fmt.Sprintf("LIVE RUNS (%d active)", activeCount)
+
+			if m.supervisorStatus != nil {
+				for _, ch := range live.Children {
+					if ch.NodeType == NodeRepo {
+						alias := strings.TrimPrefix(ch.ID, "repo:")
+						var slot *monitor.RepoSlotInfo
+						for _, s := range m.supervisorStatus.RepoSlots {
+							if s.Alias == alias {
+								slot = s
+								break
+							}
+						}
+						active := len(ch.Children)
+						max := 1
+						status := "idle"
+						if slot != nil {
+							max = slot.MaxJobs
+							status = slot.Status
+						}
+						if status == "" {
+							if active > 0 {
+								status = "busy"
+							} else {
+								status = "idle"
+							}
+						} else if active > 0 && status == "idle" {
+							status = "busy"
+						} else if active == 0 && status == "busy" {
+							status = "idle"
+						}
+						if max <= 0 {
+							if active > 0 {
+								max = active
+							} else {
+								max = 1
+							}
+						}
+						ch.Label = formatRepoSlotLabel(alias, status, active, max)
+					}
+				}
+			}
 		}
 	}
 	hist := m.getHistoricalBranch()
 	if hist != nil {
-		hist.Label = fmt.Sprintf("HISTORICAL RUNS (%d past runs)", len(hist.Children))
+		totalPastRuns := 0
+		for _, ch := range hist.Children {
+			if ch.NodeType == NodeRepo {
+				totalPastRuns += len(ch.Children)
+			} else {
+				totalPastRuns++
+			}
+		}
+		hist.Label = fmt.Sprintf("HISTORICAL RUNS (%d past runs)", totalPastRuns)
 	}
 }
 
@@ -783,12 +1435,20 @@ func isHistoricalNode(node *TreeNode) bool {
 }
 
 func findHistoricalJobNode(sel *TreeNode) *TreeNode {
-	if sel == nil || sel.ID == "historical-runs" || sel.ID == "root" || sel.ID == "live-runs" {
+	if sel == nil || !isHistoricalNode(sel) {
 		return nil
 	}
-	for curr := sel; curr != nil; curr = curr.Parent {
-		if curr.Parent != nil && curr.Parent.ID == "historical-runs" {
-			return curr
+	if sel.ID == "historical-runs" || sel.NodeType == NodeRepo || sel.NodeType == NodeBranch {
+		return nil
+	}
+	if job := sel.FindParentJob(); job != nil {
+		return job
+	}
+	for curr := sel; curr != nil && curr.ID != "historical-runs"; curr = curr.Parent {
+		if curr.Parent != nil && (curr.Parent.ID == "historical-runs" || curr.Parent.NodeType == NodeRepo) {
+			if curr.NodeType != NodeRepo && curr.ID != "historical-runs" {
+				return curr
+			}
 		}
 	}
 	return nil
@@ -887,6 +1547,23 @@ func (m *DashboardModel) syncHistoricalHUD() {
 	m.telemetry.ClearHistoricalRun()
 }
 
+func (m *DashboardModel) resolveJobRepoAlias(repoAlias, repo string) string {
+	if repoAlias != "" {
+		return repoAlias
+	}
+	if repo != "" {
+		if m.supervisorStatus != nil {
+			for _, s := range m.supervisorStatus.RepoSlots {
+				if repo == s.Alias || strings.HasSuffix(repo, "/"+s.Alias) {
+					return s.Alias
+				}
+			}
+		}
+		return repo
+	}
+	return "default"
+}
+
 func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 	label := formatRunnerRootLabel(snap.RunnerName)
 	root := &TreeNode{
@@ -913,15 +1590,6 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 		NodeType: NodeBranch,
 	}
 
-	existingHistJobs := make(map[string]*TreeNode)
-	var existingHistOrder []*TreeNode
-	if oldHist := m.getHistoricalBranch(); oldHist != nil {
-		for _, ch := range oldHist.Children {
-			existingHistJobs[ch.ID] = ch
-			existingHistOrder = append(existingHistOrder, ch)
-		}
-	}
-
 	isMultiRepo := snap.SupervisorStatus != nil
 	if !isMultiRepo {
 		for _, job := range snap.ActiveJobs {
@@ -932,7 +1600,155 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 		}
 	}
 
-	if isMultiRepo {
+	if snap.SupervisorStatus != nil && len(snap.SupervisorStatus.RepoSlots) > 0 {
+		slots := make([]*monitor.RepoSlotInfo, len(snap.SupervisorStatus.RepoSlots))
+		copy(slots, snap.SupervisorStatus.RepoSlots)
+		sort.Slice(slots, func(i, j int) bool {
+			return slots[i].Alias < slots[j].Alias
+		})
+
+		repoJobs := make(map[string][]*monitor.JobInfo)
+		for _, job := range snap.ActiveJobs {
+			if job == nil {
+				continue
+			}
+			matchedAlias := ""
+			for _, s := range slots {
+				if job.RepoAlias != "" && s.Alias == job.RepoAlias {
+					matchedAlias = s.Alias
+					break
+				}
+				if job.Repo != "" && (s.Alias == job.Repo || strings.HasSuffix(job.Repo, "/"+s.Alias)) {
+					matchedAlias = s.Alias
+					break
+				}
+			}
+			if matchedAlias == "" {
+				matchedAlias = job.RepoAlias
+				if matchedAlias == "" {
+					matchedAlias = job.Repo
+				}
+				if matchedAlias == "" {
+					matchedAlias = "default"
+				}
+			}
+			repoJobs[matchedAlias] = append(repoJobs[matchedAlias], job)
+		}
+
+		for _, slot := range slots {
+			jobs := repoJobs[slot.Alias]
+			activeCount := len(jobs)
+			status := slot.Status
+			if status == "" {
+				if activeCount > 0 {
+					status = "busy"
+				} else {
+					status = "idle"
+				}
+			} else if activeCount > 0 && status == "idle" {
+				status = "busy"
+			} else if activeCount == 0 && status == "busy" {
+				status = "idle"
+			}
+			max := slot.MaxJobs
+			if max <= 0 {
+				if activeCount > 0 {
+					max = activeCount
+				} else {
+					max = 1
+				}
+			}
+			label := formatRepoSlotLabel(slot.Alias, status, activeCount, max)
+			repoID := "repo:" + slot.Alias
+			expanded := true
+			if exp, ok := m.seenRepoExpansion[repoID]; ok {
+				expanded = exp
+			}
+			repoNode := &TreeNode{
+				ID:       repoID,
+				Label:    label,
+				Expanded: expanded,
+				NodeType: NodeRepo,
+				Data:     slot,
+			}
+			for _, job := range jobs {
+				jobNode := &TreeNode{
+					ID:       job.ID,
+					Label:    job.Name,
+					Status:   job.Status,
+					Expanded: true,
+					NodeType: NodeJob,
+					Data:     job,
+				}
+				for _, step := range job.Steps {
+					if step != nil {
+						stepNode := &TreeNode{
+							ID:       step.ID,
+							Label:    step.Name,
+							Status:   step.Status,
+							NodeType: NodeStep,
+						}
+						jobNode.AddChild(stepNode)
+					}
+				}
+				repoNode.AddChild(jobNode)
+			}
+			liveNode.AddChild(repoNode)
+		}
+
+		// Also handle any active jobs that didn't match any configured slot
+		var unconfiguredAliases []string
+		for alias := range repoJobs {
+			isConfigured := false
+			for _, s := range slots {
+				if s.Alias == alias {
+					isConfigured = true
+					break
+				}
+			}
+			if !isConfigured {
+				unconfiguredAliases = append(unconfiguredAliases, alias)
+			}
+		}
+		sort.Strings(unconfiguredAliases)
+		for _, alias := range unconfiguredAliases {
+			jobs := repoJobs[alias]
+			repoID := "repo:" + alias
+			expanded := true
+			if exp, ok := m.seenRepoExpansion[repoID]; ok {
+				expanded = exp
+			}
+			repoNode := &TreeNode{
+				ID:       repoID,
+				Label:    alias,
+				Expanded: expanded,
+				NodeType: NodeRepo,
+			}
+			for _, job := range jobs {
+				jobNode := &TreeNode{
+					ID:       job.ID,
+					Label:    job.Name,
+					Status:   job.Status,
+					Expanded: true,
+					NodeType: NodeJob,
+					Data:     job,
+				}
+				for _, step := range job.Steps {
+					if step != nil {
+						stepNode := &TreeNode{
+							ID:       step.ID,
+							Label:    step.Name,
+							Status:   step.Status,
+							NodeType: NodeStep,
+						}
+						jobNode.AddChild(stepNode)
+					}
+				}
+				repoNode.AddChild(jobNode)
+			}
+			liveNode.AddChild(repoNode)
+		}
+	} else if isMultiRepo {
 		repoJobs := make(map[string][]*monitor.JobInfo)
 		var repoOrder []string
 
@@ -1028,47 +1844,124 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 		}
 	}
 
-	seenHistIDs := make(map[string]bool)
+	existingHistJobs := make(map[string]*TreeNode)
+	type histEntry struct {
+		alias string
+		node  *TreeNode
+	}
+	var existingHistOrder []histEntry
+	if oldHist := m.getHistoricalBranch(); oldHist != nil {
+		for _, ch := range oldHist.Children {
+			if ch.NodeType == NodeRepo {
+				alias := ch.Label
+				for _, jNode := range ch.Children {
+					existingHistJobs[jNode.ID] = jNode
+					existingHistOrder = append(existingHistOrder, histEntry{alias: alias, node: jNode})
+				}
+			} else {
+				existingHistJobs[ch.ID] = ch
+				existingHistOrder = append(existingHistOrder, histEntry{alias: "default", node: ch})
+			}
+		}
+	}
+
+	histRepoJobs := make(map[string][]*monitor.JobInfo)
+	var histRepoAliases []string
+	seenAliases := make(map[string]bool)
+	snapHistIDs := make(map[string]bool)
+
 	for _, job := range snap.RecentJobs {
 		if job == nil {
 			continue
 		}
-		seenHistIDs[job.ID] = true
-		expanded := false
-		if oldJob, ok := existingHistJobs[job.ID]; ok {
-			expanded = oldJob.Expanded
+		snapHistIDs[job.ID] = true
+		alias := m.resolveJobRepoAlias(job.RepoAlias, job.Repo)
+		if !seenAliases[alias] {
+			seenAliases[alias] = true
+			histRepoAliases = append(histRepoAliases, alias)
 		}
-		jobNode := &TreeNode{
-			ID:       job.ID,
-			Label:    job.Name,
-			Status:   job.Status,
-			Expanded: expanded,
-			NodeType: NodeJob,
-			Data:     job,
-		}
-		for _, step := range job.Steps {
-			if step != nil {
-				stepNode := &TreeNode{
-					ID:       step.ID,
-					Label:    step.Name,
-					Status:   step.Status,
-					NodeType: NodeStep,
-				}
-				jobNode.AddChild(stepNode)
+		histRepoJobs[alias] = append(histRepoJobs[alias], job)
+	}
+
+	// Also check preserved jobs from previous tree
+	for _, entry := range existingHistOrder {
+		jobID := entry.node.ID
+		if !snapHistIDs[jobID] {
+			alias := entry.alias
+			if alias == "" {
+				alias = "default"
+			}
+			if !seenAliases[alias] {
+				seenAliases[alias] = true
+				histRepoAliases = append(histRepoAliases, alias)
 			}
 		}
-		histNode.AddChild(jobNode)
 	}
 
-	// Preserve existing historical runs that were loaded but not present in the new snapshot
-	for _, oldJob := range existingHistOrder {
-		if !seenHistIDs[oldJob.ID] {
-			seenHistIDs[oldJob.ID] = true
-			histNode.AddChild(oldJob)
+	sort.Strings(histRepoAliases)
+
+	for _, alias := range histRepoAliases {
+		repoID := "hist-repo:" + alias
+		expanded := true
+		if exp, ok := m.seenRepoExpansion[repoID]; ok {
+			expanded = exp
+		}
+		repoNode := &TreeNode{
+			ID:       repoID,
+			Label:    alias,
+			Expanded: expanded,
+			NodeType: NodeRepo,
+		}
+
+		for _, job := range histRepoJobs[alias] {
+			expanded := false
+			if oldJob, ok := existingHistJobs[job.ID]; ok {
+				expanded = oldJob.Expanded
+			}
+			jobNode := &TreeNode{
+				ID:       job.ID,
+				Label:    job.Name,
+				Status:   job.Status,
+				Expanded: expanded,
+				NodeType: NodeJob,
+				Data:     job,
+			}
+			for _, step := range job.Steps {
+				if step != nil {
+					stepNode := &TreeNode{
+						ID:       step.ID,
+						Label:    step.Name,
+						Status:   step.Status,
+						NodeType: NodeStep,
+					}
+					jobNode.AddChild(stepNode)
+				}
+			}
+			repoNode.AddChild(jobNode)
+		}
+
+		// Preserve any older jobs not in snapshot for this repo alias
+		for _, entry := range existingHistOrder {
+			if entry.alias == alias {
+				if snapHistIDs[entry.node.ID] {
+					continue
+				}
+				repoNode.AddChild(entry.node)
+			}
+		}
+
+		histNode.AddChild(repoNode)
+	}
+
+	totalHistRuns := 0
+	for _, ch := range histNode.Children {
+		if ch.NodeType == NodeRepo {
+			totalHistRuns += len(ch.Children)
+		} else {
+			totalHistRuns++
 		}
 	}
-
-	histNode.Label = fmt.Sprintf("HISTORICAL RUNS (%d past runs)", len(histNode.Children))
+	histNode.Label = fmt.Sprintf("HISTORICAL RUNS (%d past runs)", totalHistRuns)
 
 	root.AddChild(liveNode)
 	root.AddChild(histNode)
@@ -1105,7 +1998,7 @@ func (m *DashboardModel) handleEvent(ev monitor.Event) tea.Cmd {
 				m.stepLogs[ev.StepID] = logs
 			}
 			if ev.StepID == m.activeStepID || key == m.activeStepID {
-				m.viewport.SetContent(strings.Join(logs, "\n"))
+				m.renderAndSetLogs(logs)
 				if m.autoFollow {
 					m.viewport.GotoBottom()
 				}
@@ -1163,7 +2056,7 @@ func (m *DashboardModel) handleJobStart(job *monitor.JobInfo) {
 		return
 	}
 	live, _ := m.ensureBranches()
-	isMulti := (job.Repo != "" || job.RepoAlias != "")
+	isMulti := (m.supervisorStatus != nil) || (job.Repo != "" || job.RepoAlias != "")
 	if !isMulti {
 		for _, ch := range live.Children {
 			if ch.NodeType == NodeRepo {
@@ -1175,17 +2068,11 @@ func (m *DashboardModel) handleJobStart(job *monitor.JobInfo) {
 
 	parentNode := live
 	if isMulti {
-		repoKey := job.Repo
-		if repoKey == "" {
-			repoKey = job.RepoAlias
-		}
-		if repoKey == "" {
-			repoKey = "default"
-		}
-		repoID := "repo:" + repoKey
+		repoAlias := m.resolveJobRepoAlias(job.RepoAlias, job.Repo)
+		repoID := "repo:" + repoAlias
 		var repoNode *TreeNode
 		for _, ch := range live.Children {
-			if ch.ID == repoID {
+			if ch.ID == repoID || (ch.NodeType == NodeRepo && (strings.TrimPrefix(ch.ID, "repo:") == repoAlias || ch.Label == repoAlias || strings.HasPrefix(ch.Label, repoAlias+" "))) {
 				repoNode = ch
 				break
 			}
@@ -1195,9 +2082,13 @@ func (m *DashboardModel) handleJobStart(job *monitor.JobInfo) {
 			if exp, ok := m.seenRepoExpansion[repoID]; ok {
 				expanded = exp
 			}
+			label := repoAlias
+			if m.supervisorStatus != nil {
+				label = formatRepoSlotLabel(repoAlias, "busy", 1, 1)
+			}
 			repoNode = &TreeNode{
 				ID:       repoID,
-				Label:    repoKey,
+				Label:    label,
 				Expanded: expanded,
 				NodeType: NodeRepo,
 			}
@@ -1271,7 +2162,7 @@ func (m *DashboardModel) handleJobFinish(jobID string, job *monitor.JobInfo) tea
 				if sub.ID == jobID || (job != nil && sub.ID == job.ID) {
 					target = sub
 					ch.Children = append(ch.Children[:j], ch.Children[j+1:]...)
-					if len(ch.Children) == 0 {
+					if m.supervisorStatus == nil && len(ch.Children) == 0 {
 						live.Children = append(live.Children[:i], live.Children[i+1:]...)
 					}
 					break
@@ -1287,12 +2178,13 @@ func (m *DashboardModel) handleJobFinish(jobID string, job *monitor.JobInfo) tea
 
 	if target == nil {
 		// Check if already in historical branch
-		for _, ch := range hist.Children {
-			if ch.ID == jobID || (job != nil && ch.ID == job.ID) {
-				target = ch
-				break
+		hist.Walk(func(n *TreeNode) bool {
+			if n.ID == jobID || (job != nil && n.ID == job.ID) {
+				target = n
+				return false
 			}
-		}
+			return true
+		})
 		if target == nil {
 			label := jobID
 			status := monitor.StatusSuccess
@@ -1348,16 +2240,47 @@ func (m *DashboardModel) handleJobFinish(jobID string, job *monitor.JobInfo) tea
 		}
 	}
 
-	alreadyInHist := false
+	// Group into repo node in HISTORICAL RUNS
+	var rAlias, rRepo string
+	if job != nil {
+		rAlias, rRepo = job.RepoAlias, job.Repo
+	} else if ji, ok := target.Data.(*monitor.JobInfo); ok && ji != nil {
+		rAlias, rRepo = ji.RepoAlias, ji.Repo
+	}
+	alias := m.resolveJobRepoAlias(rAlias, rRepo)
+
+	histRepoID := "hist-repo:" + alias
+	var repoNode *TreeNode
 	for _, ch := range hist.Children {
-		if ch == target {
+		if ch.ID == histRepoID || (ch.NodeType == NodeRepo && ch.Label == alias) {
+			repoNode = ch
+			break
+		}
+	}
+	if repoNode == nil {
+		expanded := true
+		if exp, ok := m.seenRepoExpansion[histRepoID]; ok {
+			expanded = exp
+		}
+		repoNode = &TreeNode{
+			ID:       histRepoID,
+			Label:    alias,
+			Expanded: expanded,
+			NodeType: NodeRepo,
+		}
+		hist.AddChild(repoNode)
+	}
+
+	alreadyInHist := false
+	for _, ch := range repoNode.Children {
+		if ch.ID == target.ID {
 			alreadyInHist = true
 			break
 		}
 	}
 	if !alreadyInHist {
-		target.Parent = hist
-		hist.Children = append([]*TreeNode{target}, hist.Children...)
+		target.Parent = repoNode
+		repoNode.Children = append([]*TreeNode{target}, repoNode.Children...)
 	}
 
 	m.updateBranchLabels()
@@ -1417,12 +2340,13 @@ func (m *DashboardModel) upsertStepNode(jobID string, step *monitor.StepInfo) {
 				}
 			}
 			if parentJob == nil {
-				for _, ch := range hist.Children {
-					if ch.ID == "active-job" || ch.ID == "job" {
-						parentJob = ch
-						break
+				hist.Walk(func(n *TreeNode) bool {
+					if n.ID == "active-job" || n.ID == "job" {
+						parentJob = n
+						return false
 					}
-				}
+					return true
+				})
 			}
 			if parentJob == nil {
 				parentJob = &TreeNode{
@@ -1489,20 +2413,37 @@ func (m *DashboardModel) renderRepoState(sel *TreeNode) string {
 		return ""
 	}
 	title := sel.Label
-	activeCount := len(sel.Children)
+	jobCount := len(sel.Children)
 	var sb strings.Builder
 	sb.WriteString("\n")
 	fmt.Fprintf(&sb, "  Repository: %s\n", title)
-	fmt.Fprintf(&sb, "  Active Jobs: %d\n", activeCount)
-	if activeCount > 0 {
-		sb.WriteString("  Jobs:\n")
-		for _, j := range sel.Children {
-			fmt.Fprintf(&sb, "    • %s [%s]\n", j.Label, j.Status)
+	if isHistoricalNode(sel) {
+		fmt.Fprintf(&sb, "  Historical Runs: %d\n", jobCount)
+		if jobCount > 0 {
+			sb.WriteString("  Runs:\n")
+			for _, j := range sel.Children {
+				fmt.Fprintf(&sb, "    • %s [%s]\n", j.Label, j.Status)
+			}
+		} else {
+			sb.WriteString("  Status: No historical runs recorded\n")
 		}
 	} else {
-		sb.WriteString("  Status: Idle (no active jobs running)\n")
+		fmt.Fprintf(&sb, "  Active Jobs: %d\n", jobCount)
+		if jobCount > 0 {
+			sb.WriteString("  Jobs:\n")
+			for _, j := range sel.Children {
+				fmt.Fprintf(&sb, "    • %s [%s]\n", j.Label, j.Status)
+			}
+		} else {
+			sb.WriteString("  Status: Idle (no active jobs running)\n")
+		}
 	}
 	return sb.String()
+}
+
+// UpdateActiveStepLogs triggers log loading for the currently selected step.
+func (m *DashboardModel) UpdateActiveStepLogs() tea.Cmd {
+	return m.updateActiveStepLogs()
 }
 
 func (m *DashboardModel) updateActiveStepLogs() tea.Cmd {
@@ -1520,9 +2461,14 @@ func (m *DashboardModel) updateActiveStepLogs() tea.Cmd {
 		}
 
 		var lines []string
-		hasParentJob := sel.NodeType == NodeStep || (sel.Parent != nil && sel.Parent.NodeType == NodeJob) || (sel.Parent != nil && sel.Parent.ID != "" && sel.Parent.ID != "root" && sel.Parent.ID != "live-runs" && sel.Parent.ID != "historical-runs" && sel.Parent.NodeType != NodeRepo)
-		if hasParentJob && sel.Parent != nil {
-			lines = m.stepLogs[sel.Parent.ID+"/"+sel.ID]
+		parentJob := sel.FindParentJob()
+		if sel.NodeType == NodeStep && parentJob != nil {
+			lines = m.stepLogs[parentJob.ID+"/"+sel.ID]
+			if len(lines) == 0 && !isHistoricalNode(sel) {
+				lines = m.stepLogs[sel.ID]
+			}
+		} else if parentJob != nil && sel != parentJob {
+			lines = m.stepLogs[parentJob.ID+"/"+sel.ID]
 			if len(lines) == 0 && !isHistoricalNode(sel) {
 				lines = m.stepLogs[sel.ID]
 			}
@@ -1531,7 +2477,7 @@ func (m *DashboardModel) updateActiveStepLogs() tea.Cmd {
 		}
 
 		if len(lines) > 0 {
-			m.viewport.SetContent(strings.Join(lines, "\n"))
+			m.renderAndSetLogs(lines)
 			if m.autoFollow {
 				m.viewport.GotoBottom()
 			}
@@ -1539,8 +2485,8 @@ func (m *DashboardModel) updateActiveStepLogs() tea.Cmd {
 		}
 
 		// If logs are not in memory, check if this is a historical step
-		if isHistoricalNode(sel) && sel.Parent != nil && sel.Parent.ID != "" && sel.Parent.ID != "historical-runs" && sel.Parent.NodeType != NodeRepo {
-			jobID := sel.Parent.ID
+		if isHistoricalNode(sel) && sel.NodeType == NodeStep && parentJob != nil {
+			jobID := parentJob.ID
 			stepID := sel.ID
 			// In offline mode with a direct history store, read immediately without IPC
 			if m.isOffline && m.historyStore != nil {
@@ -1551,7 +2497,7 @@ func (m *DashboardModel) updateActiveStepLogs() tea.Cmd {
 					}
 					m.stepLogs[jobID+"/"+stepID] = fetched
 					m.stepLogs[stepID] = fetched
-					m.viewport.SetContent(strings.Join(fetched, "\n"))
+					m.renderAndSetLogs(fetched)
 					if m.autoFollow {
 						m.viewport.GotoBottom()
 					}
@@ -1586,9 +2532,8 @@ func (m *DashboardModel) View() string {
 	if m.isZoomed {
 		_, zoomWidth, targetOuterHeight, zoomHeight := m.calcDimensions()
 		_ = targetOuterHeight
-		m.viewport.Width = zoomWidth
-		m.viewport.Height = zoomHeight
-		content = borderStyle.Width(zoomWidth).Height(zoomHeight).Render(m.viewport.View())
+		logContent := m.renderLogViewport(zoomWidth, zoomHeight)
+		content = borderStyle.Width(zoomWidth).Height(zoomHeight).Render(logContent)
 	} else {
 		treeWidth, rightWidth, targetOuterHeight, logInnerHeight := m.calcDimensions()
 		_ = logInnerHeight
@@ -1597,7 +2542,23 @@ func (m *DashboardModel) View() string {
 		if treeInnerHeight < 1 {
 			treeInnerHeight = 1
 		}
-		treeBox := borderStyle.Width(treeWidth).Height(treeInnerHeight).Render(m.tree.View(treeWidth))
+
+		var treeContent string
+		if m.treeSearching || m.treeSearchInput.Value() != "" {
+			m.treeSearchInput.Width = treeWidth - 9
+			if m.treeSearchInput.Width < 5 {
+				m.treeSearchInput.Width = 5
+			}
+			searchBar := m.treeSearchInput.View()
+			if ansi.StringWidth(searchBar) > treeWidth {
+				searchBar = ansi.Truncate(searchBar, treeWidth, "")
+			}
+			treeContent = searchBar + "\n" + m.tree.View(treeWidth)
+		} else {
+			treeContent = m.tree.View(treeWidth)
+		}
+
+		treeBox := borderStyle.Width(treeWidth).Height(treeInnerHeight).Render(treeContent)
 
 		telemWidth := rightWidth
 		var telemContent string
@@ -1614,10 +2575,8 @@ func (m *DashboardModel) View() string {
 		if actualLogInnerHeight < 1 {
 			actualLogInnerHeight = 1
 		}
-		m.viewport.Width = rightWidth
-		m.viewport.Height = actualLogInnerHeight
-
-		logBox := borderStyle.Width(rightWidth).Height(actualLogInnerHeight).Render(m.viewport.View())
+		logContent := m.renderLogViewport(rightWidth, actualLogInnerHeight)
+		logBox := borderStyle.Width(rightWidth).Height(actualLogInnerHeight).Render(logContent)
 		rightPane := lipgloss.JoinVertical(lipgloss.Left, telemBox, logBox)
 		content = lipgloss.JoinHorizontal(lipgloss.Top, treeBox, rightPane)
 	}
@@ -1647,13 +2606,32 @@ func leftNavText(width int, err error) string {
 }
 
 func (m *DashboardModel) renderFooter() string {
-	leftStr := leftNavText(m.width, m.lastErr)
-	left := dimStyle.Render(leftStr)
+	hasToast := m.toastMsg != "" && (m.toastExpiresAt.IsZero() || time.Now().Before(m.toastExpiresAt))
+	var leftStr string
+	if hasToast {
+		leftStr = " " + m.toastMsg
+	} else if m.treeSearching {
+		leftStr = " Esc cancel • Enter select"
+	} else if m.logSearching {
+		leftStr = " Esc cancel • Enter navigate"
+	} else {
+		leftStr = leftNavText(m.width, m.lastErr)
+	}
+
+	var left string
+	if hasToast {
+		left = toastStyle.Render(leftStr)
+	} else {
+		left = dimStyle.Render(leftStr)
+	}
 	leftW := lipgloss.Width(left)
 
 	sample := m.telemetry.Sample()
 	if sample == nil || m.width < 70 {
 		if leftW > m.width && m.width > 0 {
+			if hasToast {
+				return toastStyle.Render(ansi.Truncate(leftStr, m.width, ""))
+			}
 			return dimStyle.Render(ansi.Truncate(leftStr, m.width, ""))
 		}
 		return left
@@ -1688,6 +2666,9 @@ func (m *DashboardModel) renderFooter() string {
 
 	// 3. Fallback: insufficient clearance for host vitals
 	if leftW > m.width && m.width > 0 {
+		if hasToast {
+			return toastStyle.Render(ansi.Truncate(leftStr, m.width, ""))
+		}
 		return dimStyle.Render(ansi.Truncate(leftStr, m.width, ""))
 	}
 	return left
@@ -1825,4 +2806,186 @@ func renderStepEmptyState(sel *TreeNode) string {
 	default:
 		return "\n  " + dimStyle.Render("○ Step is queued or waiting to execute.") + "\n  " + dimStyle.Render("Logs will stream here automatically when execution starts.")
 	}
+}
+
+func (m *DashboardModel) activeStepLogLines() []string {
+	if m == nil {
+		return nil
+	}
+	sel := m.tree.SelectedNode()
+	var lines []string
+	if sel != nil {
+		parentJob := sel.FindParentJob()
+		if sel.NodeType == NodeStep && parentJob != nil {
+			lines = m.stepLogs[parentJob.ID+"/"+sel.ID]
+			if len(lines) == 0 && !isHistoricalNode(sel) {
+				lines = m.stepLogs[sel.ID]
+			}
+		} else if parentJob != nil && sel != parentJob {
+			lines = m.stepLogs[parentJob.ID+"/"+sel.ID]
+			if len(lines) == 0 && !isHistoricalNode(sel) {
+				lines = m.stepLogs[sel.ID]
+			}
+		} else {
+			lines = m.stepLogs[sel.ID]
+		}
+	}
+	if len(lines) == 0 && m.activeStepID != "" {
+		lines = m.stepLogs[m.activeStepID]
+	}
+	return lines
+}
+
+func (m *DashboardModel) updateSearchMatches(lines []string) {
+	if m.searchQuery == "" {
+		m.searchMatches = nil
+		m.currentMatchIdx = 0
+		return
+	}
+	var matches []int
+	lowerQuery := strings.ToLower(m.searchQuery)
+	for i, line := range lines {
+		clean := ansi.Strip(line)
+		if strings.Contains(strings.ToLower(clean), lowerQuery) {
+			matches = append(matches, i)
+		}
+	}
+	m.searchMatches = matches
+	if len(matches) == 0 {
+		m.currentMatchIdx = 0
+	} else if m.currentMatchIdx >= len(matches) {
+		m.currentMatchIdx = len(matches) - 1
+	}
+}
+
+func highlightLine(line, query string, style lipgloss.Style) string {
+	if query == "" {
+		return line
+	}
+	clean := ansi.Strip(line)
+	var sb strings.Builder
+	remaining := clean
+	for len(remaining) > 0 {
+		start, end := findCaseInsensitiveSubstr(remaining, query)
+		if start == -1 {
+			sb.WriteString(remaining)
+			break
+		}
+		if start > 0 {
+			sb.WriteString(remaining[:start])
+		}
+		sb.WriteString(style.Render(remaining[start:end]))
+		remaining = remaining[end:]
+	}
+	return sb.String()
+}
+
+func (m *DashboardModel) renderHighlightedLines(lines []string) string {
+	minLine, maxLine := -1, -1
+	if m.isSelecting {
+		minLine = m.dragStartLine
+		maxLine = m.dragEndLine
+		if minLine > maxLine {
+			minLine, maxLine = maxLine, minLine
+		}
+	}
+
+	activeLine := -1
+	if m.searchQuery != "" && len(m.searchMatches) > 0 && m.currentMatchIdx >= 0 && m.currentMatchIdx < len(m.searchMatches) {
+		activeLine = m.searchMatches[m.currentMatchIdx]
+	}
+
+	renderedLines := make([]string, len(lines))
+	for i, line := range lines {
+		if minLine != -1 && i >= minLine && i <= maxLine {
+			stripped := ansi.Strip(line)
+			if m.viewport.Width > 0 && ansi.StringWidth(stripped) < m.viewport.Width {
+				stripped += strings.Repeat(" ", m.viewport.Width-ansi.StringWidth(stripped))
+			}
+			renderedLines[i] = selectedLogStyle.Render(stripped)
+		} else if m.searchQuery != "" {
+			if activeLine == i {
+				renderedLines[i] = highlightLine(line, m.searchQuery, activeMatchStyle)
+			} else {
+				renderedLines[i] = highlightLine(line, m.searchQuery, normalMatchStyle)
+			}
+		} else {
+			renderedLines[i] = line
+		}
+	}
+	return strings.Join(renderedLines, "\n")
+}
+
+func (m *DashboardModel) renderAndSetLogs(lines []string) {
+	if len(lines) == 0 {
+		return
+	}
+	if m.searchQuery != "" || m.isSelecting {
+		if m.searchQuery != "" {
+			m.updateSearchMatches(lines)
+		}
+		rendered := m.renderHighlightedLines(lines)
+		m.viewport.SetContent(rendered)
+	} else {
+		m.viewport.SetContent(strings.Join(lines, "\n"))
+	}
+}
+
+func (m *DashboardModel) refreshHighlightedLogs() {
+	lines := m.activeStepLogLines()
+	if len(lines) == 0 {
+		return
+	}
+	if m.searchQuery != "" || m.isSelecting {
+		rendered := m.renderHighlightedLines(lines)
+		m.viewport.SetContent(rendered)
+	} else {
+		m.viewport.SetContent(strings.Join(lines, "\n"))
+	}
+}
+
+func (m *DashboardModel) scrollToMatch(lineIdx int) {
+	if m.viewport.Height <= 0 {
+		m.viewport.SetYOffset(lineIdx)
+		return
+	}
+	targetY := lineIdx - m.viewport.Height/3
+	if targetY < 0 {
+		targetY = 0
+	}
+	m.viewport.SetYOffset(targetY)
+}
+
+func (m *DashboardModel) renderFindBar(width int) string {
+	var matchCounter string
+	if len(m.searchMatches) == 0 {
+		matchCounter = lipgloss.NewStyle().Foreground(lipgloss.Color("#F87171")).Render("(No matches)")
+	} else {
+		counterText := fmt.Sprintf("(Match %d of %d)", m.currentMatchIdx+1, len(m.searchMatches))
+		matchCounter = lipgloss.NewStyle().Foreground(lipgloss.Color("#38BDF8")).Bold(true).Render(counterText)
+	}
+
+	shortcuts := lipgloss.NewStyle().Foreground(lipgloss.Color("#64748B")).Render("[n: next, N: prev, Esc: dismiss]")
+	bar := fmt.Sprintf("%s %s %s", m.logSearchInput.View(), matchCounter, shortcuts)
+	if width > 0 && ansi.StringWidth(bar) > width {
+		bar = ansi.Truncate(bar, width, "")
+	}
+	return bar
+}
+
+func (m *DashboardModel) renderLogViewport(width, height int) string {
+	if m.logSearching || m.searchQuery != "" {
+		vpHeight := height - 1
+		if vpHeight < 1 {
+			vpHeight = 1
+		}
+		m.viewport.Width = width
+		m.viewport.Height = vpHeight
+		vpView := m.viewport.View()
+		findBar := m.renderFindBar(width)
+		return lipgloss.JoinVertical(lipgloss.Left, vpView, findBar)
+	}
+	m.viewport.Width = width
+	m.viewport.Height = height
+	return m.viewport.View()
 }

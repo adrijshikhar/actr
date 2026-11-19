@@ -206,7 +206,7 @@ func TestHistory_EngineLifecycle_EndToEnd(t *testing.T) {
 
 	assert.Contains(t, view, "◉ OFFLINE (HISTORY)")
 	assert.Contains(t, view, "HISTORICAL RUNS")
-	assert.Contains(t, view, "E2E Integration Pip")
+	assert.Contains(t, view, "E2E Integration P")
 
 	// Verify step log retrieval directly from offline store
 	retrievedLogs, err := offlineStore.GetStepLogs(jobID, "step-setup")

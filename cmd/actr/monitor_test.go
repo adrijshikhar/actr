@@ -81,6 +81,39 @@ func TestMonitorCmd_DemoFlag(t *testing.T) {
 	}
 }
 
+func TestMonitorCmd_DemoMode_DoesNotPolluteConfigDirHistoryDB(t *testing.T) {
+	tempDir := t.TempDir()
+	var executed atomic.Bool
+	origRunProgram := runProgram
+	runProgram = func(m tea.Model, opts ...tea.ProgramOption) error {
+		executed.Store(true)
+		if dash, ok := m.(*tui.DashboardModel); ok {
+			assert.False(t, dash.IsOffline())
+		}
+		return nil
+	}
+	defer func() {
+		runProgram = origRunProgram
+	}()
+
+	var stdout, stderr bytes.Buffer
+	ctx := context.Background()
+
+	code := dispatchWithContext(ctx, []string{"monitor", "--demo", "--config-dir", tempDir}, &stdout, &stderr)
+	require.Equal(t, 0, code, "expected monitor --demo to exit 0")
+	require.True(t, executed.Load())
+
+	// Crucial check: verify that configDir/history.db was NEVER created
+	prodDBPath := filepath.Join(tempDir, "history.db")
+	_, err := os.Stat(prodDBPath)
+	assert.True(t, os.IsNotExist(err), "demo mode must never write to config-dir/history.db")
+
+	// Also verify that legacy runs/ was never created
+	legacyRunsDir := filepath.Join(tempDir, "runs")
+	_, err = os.Stat(legacyRunsDir)
+	assert.True(t, os.IsNotExist(err), "demo mode must never write to config-dir/runs")
+}
+
 func TestMonitorCmd_SocketNotFound(t *testing.T) {
 	missingSock := filepath.Join(t.TempDir(), "nonexistent.sock")
 	var stdout, stderr bytes.Buffer
@@ -330,11 +363,12 @@ func TestMonitorCmd_DefaultConfigDirResolution(t *testing.T) {
 	}
 }
 
-func TestMonitor_OfflineMode_HydratesFromDiskStore(t *testing.T) {
+func TestMonitor_OfflineMode_HydratesFromSQLiteStore(t *testing.T) {
 	tempDir := t.TempDir()
-	runsDir := filepath.Join(tempDir, "runs")
-	store, err := history.NewDiskStore(runsDir)
+	dbPath := filepath.Join(tempDir, "history.db")
+	store, err := history.NewSQLiteStore(dbPath)
 	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
 
 	job1 := &monitor.JobInfo{
 		ID:        "job-offline-1",
@@ -382,7 +416,7 @@ func TestMonitor_OfflineMode_HydratesFromDiskStore(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	ctx := context.Background()
 
-	code := dispatchWithContext(ctx, []string{"monitor", "--sock", missingSock, "--runs-dir", runsDir}, &stdout, &stderr)
+	code := dispatchWithContext(ctx, []string{"monitor", "--sock", missingSock, "--config-dir", tempDir}, &stdout, &stderr)
 	require.Equal(t, 0, code, "expected monitor to succeed in offline mode, stderr: %s", stderr.String())
 
 	require.NotNil(t, capturedModel, "expected runProgram to be called with dashboard model")
@@ -404,9 +438,10 @@ func TestMonitor_OfflineMode_HydratesFromDiskStore(t *testing.T) {
 
 func TestMonitor_OfflineMode_DirectStepLogReading(t *testing.T) {
 	tempDir := t.TempDir()
-	runsDir := filepath.Join(tempDir, "runs")
-	store, err := history.NewDiskStore(runsDir)
+	dbPath := filepath.Join(tempDir, "history.db")
+	store, err := history.NewSQLiteStore(dbPath)
 	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
 
 	jobID := "job-offline-log-test"
 	stepID := "step-offline-log-1"
@@ -452,14 +487,15 @@ func TestMonitor_OfflineMode_DirectStepLogReading(t *testing.T) {
 			break
 		}
 	}
-	assert.True(t, found, "expected step logs to be read directly from DiskStore in offline mode")
+	assert.True(t, found, "expected step logs to be read directly from SQLiteStore in offline mode")
 }
 
 func TestMonitor_AutoReconnect_TransitionsToLive(t *testing.T) {
 	tempDir := t.TempDir()
-	runsDir := filepath.Join(tempDir, "runs")
-	store, err := history.NewDiskStore(runsDir)
+	dbPath := filepath.Join(tempDir, "history.db")
+	store, err := history.NewSQLiteStore(dbPath)
 	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
 
 	histJob := &monitor.JobInfo{
 		ID:        "job-hist-reconnect-1",

@@ -18,7 +18,7 @@ import (
 // If maxDiskBytes > 0 and the total disk usage of run folders exceeds maxDiskBytes,
 // oldest completed runs are pruned one-by-one until total usage is <= 90% of maxDiskBytes.
 // Updated index.json is written atomically.
-func (s *DiskStore) Prune(maxRuns int, maxDiskBytes int64) (int, error) {
+func (s *DiskStore) Prune(maxRuns int, maxDiskBytes ...int64) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -71,7 +71,11 @@ func (s *DiskStore) Prune(maxRuns int, maxDiskBytes int64) (int, error) {
 	}
 
 	// 2. Disk size pruning: prune oldest completed runs until total usage is <= 90% of maxDiskBytes
-	if maxDiskBytes > 0 {
+	var diskLimit int64
+	if len(maxDiskBytes) > 0 {
+		diskLimit = maxDiskBytes[0]
+	}
+	if diskLimit > 0 {
 		runSizes := make(map[string]int64)
 		var totalSize int64
 
@@ -89,8 +93,8 @@ func (s *DiskStore) Prune(maxRuns int, maxDiskBytes int64) (int, error) {
 			totalSize += sz
 		}
 
-		if totalSize > maxDiskBytes {
-			threshold := int64(float64(maxDiskBytes) * 0.90)
+		if totalSize > diskLimit {
+			threshold := int64(float64(diskLimit) * 0.90)
 			for len(completedRuns) > 0 && totalSize > threshold {
 				lastIdx := len(completedRuns) - 1
 				oldest := completedRuns[lastIdx]
