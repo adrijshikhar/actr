@@ -2400,3 +2400,124 @@ func TestDashboard_SidebarScrollingWithManyHistoricalRuns(t *testing.T) {
 	m = res.(*DashboardModel)
 	assert.Equal(t, expectedRow, m.tree.Cursor, "clicked row should account for m.tree.Offset")
 }
+
+func TestDashboard_SidebarHeightStabilityAndPreciseClickInteraction(t *testing.T) {
+	termHeight := 30
+	m := NewDashboardModel(testSocketPath(t))
+	m.ready = true
+	resModel, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: termHeight})
+	m = resModel.(*DashboardModel)
+
+	snap := &monitor.Snapshot{
+		RunnerName: "test-runner",
+	}
+	for i := 1; i <= 50; i++ {
+		snap.RecentJobs = append(snap.RecentJobs, &monitor.JobInfo{
+			ID:        fmt.Sprintf("hist-job-%02d", i),
+			Name:      fmt.Sprintf("workflow-%02d", i),
+			RepoAlias: "default",
+			Status:    monitor.StatusSuccess,
+		})
+	}
+	m.ApplySnapshot(snap)
+
+	// 1. When collapsed (only ~5 rows visible in tree, no scrollbar)
+	viewCollapsed := m.View()
+	heightCollapsed := lipgloss.Height(viewCollapsed)
+	assert.Equal(t, termHeight, heightCollapsed, "view height when collapsed should exactly equal terminal height")
+
+	// 2. Expand HISTORICAL RUNS (> 50 rows visible, scrollbar opens)
+	for _, r := range m.tree.Rows() {
+		if r.Node != nil && (r.Node.ID == "historical-runs" || r.Node.ID == "hist-repo:default") {
+			r.Node.Expanded = true
+		}
+	}
+	m.tree.Rebuild()
+	assert.Greater(t, len(m.tree.Rows()), 50)
+
+	viewExpanded := m.View()
+	heightExpanded := lipgloss.Height(viewExpanded)
+	assert.Equal(t, termHeight, heightExpanded, "view height when expanded with scrollbar MUST NOT increase")
+	assert.Equal(t, heightCollapsed, heightExpanded, "view height must remain invariant between collapsed and expanded")
+
+	// 3. Test single-click toggling of branch header
+	histRow := -1
+	for idx, r := range m.tree.Rows() {
+		if r.Node != nil && r.Node.ID == "historical-runs" {
+			histRow = idx
+			break
+		}
+	}
+	require.GreaterOrEqual(t, histRow, 0)
+	histNode := m.tree.NodeAtRow(histRow)
+	require.True(t, histNode.Expanded)
+
+	// Click on the branch row to collapse it
+	res, _ := m.Update(tea.MouseMsg{
+		X:      10, // Clicking in the middle of "HISTORICAL RUNS" label
+		Y:      histRow + 1,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	m = res.(*DashboardModel)
+	assert.False(t, histNode.Expanded, "single click on branch header should collapse it")
+
+	// Click again to expand it
+	res, _ = m.Update(tea.MouseMsg{
+		X:      10,
+		Y:      histRow + 1,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	m = res.(*DashboardModel)
+	assert.True(t, histNode.Expanded, "second click on branch header should re-expand it")
+
+	// 4. Test clicking on an already-selected container node toggles it
+	defaultRepoRow := -1
+	for idx, r := range m.tree.Rows() {
+		if r.Node != nil && r.Node.ID == "hist-repo:default" {
+			defaultRepoRow = idx
+			break
+		}
+	}
+	require.GreaterOrEqual(t, defaultRepoRow, 0)
+	defaultRepoNode := m.tree.NodeAtRow(defaultRepoRow)
+	require.True(t, defaultRepoNode.Expanded)
+
+	// Select it first
+	m.tree.SelectRow(defaultRepoRow)
+	assert.Equal(t, defaultRepoRow, m.tree.Cursor)
+
+	// Click on already-selected row (on label) -> should toggle
+	res, _ = m.Update(tea.MouseMsg{
+		X:      8,
+		Y:      defaultRepoRow + 1,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	m = res.(*DashboardModel)
+	assert.False(t, defaultRepoNode.Expanded, "clicking on already-selected container node should toggle expansion")
+
+	// 5. Test clicking on scrollbar column
+	defaultRepoNode.Expanded = true
+	m.tree.Rebuild()
+	m.tree.SetHeight(10)
+	m.tree.Offset = 5
+	hasScroll, thumbStart, _ := m.tree.ScrollbarInfo()
+	require.True(t, hasScroll)
+
+	treeWidth := m.calcTreeWidth()
+	// Click above thumb on scrollbar
+	clickY := thumbStart - 1
+	if clickY < 0 {
+		clickY = 0
+	}
+	res, _ = m.Update(tea.MouseMsg{
+		X:      treeWidth, // On scrollbar column
+		Y:      clickY + 1,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	m = res.(*DashboardModel)
+	assert.Less(t, m.tree.Offset, 5, "clicking above thumb on scrollbar should scroll up")
+}

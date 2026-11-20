@@ -668,6 +668,28 @@ func (tw *TreeWidget) SelectFirst(fn func(node *TreeNode) bool) bool {
 	return false
 }
 
+// ScrollbarInfo returns whether the scrollbar is active, along with thumbStart and thumbEnd row indices.
+func (tw *TreeWidget) ScrollbarInfo() (hasScrollbar bool, thumbStart int, thumbEnd int) {
+	if tw == nil || tw.Height <= 0 || len(tw.rows) <= tw.Height {
+		return false, 0, 0
+	}
+	h := tw.Height
+	total := len(tw.rows)
+	thumbSize := (h * h) / total
+	if thumbSize < 1 {
+		thumbSize = 1
+	}
+	maxOffset := total - h
+	if maxOffset > 0 {
+		thumbStart = (tw.Offset * (h - thumbSize)) / maxOffset
+	}
+	thumbEnd = thumbStart + thumbSize
+	if thumbEnd > h {
+		thumbEnd = h
+	}
+	return true, thumbStart, thumbEnd
+}
+
 // View renders the tree within the specified width, windowing and scrolling if Height > 0.
 func (tw *TreeWidget) View(width int) string {
 	if width <= 0 {
@@ -684,15 +706,14 @@ func (tw *TreeWidget) View(width int) string {
 
 	startRow := 0
 	endRow := len(tw.rows)
-	hasScrollbar := false
+	hasScrollbar, thumbStart, thumbEnd := tw.ScrollbarInfo()
 
-	if tw.Height > 0 && len(tw.rows) > tw.Height {
+	if hasScrollbar {
 		startRow = tw.Offset
 		endRow = tw.Offset + tw.Height
 		if endRow > len(tw.rows) {
 			endRow = len(tw.rows)
 		}
-		hasScrollbar = true
 	}
 
 	contentWidth := width
@@ -700,25 +721,7 @@ func (tw *TreeWidget) View(width int) string {
 		contentWidth = width - 1
 	}
 
-	var thumbStart, thumbEnd int
-	if hasScrollbar {
-		h := tw.Height
-		total := len(tw.rows)
-		thumbSize := (h * h) / total
-		if thumbSize < 1 {
-			thumbSize = 1
-		}
-		maxOffset := total - h
-		if maxOffset > 0 {
-			thumbStart = (tw.Offset * (h - thumbSize)) / maxOffset
-		}
-		thumbEnd = thumbStart + thumbSize
-		if thumbEnd > h {
-			thumbEnd = h
-		}
-	}
-
-	var b strings.Builder
+	lines := make([]string, 0, endRow-startRow)
 	for i := startRow; i < endRow; i++ {
 		r := tw.rows[i]
 		if r.Node == nil {
@@ -798,6 +801,7 @@ func (tw *TreeWidget) View(width int) string {
 			renderedLabel = normalStyle.Render(label)
 		}
 
+		var lineStr string
 		if isSelected {
 			renderedIndent := selectedStyle.Render(indent)
 			content := renderedIndent + glyph + renderedLabel
@@ -808,7 +812,7 @@ func (tw *TreeWidget) View(width int) string {
 			} else if contentW > contentWidth {
 				content = ansi.Truncate(content, contentWidth, "")
 			}
-			b.WriteString(content + scrollChar)
+			lineStr = content + scrollChar
 		} else {
 			line := normalStyle.Render(indent) + glyph + renderedLabel
 			lineW := ansi.StringWidth(line)
@@ -817,9 +821,9 @@ func (tw *TreeWidget) View(width int) string {
 			} else if lineW > contentWidth {
 				line = ansi.Truncate(line, contentWidth, "")
 			}
-			b.WriteString(line + scrollChar)
+			lineStr = line + scrollChar
 		}
-		b.WriteString("\n")
+		lines = append(lines, lineStr)
 	}
-	return b.String()
+	return strings.Join(lines, "\n")
 }

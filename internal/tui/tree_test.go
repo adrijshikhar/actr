@@ -767,6 +767,9 @@ func TestTreeWidget_ScrollingAndWindowing(t *testing.T) {
 
 	// First view should show top items and scrollbar
 	v1 := tw.View(30)
+	if lipgloss.Height(v1) != 10 {
+		t.Fatalf("expected lipgloss.Height(v1) == 10, got %d", lipgloss.Height(v1))
+	}
 	if !strings.Contains(v1, "Run Item A") {
 		t.Fatalf("expected v1 to contain 'Run Item A', got:\n%s", v1)
 	}

@@ -953,28 +953,51 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 
+				// Check for scrollbar click on the right edge of sidebar
+				treeWidth := m.calcTreeWidth()
+				hasScrollbar, thumbStart, thumbEnd := m.tree.ScrollbarInfo()
+				if hasScrollbar && msg.X == treeWidth {
+					visualY := msg.Y - treeTopOffset
+					if visualY < thumbStart {
+						m.tree.ScrollUp(m.tree.Height)
+					} else if visualY >= thumbEnd {
+						m.tree.ScrollDown(m.tree.Height)
+					}
+					return m, m.updateActiveStepLogs()
+				}
+
 				if msg.Y >= treeTopOffset && (m.tree.Height <= 0 || msg.Y < treeTopOffset+m.tree.Height) {
 					row := m.tree.Offset + msg.Y - treeTopOffset
 					if row >= 0 && row < len(m.tree.Rows()) {
 						clickedNode := m.tree.NodeAtRow(row)
 
-						// Double click detection: same node within 350ms
+						// Double click detection: same node within 500ms
 						isDoubleClick := !m.lastTreeClickTime.IsZero() &&
-							time.Since(m.lastTreeClickTime) <= 350*time.Millisecond &&
+							time.Since(m.lastTreeClickTime) <= 500*time.Millisecond &&
 							clickedNode != nil && m.lastTreeClickNodeID == clickedNode.ID
 
-						// Chevron click detection: indent + glyph
+						// Chevron click detection: indent + glyph with generous hit target
 						isChevron := false
 						if clickedNode != nil && len(clickedNode.Children) > 0 {
 							chevronStart := 1 + clickedNode.Depth*2
-							chevronEnd := chevronStart + 2
+							chevronEnd := chevronStart + 3
 							if msg.X >= 1 && msg.X <= chevronEnd {
 								isChevron = true
 							}
 						}
 
+						// Toggle expansion on:
+						// 1. Double click anywhere on a container node
+						// 2. Direct click on the chevron / arrow prefix
+						// 3. Click on a container node that is already selected
+						// 4. Click on a top-level branch header (like HISTORICAL RUNS or LIVE RUNS)
+						wasAlreadySelected := (m.tree.Cursor == row)
+						isBranchHeader := clickedNode != nil && (clickedNode.NodeType == NodeBranch || clickedNode.ID == "historical-runs" || clickedNode.ID == "live-runs")
+						isContainer := clickedNode != nil && len(clickedNode.Children) > 0
+						shouldToggle := (isContainer && (isDoubleClick || isChevron || wasAlreadySelected)) || isBranchHeader
+
 						m.tree.SelectRow(row)
-						if isDoubleClick || isChevron {
+						if shouldToggle {
 							m.tree.ToggleExpandSelected()
 						}
 						if clickedNode != nil && clickedNode.NodeType == NodeRepo {
