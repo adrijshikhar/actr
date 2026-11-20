@@ -1366,7 +1366,7 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 			defer ticker.Stop()
 
 			if sample := sampler.Sample(); sample != nil {
-				monSrv.SetTelemetry(sample)
+				monSrv.SetJobTelemetry(jobID, c.repoAlias, sample)
 			}
 
 			for {
@@ -1375,7 +1375,7 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 					return
 				case <-ticker.C:
 					if sample := sampler.Sample(); sample != nil {
-						monSrv.SetTelemetry(sample)
+						monSrv.SetJobTelemetry(jobID, c.repoAlias, sample)
 					}
 				}
 			}
@@ -1390,11 +1390,6 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 		if s != nil {
 			s.SetTargetPID(0, 0)
 			s.SetTraceContext("", "", "", time.Time{})
-			if monSrv != nil {
-				if smp := s.Sample(); smp != nil {
-					monSrv.SetTelemetry(smp)
-				}
-			}
 		}
 	}()
 

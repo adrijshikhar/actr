@@ -1014,6 +1014,10 @@ func TestDashboard_UnifiedTree_LiveAndHistoricalBranches(t *testing.T) {
 		t.Fatalf("expected second historical job ID 'job-hist-2', got %q", defaultRepo.Children[1].ID)
 	}
 
+	histBranch.Expanded = true
+	defaultRepo.Expanded = true
+	m.tree.Rebuild()
+
 	view := m.tree.View(60)
 	for _, expectedText := range []string{
 		"LIVE RUNS (1 active)",
@@ -1194,6 +1198,12 @@ func TestDashboard_HistoricalStepSelection_LoadsLogs(t *testing.T) {
 	}
 
 	// Expand historical job to expose its steps
+	if n := m.tree.FindNode("historical-runs"); n != nil {
+		n.Expanded = true
+	}
+	if n := m.tree.FindNode("hist-repo:default"); n != nil {
+		n.Expanded = true
+	}
 	jobNode := m.tree.FindNode("job-hist-1")
 	require.NotNil(t, jobNode, "job-hist-1 must exist in tree")
 	jobNode.Expanded = true
@@ -1293,10 +1303,17 @@ func TestDashboard_HistoricalSelection_PeakVitalsHUD(t *testing.T) {
 	m.updateActiveStepLogs()
 	assert.False(t, m.telemetry.IsHistorical(), "expected live mode when live step selected")
 	dashView := m.View()
-	assert.Contains(t, dashView, "∿ SYSTEM VITALS & RADAR")
+	assert.Contains(t, dashView, "∿ RUN VITALS & RADAR")
 	assert.NotContains(t, dashView, "∿ RUN VITALS (PEAK SUMMARY)")
 
 	// 2. Select historical job: telemetry switches to Peak Vitals mode
+	if n := m.tree.FindNode("historical-runs"); n != nil {
+		n.Expanded = true
+	}
+	if n := m.tree.FindNode("hist-repo:default"); n != nil {
+		n.Expanded = true
+	}
+	m.tree.Rebuild()
 	found := m.tree.SelectFirst(func(n *TreeNode) bool { return n.ID == "job-hist-1" })
 	require.True(t, found, "job-hist-1 must be found in tree")
 	m.updateActiveStepLogs()
@@ -1327,7 +1344,7 @@ func TestDashboard_HistoricalSelection_PeakVitalsHUD(t *testing.T) {
 	m.updateActiveStepLogs()
 	assert.False(t, m.telemetry.IsHistorical(), "expected live mode when moved back to live job")
 	dashView = m.View()
-	assert.Contains(t, dashView, "∿ SYSTEM VITALS & RADAR")
+	assert.Contains(t, dashView, "∿ RUN VITALS & RADAR")
 	assert.NotContains(t, dashView, "∿ RUN VITALS (PEAK SUMMARY)")
 
 	// 5. Select historical-runs branch header: telemetry clears historical mode
@@ -1335,7 +1352,7 @@ func TestDashboard_HistoricalSelection_PeakVitalsHUD(t *testing.T) {
 	m.updateActiveStepLogs()
 	assert.False(t, m.telemetry.IsHistorical(), "expected live/cleared mode on historical branch root")
 	dashView = m.View()
-	assert.Contains(t, dashView, "∿ SYSTEM VITALS & RADAR")
+	assert.Contains(t, dashView, "∿ RUN VITALS & RADAR")
 }
 
 func TestDashboard_MultiRepoTreeGrouping(t *testing.T) {
@@ -1598,6 +1615,13 @@ func TestDashboard_NodeTraversalAndStepSelection(t *testing.T) {
 	model.SetHistoricalRunSummary("job-aim-h1", histSummary)
 
 	// 1. Select the repo group node: HUD should NOT treat it as a job
+	if n := model.tree.FindNode("historical-runs"); n != nil {
+		n.Expanded = true
+	}
+	if n := model.tree.FindNode("hist-repo:aim"); n != nil {
+		n.Expanded = true
+	}
+	model.tree.Rebuild()
 	foundRepo := model.tree.SelectFirst(func(n *TreeNode) bool { return n.ID == "hist-repo:aim" })
 	require.True(t, foundRepo)
 	_ = model.updateActiveStepLogs()
@@ -2343,10 +2367,11 @@ func TestDashboard_SidebarScrollingWithManyHistoricalRuns(t *testing.T) {
 	m.ApplySnapshot(snap)
 
 	// Expand historical root and default repo
-	for _, r := range m.tree.Rows() {
-		if r.Node != nil && (r.Node.ID == "historical-root" || r.Node.ID == "hist-repo:default") {
-			r.Node.Expanded = true
-		}
+	if n := m.tree.FindNode("historical-runs"); n != nil {
+		n.Expanded = true
+	}
+	if n := m.tree.FindNode("hist-repo:default"); n != nil {
+		n.Expanded = true
 	}
 	m.tree.Rebuild()
 
@@ -2430,10 +2455,11 @@ func TestDashboard_SidebarHeightStabilityAndPreciseClickInteraction(t *testing.T
 	assert.Equal(t, termHeight, heightCollapsed, "view height when collapsed should exactly equal terminal height")
 
 	// 2. Expand HISTORICAL RUNS (> 50 rows visible, scrollbar opens)
-	for _, r := range m.tree.Rows() {
-		if r.Node != nil && (r.Node.ID == "historical-runs" || r.Node.ID == "hist-repo:default") {
-			r.Node.Expanded = true
-		}
+	if n := m.tree.FindNode("historical-runs"); n != nil {
+		n.Expanded = true
+	}
+	if n := m.tree.FindNode("hist-repo:default"); n != nil {
+		n.Expanded = true
 	}
 	m.tree.Rebuild()
 	assert.Greater(t, len(m.tree.Rows()), 50)

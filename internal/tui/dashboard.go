@@ -158,7 +158,7 @@ func NewDashboardModel(sockPath string) *DashboardModel {
 	histNode := &TreeNode{
 		ID:       "historical-runs",
 		Label:    "HISTORICAL RUNS (0 past runs)",
-		Expanded: true,
+		Expanded: false,
 		NodeType: NodeBranch,
 	}
 	root.AddChild(liveNode)
@@ -772,6 +772,9 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.autoFollow = !m.autoFollow
 			if m.autoFollow {
 				m.viewport.GotoBottom()
+				m.setToast("✓ Auto-follow ON (following live logs)")
+			} else {
+				m.setToast("○ Auto-follow OFF (manual scrolling)")
 			}
 			return m, nil
 		case "k", "up":
@@ -1282,8 +1285,10 @@ func (m *DashboardModel) applySnapshot(snap *monitor.Snapshot) tea.Cmd {
 	if snap == nil {
 		return nil
 	}
-	if snap.Telemetry != nil {
+	if snap.Telemetry != nil && len(snap.ActiveJobs) > 0 {
 		m.telemetry.Update(snap.Telemetry)
+	} else if len(snap.ActiveJobs) == 0 {
+		m.telemetry.Update(nil)
 	}
 	if snap.SupervisorStatus != nil {
 		m.supervisorStatus = snap.SupervisorStatus
@@ -1360,10 +1365,14 @@ func (m *DashboardModel) ensureBranches() (*TreeNode, *TreeNode) {
 	}
 	hist := m.getHistoricalBranch()
 	if hist == nil {
+		histExpanded := false
+		if exp, ok := m.seenRepoExpansion["historical-runs"]; ok {
+			histExpanded = exp
+		}
 		hist = &TreeNode{
 			ID:       "historical-runs",
 			Label:    "HISTORICAL RUNS (0 past runs)",
-			Expanded: true,
+			Expanded: histExpanded,
 			NodeType: NodeBranch,
 		}
 		m.tree.Root.AddChild(hist)
@@ -1597,13 +1606,32 @@ func (m *DashboardModel) resolveJobRepoAlias(repoAlias, repo string) string {
 		}
 		return repo
 	}
-	if m.supervisorStatus != nil && len(m.supervisorStatus.RepoSlots) == 1 {
-		return m.supervisorStatus.RepoSlots[0].Alias
+	if m.supervisorStatus != nil {
+		var busySlots []string
+		for _, s := range m.supervisorStatus.RepoSlots {
+			if s.ActiveJobs > 0 {
+				busySlots = append(busySlots, s.Alias)
+			}
+		}
+		if len(busySlots) == 1 {
+			return busySlots[0]
+		}
+		if len(m.supervisorStatus.RepoSlots) == 1 {
+			return m.supervisorStatus.RepoSlots[0].Alias
+		}
 	}
 	return "default"
 }
 
 func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
+	savedExpanded := make(map[string]bool)
+	if m.tree != nil && m.tree.Root != nil {
+		m.tree.Root.Walk(func(n *TreeNode) bool {
+			savedExpanded[n.ID] = n.Expanded
+			return true
+		})
+	}
+
 	label := formatRunnerRootLabel(snap.RunnerName)
 	root := &TreeNode{
 		ID:       "root",
@@ -1623,9 +1651,17 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 		liveNode.Label = fmt.Sprintf("LIVE RUNS (%d active)", len(snap.ActiveJobs))
 	}
 
+	histExpanded := false
+	if exp, ok := m.seenRepoExpansion["historical-runs"]; ok {
+		histExpanded = exp
+	} else if existingHist := m.getHistoricalBranch(); existingHist != nil && existingHist.Expanded {
+		histExpanded = true
+	} else {
+		histExpanded = m.isOffline
+	}
 	histNode := &TreeNode{
 		ID:       "historical-runs",
-		Expanded: true,
+		Expanded: histExpanded,
 		NodeType: NodeBranch,
 	}
 
@@ -1663,13 +1699,34 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 				}
 			}
 			if matchedAlias == "" {
-				matchedAlias = job.RepoAlias
-				if matchedAlias == "" {
-					matchedAlias = job.Repo
+				for _, s := range slots {
+					sLower := strings.ToLower(s.Alias)
+					if (job.Workflow != "" && strings.Contains(strings.ToLower(job.Workflow), sLower)) ||
+						(job.Name != "" && strings.Contains(strings.ToLower(job.Name), sLower)) {
+						matchedAlias = s.Alias
+						break
+					}
 				}
-				if matchedAlias == "" {
-					matchedAlias = "default"
+			}
+			if matchedAlias == "" {
+				var busySlots []string
+				for _, s := range slots {
+					if s.ActiveJobs > 0 {
+						busySlots = append(busySlots, s.Alias)
+					}
 				}
+				if len(busySlots) == 1 {
+					matchedAlias = busySlots[0]
+				}
+			}
+			if matchedAlias == "" && len(slots) == 1 {
+				matchedAlias = slots[0].Alias
+			}
+			if matchedAlias == "" {
+				matchedAlias = m.resolveJobRepoAlias(job.RepoAlias, job.Repo)
+			}
+			if matchedAlias == "" {
+				matchedAlias = "default"
 			}
 			repoJobs[matchedAlias] = append(repoJobs[matchedAlias], job)
 		}
@@ -1941,9 +1998,13 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 
 	for _, alias := range histRepoAliases {
 		repoID := "hist-repo:" + alias
-		expanded := true
+		expanded := false
 		if exp, ok := m.seenRepoExpansion[repoID]; ok {
 			expanded = exp
+		} else if existingRepo := m.tree.FindNode(repoID); existingRepo != nil && existingRepo.Expanded {
+			expanded = true
+		} else {
+			expanded = m.isOffline
 		}
 		repoNode := &TreeNode{
 			ID:       repoID,
@@ -2297,7 +2358,7 @@ func (m *DashboardModel) handleJobFinish(jobID string, job *monitor.JobInfo) tea
 		}
 	}
 	if repoNode == nil {
-		expanded := true
+		expanded := false
 		if exp, ok := m.seenRepoExpansion[histRepoID]; ok {
 			expanded = exp
 		}
@@ -2320,6 +2381,11 @@ func (m *DashboardModel) handleJobFinish(jobID string, job *monitor.JobInfo) tea
 	if !alreadyInHist {
 		target.Parent = repoNode
 		repoNode.Children = append([]*TreeNode{target}, repoNode.Children...)
+	}
+
+	if selectedBefore != nil && (selectedBefore.ID == target.ID || (selectedBefore.FindParentJob() != nil && selectedBefore.FindParentJob().ID == target.ID)) {
+		hist.Expanded = true
+		repoNode.Expanded = true
 	}
 
 	m.updateBranchLabels()
@@ -2635,17 +2701,19 @@ func (m *DashboardModel) View() string {
 	return lipgloss.JoinVertical(lipgloss.Left, content, footer)
 }
 
-func leftNavText(width int, err error) string {
+func leftNavText(width int, err error, autoFollow bool) string {
+	followStr := "f follow:ON"
+	if !autoFollow {
+		followStr = "f follow:OFF"
+	}
 	var nav string
 	switch {
 	case width >= 150 && err == nil:
-		nav = " ↑/k up • ↓/j down • Enter toggle • / filter • ctrl+f search • c copy • z zoom • f follow • q quit"
-	case width >= 135 && err == nil:
-		nav = " ↑/k up • ↓/j down • Enter toggle • / filter • ctrl+f find • c copy • z zoom • q quit"
-	case width >= 125 && err == nil:
-		nav = " ↑/k up • ↓/j down • Enter/Space toggle • z zoom • f follow • q quit"
-	case width >= 100 && err == nil:
-		nav = " ↑/k up • ↓/j down • Enter toggle • / find • z zoom • q quit"
+		nav = fmt.Sprintf(" ↑/k up • ↓/j down • Enter toggle • / filter • ctrl+f search • c copy • z zoom • %s • q quit", followStr)
+	case width >= 130 && err == nil:
+		nav = fmt.Sprintf(" ↑/k up • ↓/j down • Enter toggle • / filter • ctrl+f find • c copy • z zoom • %s • q quit", followStr)
+	case width >= 95 && err == nil:
+		nav = fmt.Sprintf(" ↑/k up • ↓/j down • Enter toggle • z zoom • %s • q quit", followStr)
 	case width >= 50 && err == nil:
 		nav = " ↑/k up • ↓/j down • Enter toggle • / find • q quit"
 	case err != nil:
@@ -2669,7 +2737,7 @@ func (m *DashboardModel) renderFooter() string {
 	} else if m.logSearching {
 		leftStr = " Esc cancel • Enter navigate"
 	} else {
-		leftStr = leftNavText(m.width, m.lastErr)
+		leftStr = leftNavText(m.width, m.lastErr, m.autoFollow)
 	}
 
 	var left string

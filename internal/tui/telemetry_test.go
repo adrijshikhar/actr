@@ -573,7 +573,7 @@ func TestTelemetryWidget_ClearHistoricalMode(t *testing.T) {
 	// Before historical: live mode
 	assert.False(t, tw.IsHistorical())
 	viewLive1 := tw.View(80)
-	assert.Contains(t, viewLive1, "∿ SYSTEM VITALS & RADAR")
+	assert.Contains(t, viewLive1, "∿ RUN VITALS & RADAR")
 	assert.Contains(t, viewLive1, "PID: 9999")
 
 	// Switch to historical
@@ -592,7 +592,7 @@ func TestTelemetryWidget_ClearHistoricalMode(t *testing.T) {
 	tw.ClearHistoricalRun()
 	assert.False(t, tw.IsHistorical())
 	viewLive2 := tw.View(80)
-	assert.Contains(t, viewLive2, "∿ SYSTEM VITALS & RADAR")
+	assert.Contains(t, viewLive2, "∿ RUN VITALS & RADAR")
 	assert.Contains(t, viewLive2, "PID: 9999")
 	assert.Contains(t, viewLive2, "33.3%")
 }
