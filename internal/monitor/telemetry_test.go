@@ -3,9 +3,15 @@ package monitor
 import (
 	"math"
 	"os"
+	"os/exec"
+	"runtime"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestTelemetrySampler_SampleHostAndProcess(t *testing.T) {
@@ -133,4 +139,40 @@ func TestTelemetrySampler_RunnerMetricsFields(t *testing.T) {
 	if sample.DiskUsedRatio < 0 || sample.DiskUsedRatio > 1.0 {
 		t.Fatalf("expected DiskUsedRatio between 0 and 1, got %f", sample.DiskUsedRatio)
 	}
+}
+
+func TestSampleProcessGroup_CurrentProcess(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("sampleProcessGroup ps -g is only supported on Unix")
+	}
+
+	rawPID := os.Getpid()
+	if rawPID <= 0 {
+		t.Fatal("invalid PID")
+	}
+
+	// In current process, PGID can be checked or we can spawn a process with Setpgid
+	cmd := exec.Command("sleep", "0.5")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	require.NoError(t, cmd.Start())
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+
+	pid := cmd.Process.Pid
+	if pid <= 0 || pid > math.MaxInt32 {
+		t.Fatal("invalid process PID")
+	}
+	//nolint:gosec // range checked above
+	pgid := int32(pid) // #nosec G115
+	cpu, rss, count, err := sampleProcessGroup(pgid)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, count, 1)
+	assert.Greater(t, rss, uint64(0))
+	assert.GreaterOrEqual(t, cpu, 0.0)
+}
+
+func TestGetAllDescendants_NilOrEmpty(t *testing.T) {
+	assert.Nil(t, getAllDescendants(nil))
 }

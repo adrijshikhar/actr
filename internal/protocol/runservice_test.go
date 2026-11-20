@@ -1104,3 +1104,258 @@ func TestParseAcquiredJob_StepReferencePreservation(t *testing.T) {
 	assert.Equal(t, "v3", s2.Reference.Ref)
 	assert.Equal(t, "uses", s2.Type)
 }
+
+func TestParseAcquiredJob_EnvironmentVariables(t *testing.T) {
+	rawJSON := `{
+		"jobId": "job-env-test",
+		"environmentVariables": [
+			{"Key": "EXPECTED_ARCH", "Value": "arm64"},
+			{"Key": "PLATFORM", "Value": "darwin-arm64"},
+			{"k": "V8_TARGET", "v": "aarch64-apple-darwin"}
+		],
+		"steps": [
+			{
+				"id": "step-1",
+				"name": "Check Env",
+				"condition": "success()",
+				"type": "run",
+				"script": "echo hello"
+			}
+		]
+	}`
+
+	job, err := protocol.ParseAcquiredJob([]byte(rawJSON))
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	require.NotNil(t, job.Environment)
+	assert.Equal(t, "arm64", job.Environment["EXPECTED_ARCH"])
+	assert.Equal(t, "darwin-arm64", job.Environment["PLATFORM"])
+	assert.Equal(t, "aarch64-apple-darwin", job.Environment["V8_TARGET"])
+}
+
+func TestParseAcquiredJob_Endpoints(t *testing.T) {
+	rawJSON := `{
+		"jobId": "job-endpoints-test",
+		"resources": {
+			"endpoints": [
+				{
+					"name": "SystemVssConnection",
+					"type": "SystemVssConnection",
+					"url": "https://pipelines.actions.githubusercontent.com/test",
+					"authorization": {
+						"parameters": {
+							"AccessToken": "test-runtime-token"
+						}
+					},
+					"data": {
+						"ResultsServiceUrl": "https://results-receiver.actions.githubusercontent.com/",
+						"CacheServerUrl": "https://artifactcache.actions.githubusercontent.com/"
+					}
+				}
+			]
+		},
+		"steps": []
+	}`
+
+	job, err := protocol.ParseAcquiredJob([]byte(rawJSON))
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	require.Len(t, job.Endpoints, 1)
+
+	ep := job.Endpoints[0]
+	assert.Equal(t, "SystemVssConnection", ep.Name)
+	assert.Equal(t, "https://pipelines.actions.githubusercontent.com/test", ep.URL)
+	assert.Equal(t, "test-runtime-token", job.JobToken)
+	assert.Equal(t, "https://results-receiver.actions.githubusercontent.com/", ep.Data["ResultsServiceUrl"])
+	assert.Equal(t, "https://artifactcache.actions.githubusercontent.com/", ep.Data["CacheServerUrl"])
+}
+
+func TestParseAcquiredJob_StepConditions(t *testing.T) {
+	rawJSON := `{
+		"jobId": "job-conditions-test",
+		"steps": [
+			{
+				"id": "s1",
+				"name": "Always run",
+				"condition": "always()",
+				"type": "run",
+				"script": "echo always"
+			},
+			{
+				"id": "s2",
+				"name": "Docker step",
+				"condition": {"expression": "runner.os == 'macOS' && startsWith(matrix.platform, 'linux-')"},
+				"type": "run",
+				"script": "docker run"
+			},
+			{
+				"id": "s3",
+				"name": "Default step",
+				"type": "run",
+				"script": "echo default"
+			}
+		]
+	}`
+
+	job, err := protocol.ParseAcquiredJob([]byte(rawJSON))
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	require.Len(t, job.Steps, 3)
+
+	assert.Equal(t, "always()", job.Steps[0].Condition)
+	assert.Equal(t, "runner.os == 'macOS' && startsWith(matrix.platform, 'linux-')", job.Steps[1].Condition)
+	assert.Equal(t, "success()", job.Steps[2].Condition)
+}
+
+func TestParseAcquiredJob_NullEnvironmentEntry(t *testing.T) {
+	rawJSON := `{
+		"jobId": "job-null-env-test",
+		"environmentVariables": [
+			{"key": "FOO", "value": null},
+			{"key": "BAR", "value": "baz"}
+		],
+		"steps": []
+	}`
+
+	job, err := protocol.ParseAcquiredJob([]byte(rawJSON))
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	assert.Equal(t, "", job.Environment["FOO"])
+	assert.Equal(t, "baz", job.Environment["BAR"])
+	_, hasKey := job.Environment["key"]
+	_, hasVal := job.Environment["value"]
+	assert.False(t, hasKey, "environment should not contain bogus 'key'")
+	assert.False(t, hasVal, "environment should not contain bogus 'value'")
+}
+
+func TestParseAcquiredJob_EmptyContainerDoesNotSetImage(t *testing.T) {
+	rawJSON := `{
+		"jobId": "job-empty-container-test",
+		"container": {},
+		"steps": []
+	}`
+
+	job, err := protocol.ParseAcquiredJob([]byte(rawJSON))
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	if job.Container != nil {
+		assert.Empty(t, job.Container.Image, "container image should not be '{}'")
+	}
+}
+
+func TestJobSpecification_JSONRoundTrip(t *testing.T) {
+	orig := protocol.JobSpecification{
+		JobID:   "job-roundtrip",
+		JobName: "Test Job",
+		PlanID:  "plan-1",
+		Environment: map[string]string{
+			"VAR1": "val1",
+		},
+		Endpoints: []protocol.ServiceEndpoint{
+			{
+				Name: "TestEndpoint",
+				Type: "OAuth",
+				URL:  "https://example.com",
+				Authorization: &protocol.EndpointAuthorization{
+					Scheme:     "Bearer",
+					Parameters: map[string]string{"token": "secret"},
+				},
+			},
+		},
+	}
+
+	data, err := json.Marshal(orig)
+	require.NoError(t, err)
+
+	var restored protocol.JobSpecification
+	err = json.Unmarshal(data, &restored)
+	require.NoError(t, err)
+
+	assert.Equal(t, orig.JobID, restored.JobID)
+	assert.Equal(t, orig.Environment["VAR1"], restored.Environment["VAR1"])
+	require.Len(t, restored.Endpoints, 1)
+	assert.Equal(t, orig.Endpoints[0].Name, restored.Endpoints[0].Name)
+	assert.Equal(t, orig.Endpoints[0].Authorization.Parameters["token"], restored.Endpoints[0].Authorization.Parameters["token"])
+}
+
+func TestParseAcquiredJob_TopLevelEndpoints_ASTData(t *testing.T) {
+	wireJSON := `{
+		"jobId": "job-top-ep",
+		"endpoints": [
+			{
+				"name": "TopEP",
+				"type": "Custom",
+				"url": "https://custom.endpoint.com",
+				"data": {
+					"key1": {"lit": "literal-val"},
+					"key2": "plain-val"
+				}
+			}
+		]
+	}`
+
+	var job protocol.JobSpecification
+	err := json.Unmarshal([]byte(wireJSON), &job)
+	require.NoError(t, err)
+	require.Len(t, job.Endpoints, 1)
+	assert.Equal(t, "TopEP", job.Endpoints[0].Name)
+	assert.Equal(t, "literal-val", job.Endpoints[0].Data["key1"])
+	assert.Equal(t, "plain-val", job.Endpoints[0].Data["key2"])
+}
+
+func TestParseAcquiredJob_BooleanConditions(t *testing.T) {
+	wireJSON := `{
+		"jobId": "job-bool-cond",
+		"steps": [
+			{
+				"id": "step-false",
+				"condition": false
+			},
+			{
+				"id": "step-true",
+				"if": true
+			}
+		]
+	}`
+
+	var job protocol.JobSpecification
+	err := json.Unmarshal([]byte(wireJSON), &job)
+	require.NoError(t, err)
+	require.Len(t, job.Steps, 2)
+	assert.Equal(t, "false", job.Steps[0].Condition)
+	assert.Equal(t, "true", job.Steps[1].Condition)
+}
+
+func TestParseAcquiredJob_EndpointsDeduplication(t *testing.T) {
+	wireJSON := `{
+		"jobId": "job-dedup-ep",
+		"endpoints": [
+			{
+				"name": "SharedEP",
+				"type": "Custom",
+				"url": "https://custom.endpoint.com"
+			}
+		],
+		"resources": {
+			"endpoints": [
+				{
+					"name": "SharedEP",
+					"type": "Custom",
+					"url": "https://custom.endpoint.com"
+				},
+				{
+					"name": "OtherEP",
+					"type": "Custom",
+					"url": "https://other.endpoint.com"
+				}
+			]
+		}
+	}`
+
+	var job protocol.JobSpecification
+	err := json.Unmarshal([]byte(wireJSON), &job)
+	require.NoError(t, err)
+	require.Len(t, job.Endpoints, 2)
+	assert.Equal(t, "SharedEP", job.Endpoints[0].Name)
+	assert.Equal(t, "OtherEP", job.Endpoints[1].Name)
+}

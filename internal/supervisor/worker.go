@@ -142,6 +142,7 @@ func NewRepoWorker(alias string, repoCfg config.RepoConfig, resMgr *ResourceMana
 		}
 		coord := engine.NewCoordinator(host.NewDriver(), protoRunClient, w.workFolder).
 			WithRunnerName(alias).
+			WithRepoAlias(alias).
 			WithRepositoryURL(repoCfg.URL)
 		if monServer != nil {
 			coord.SetMonitorServer(monServer)

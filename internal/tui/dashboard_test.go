@@ -2320,3 +2320,83 @@ func TestDashboard_ToastNotificationLifecycle(t *testing.T) {
 	m = newModel.(*DashboardModel)
 	assert.Empty(t, m.ToastMsg(), "toast should be empty after clearToastMsg")
 }
+
+func TestDashboard_SidebarScrollingWithManyHistoricalRuns(t *testing.T) {
+	m := NewDashboardModel(testSocketPath(t))
+	m.ready = true
+	resModel, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = resModel.(*DashboardModel)
+
+	// Create 50 historical runs
+	snap := &monitor.Snapshot{
+		RunnerName: "test-runner",
+	}
+	for i := 1; i <= 50; i++ {
+		snap.RecentJobs = append(snap.RecentJobs, &monitor.JobInfo{
+			ID:        fmt.Sprintf("hist-job-%02d", i),
+			Name:      fmt.Sprintf("workflow-%02d", i),
+			RepoAlias: "default",
+			Status:    monitor.StatusSuccess,
+		})
+	}
+
+	m.ApplySnapshot(snap)
+
+	// Expand historical root and default repo
+	for _, r := range m.tree.Rows() {
+		if r.Node != nil && (r.Node.ID == "historical-root" || r.Node.ID == "hist-repo:default") {
+			r.Node.Expanded = true
+		}
+	}
+	m.tree.Rebuild()
+
+	totalRows := len(m.tree.Rows())
+	assert.Greater(t, totalRows, 50, "should have > 50 rows in the tree")
+
+	// Render view to populate sizes and heights
+	v := m.View()
+	assert.NotEmpty(t, v)
+	assert.Greater(t, m.tree.Height, 0)
+	assert.Equal(t, 0, m.tree.Offset)
+	assert.Contains(t, v, "█", "scrollbar thumb should be visible with > 50 rows")
+	assert.Contains(t, v, "│", "scrollbar track should be visible")
+
+	// Navigate down 30 rows
+	m.focus = FocusTree
+	for i := 0; i < 30; i++ {
+		res, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+		m = res.(*DashboardModel)
+	}
+
+	assert.Equal(t, 30, m.tree.Cursor)
+	assert.Greater(t, m.tree.Offset, 0, "offset should have increased to scroll down")
+	assert.LessOrEqual(t, m.tree.Offset, m.tree.Cursor)
+	assert.Greater(t, m.tree.Offset+m.tree.Height, m.tree.Cursor)
+
+	vScrolled := m.View()
+	assert.Contains(t, vScrolled, "█")
+
+	// Test PageDown key
+	prevOffset := m.tree.Offset
+	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	m = res.(*DashboardModel)
+	assert.GreaterOrEqual(t, m.tree.Offset, prevOffset)
+
+	// Test PageUp key
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	m = res.(*DashboardModel)
+	assert.LessOrEqual(t, m.tree.Offset, prevOffset+m.tree.Height)
+
+	// Test Mouse click on a scrolled row
+	clickedY := 5
+	treeTopOffset := 1
+	expectedRow := m.tree.Offset + clickedY - treeTopOffset
+	res, _ = m.Update(tea.MouseMsg{
+		X:      5,
+		Y:      clickedY,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	m = res.(*DashboardModel)
+	assert.Equal(t, expectedRow, m.tree.Cursor, "clicked row should account for m.tree.Offset")
+}

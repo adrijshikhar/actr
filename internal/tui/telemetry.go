@@ -291,7 +291,7 @@ func (tw *TelemetryWidget) View(width int) string {
 
 	metaLine := dimStyle.Render(fmt.Sprintf("STEP: %s  │  %s  │  %s  │  %s", stepName, pidStr, timeStr, traceStr))
 
-	barWidth := width - 36
+	barWidth := width - 42
 	if barWidth < 10 {
 		barWidth = 10
 	}

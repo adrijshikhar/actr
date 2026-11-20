@@ -737,3 +737,92 @@ func TestTreeWidget_ToggleExpandSelected(t *testing.T) {
 	var nilTree *TreeWidget
 	nilTree.ToggleExpandSelected() // should not panic
 }
+
+func TestTreeWidget_ScrollingAndWindowing(t *testing.T) {
+	root := &TreeNode{
+		ID:       "root",
+		Label:    "all-runs",
+		Expanded: true,
+	}
+	for i := 1; i <= 30; i++ {
+		root.AddChild(&TreeNode{
+			ID:    "item-" + string(rune('A'+i-1)),
+			Label: "Run Item " + string(rune('A'+i-1)),
+		})
+	}
+
+	tw := NewTreeWidget(root)
+	if len(tw.Rows()) != 31 {
+		t.Fatalf("expected 31 rows, got %d", len(tw.Rows()))
+	}
+
+	// Set visible height to 10 rows
+	tw.SetHeight(10)
+	if tw.Height != 10 {
+		t.Fatalf("expected height 10, got %d", tw.Height)
+	}
+	if tw.Offset != 0 {
+		t.Fatalf("expected offset 0, got %d", tw.Offset)
+	}
+
+	// First view should show top items and scrollbar
+	v1 := tw.View(30)
+	if !strings.Contains(v1, "Run Item A") {
+		t.Fatalf("expected v1 to contain 'Run Item A', got:\n%s", v1)
+	}
+	if strings.Contains(v1, "Run Item Z") {
+		t.Fatalf("expected v1 NOT to contain 'Run Item Z' (offscreen)")
+	}
+	if !strings.Contains(v1, "█") || !strings.Contains(v1, "│") {
+		t.Fatalf("expected scrollbar characters in v1, got:\n%s", v1)
+	}
+
+	// Move cursor down past row 10
+	for i := 0; i < 15; i++ {
+		tw.Down()
+	}
+	if tw.Cursor != 15 {
+		t.Fatalf("expected cursor 15, got %d", tw.Cursor)
+	}
+	if tw.Offset <= 0 {
+		t.Fatalf("expected offset > 0 after navigating down, got %d", tw.Offset)
+	}
+	if tw.Cursor < tw.Offset || tw.Cursor >= tw.Offset+tw.Height {
+		t.Fatalf("expected cursor %d to be within [%d, %d)", tw.Cursor, tw.Offset, tw.Offset+tw.Height)
+	}
+
+	v2 := tw.View(30)
+	if !strings.Contains(v2, "Run Item O") {
+		t.Fatalf("expected v2 to contain visible scrolled item 'Run Item O', got:\n%s", v2)
+	}
+
+	// ScrollDown and ScrollUp
+	tw.ScrollDown(10)
+	if tw.Offset > len(tw.Rows())-tw.Height {
+		t.Fatalf("expected offset capped at max offset, got %d", tw.Offset)
+	}
+	tw.ScrollUp(100)
+	if tw.Offset != 0 {
+		t.Fatalf("expected offset reset to 0 after ScrollUp, got %d", tw.Offset)
+	}
+	if tw.Cursor < tw.Offset || tw.Cursor >= tw.Offset+tw.Height {
+		t.Fatalf("expected cursor clamped into [0, 10), got %d", tw.Cursor)
+	}
+
+	// Edge cases: nil receiver, zero/negative height
+	var nilTree *TreeWidget
+	nilTree.SetHeight(10)
+	nilTree.EnsureVisible()
+	nilTree.ScrollUp(5)
+	nilTree.ScrollDown(5)
+
+	tw.SetHeight(0)
+	tw.EnsureVisible()
+	if tw.Offset != 0 {
+		t.Fatalf("expected offset 0 when Height <= 0, got %d", tw.Offset)
+	}
+	vNoScroll := tw.View(30)
+	if strings.Contains(vNoScroll, "│") {
+		t.Fatalf("expected no scrollbar when Height == 0, got:\n%s", vNoScroll)
+	}
+}

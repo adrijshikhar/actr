@@ -37,8 +37,12 @@ func (ai *ActionInput) UnmarshalYAML(value *yaml.Node) error {
 	if v, ok := m["description"].(string); ok {
 		ai.Description = v
 	}
-	if v, ok := m["default"].(string); ok {
-		ai.Default = v
+	// Extract default as literal text directly from yaml.Node to avoid float64 precision loss (e.g. 3.10 -> 3.1)
+	for i := 0; i < len(value.Content)-1; i += 2 {
+		if value.Content[i].Value == "default" {
+			ai.Default = value.Content[i+1].Value
+			break
+		}
 	}
 	if v, ok := m["deprecationMessage"].(string); ok {
 		ai.DeprecationMessage = v

@@ -7,6 +7,7 @@ import (
 
 	"github.com/adrijshikhar/actr/internal/config"
 	"github.com/adrijshikhar/actr/internal/monitor"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -225,6 +226,28 @@ func TestTelemetryWidget_StrictMonospaceAlignment(t *testing.T) {
 	// Check Trace ID present
 	if !strings.Contains(view, "4bf92f35") {
 		t.Fatalf("expected trace ID in view, got:\n%s", view)
+	}
+
+	// Verify no line wraps or exceeds target width with realistic disk metrics
+	twBig := NewTelemetryWidget()
+	twBig.Update(&monitor.RunnerMetrics{
+		PID:            87359,
+		PGID:           87359,
+		StepCPU:        88.5,
+		StepRSSBytes:   5 * 1024 * 1024 * 1024,
+		DiskUsedBytes:  668 * 1024 * 1024 * 1024,
+		DiskTotalBytes: 925 * 1024 * 1024 * 1024,
+		DiskFreeBytes:  257 * 1024 * 1024 * 1024,
+		DiskUsedRatio:  0.72,
+		ActiveStepName: "Focused patched Rust",
+		StepElapsedSec: 120,
+		TraceID:        "4bf92f3577b34da6a3ce929d0e0e4736",
+	})
+	bigView := twBig.View(90)
+	for _, l := range strings.Split(bigView, "\n") {
+		if lipgloss.Width(l) > 90 {
+			t.Fatalf("line exceeds width 90: %q (len %d)", l, lipgloss.Width(l))
+		}
 	}
 }
 

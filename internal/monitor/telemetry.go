@@ -3,6 +3,11 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"os/exec"
+	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -188,7 +193,11 @@ func (s *TelemetrySampler) SetTraceContext(traceID, spanID, stepName string, sta
 	s.stepStarted = startedAt
 }
 
-func (s *TelemetrySampler) Sample() *RunnerMetrics {
+func (s *TelemetrySampler) Sample() (sample *RunnerMetrics) {
+	defer func() {
+		_ = recover() // Protect against panics in third-party metric collectors (e.g. gopsutil net/disk parsing on Darwin)
+	}()
+
 	s.sampleMu.Lock()
 	defer s.sampleMu.Unlock()
 
@@ -204,7 +213,7 @@ func (s *TelemetrySampler) Sample() *RunnerMetrics {
 	s.mu.RUnlock()
 
 	now := time.Now()
-	sample := &RunnerMetrics{
+	sample = &RunnerMetrics{
 		Timestamp:      now,
 		PID:            targetPID,
 		PGID:           targetPGID,
@@ -250,20 +259,32 @@ func (s *TelemetrySampler) Sample() *RunnerMetrics {
 		} else {
 			sample.ProcessCount = 1
 		}
-	} else if targetPID > 0 {
-		if p, err := process.NewProcess(targetPID); err == nil {
-			sample.ProcessCount = 1
-			if cpuPercent, err := p.CPUPercent(); err == nil {
-				sample.StepCPU = cpuPercent
+	} else if targetPID > 0 || targetPGID > 0 {
+		sampled := false
+		if (runtime.GOOS == "darwin" || runtime.GOOS == "linux") && targetPGID > 0 {
+			cpuVal, rssVal, count, err := sampleProcessGroup(targetPGID)
+			if err == nil && count > 0 {
+				sample.StepCPU = cpuVal
+				sample.StepRSSBytes = rssVal
+				sample.ProcessCount = count
+				sampled = true
 			}
-			if memInfo, err := p.MemoryInfo(); err == nil && memInfo != nil {
-				sample.StepRSSBytes = memInfo.RSS
-			}
+		}
 
-			// Aggregate child processes in the process group
-			if children, err := p.Children(); err == nil {
-				sample.ProcessCount += len(children)
-				for _, ch := range children {
+		if !sampled && targetPID > 0 {
+			if p, err := process.NewProcess(targetPID); err == nil {
+				sample.ProcessCount = 1
+				if cpuPercent, err := p.CPUPercent(); err == nil {
+					sample.StepCPU = cpuPercent
+				}
+				if memInfo, err := p.MemoryInfo(); err == nil && memInfo != nil {
+					sample.StepRSSBytes = memInfo.RSS
+				}
+
+				// Aggregate all descendant processes recursively
+				descendants := getAllDescendants(p)
+				sample.ProcessCount += len(descendants)
+				for _, ch := range descendants {
 					if cCPU, err := ch.CPUPercent(); err == nil {
 						sample.StepCPU += cCPU
 					}
@@ -295,42 +316,121 @@ func (s *TelemetrySampler) Sample() *RunnerMetrics {
 	}
 
 	// Disk Write Rate
-	if diskCounters, err := disk.IOCounters(); err == nil {
-		var totalWriteBytes uint64
-		for _, c := range diskCounters {
-			totalWriteBytes += c.WriteBytes
-		}
-		if !s.lastDiskTime.IsZero() && now.After(s.lastDiskTime) {
-			durationSec := now.Sub(s.lastDiskTime).Seconds()
-			if durationSec > 0 && totalWriteBytes >= s.lastDiskWr {
-				sample.DiskWriteRate = uint64(float64(totalWriteBytes-s.lastDiskWr) / durationSec)
+	func() {
+		defer func() { _ = recover() }()
+		if diskCounters, err := disk.IOCounters(); err == nil {
+			var totalWriteBytes uint64
+			for _, c := range diskCounters {
+				totalWriteBytes += c.WriteBytes
 			}
+			if !s.lastDiskTime.IsZero() && now.After(s.lastDiskTime) {
+				durationSec := now.Sub(s.lastDiskTime).Seconds()
+				if durationSec > 0 && totalWriteBytes >= s.lastDiskWr {
+					sample.DiskWriteRate = uint64(float64(totalWriteBytes-s.lastDiskWr) / durationSec)
+				}
+			}
+			s.lastDiskTime = now
+			s.lastDiskWr = totalWriteBytes
 		}
-		s.lastDiskTime = now
-		s.lastDiskWr = totalWriteBytes
-	}
+	}()
 
 	// Network I/O Rate (host fallback when no container targeted)
 	if targetContainerID == "" {
-		if netCounters, err := net.IOCounters(false); err == nil && len(netCounters) > 0 {
-			rx := netCounters[0].BytesRecv
-			tx := netCounters[0].BytesSent
-			if !s.lastNetTime.IsZero() && now.After(s.lastNetTime) {
-				durationSec := now.Sub(s.lastNetTime).Seconds()
-				if durationSec > 0 {
-					if rx >= s.lastNetRx {
-						sample.NetRxRate = uint64(float64(rx-s.lastNetRx) / durationSec)
-					}
-					if tx >= s.lastNetTx {
-						sample.NetTxRate = uint64(float64(tx-s.lastNetTx) / durationSec)
+		func() {
+			defer func() { _ = recover() }()
+			if netCounters, err := net.IOCounters(false); err == nil && len(netCounters) > 0 {
+				rx := netCounters[0].BytesRecv
+				tx := netCounters[0].BytesSent
+				if !s.lastNetTime.IsZero() && now.After(s.lastNetTime) {
+					durationSec := now.Sub(s.lastNetTime).Seconds()
+					if durationSec > 0 {
+						if rx >= s.lastNetRx {
+							sample.NetRxRate = uint64(float64(rx-s.lastNetRx) / durationSec)
+						}
+						if tx >= s.lastNetTx {
+							sample.NetTxRate = uint64(float64(tx-s.lastNetTx) / durationSec)
+						}
 					}
 				}
+				s.lastNetTime = now
+				s.lastNetRx = rx
+				s.lastNetTx = tx
 			}
-			s.lastNetTime = now
-			s.lastNetRx = rx
-			s.lastNetTx = tx
-		}
+		}()
 	}
 
 	return sample
+}
+
+// sampleProcessGroup queries ps to aggregate CPU%, RSS bytes, and process count
+// for all processes in the specified process group (PGID).
+func sampleProcessGroup(pgid int32) (cpu float64, rss uint64, count int, err error) {
+	if pgid <= 0 {
+		return 0, 0, 0, errors.New("invalid pgid")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+
+	var cmd *exec.Cmd
+	var pgidStr string
+	isLinux := runtime.GOOS == "linux"
+	if isLinux {
+		pgidStr = strconv.Itoa(int(pgid))
+		cmd = exec.CommandContext(ctx, "ps", "-eo", "pid,pgid,%cpu,rss")
+	} else {
+		cmd = exec.CommandContext(ctx, "ps", "-o", "pid,%cpu,rss", "-g", strconv.Itoa(int(pgid))) // #nosec G204 -- pgid is an integer
+	}
+
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) <= 1 {
+		return 0, 0, 0, nil
+	}
+	for _, line := range lines[1:] {
+		fields := strings.Fields(line)
+		if isLinux {
+			if len(fields) < 4 || fields[1] != pgidStr {
+				continue
+			}
+			cVal, errC := strconv.ParseFloat(fields[2], 64)
+			rssKB, errM := strconv.ParseUint(fields[3], 10, 64)
+			if errC == nil && errM == nil {
+				cpu += cVal
+				rss += rssKB * 1024
+				count++
+			}
+		} else {
+			if len(fields) < 3 {
+				continue
+			}
+			cVal, errC := strconv.ParseFloat(fields[1], 64)
+			rssKB, errM := strconv.ParseUint(fields[2], 10, 64)
+			if errC == nil && errM == nil {
+				cpu += cVal
+				rss += rssKB * 1024
+				count++
+			}
+		}
+	}
+	return cpu, rss, count, nil
+}
+
+// getAllDescendants recursively gathers all descendant processes of p.
+func getAllDescendants(p *process.Process) []*process.Process {
+	if p == nil {
+		return nil
+	}
+	var all []*process.Process
+	children, err := p.Children()
+	if err != nil || len(children) == 0 {
+		return all
+	}
+	for _, ch := range children {
+		all = append(all, ch)
+		all = append(all, getAllDescendants(ch)...)
+	}
+	return all
 }

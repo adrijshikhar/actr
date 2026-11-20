@@ -795,7 +795,7 @@ func TestCoordinator_ExecuteJob_WithMonitor(t *testing.T) {
 		},
 	}
 
-	coord := NewCoordinator(mock, nil, filepath.Join(tmpDir, "work")).WithStepLogger(true)
+	coord := NewCoordinator(mock, nil, filepath.Join(tmpDir, "work")).WithStepLogger(true).WithRepoAlias("cxstatusline")
 	coord.SetMonitorServer(server)
 
 	client := monitor.NewClient(sockPath)
@@ -843,11 +843,15 @@ func TestCoordinator_ExecuteJob_WithMonitor(t *testing.T) {
 	mu.Unlock()
 
 	var hasJobStart, hasJobFinish, hasStepStart, hasStepLog, hasTelemetry, hasStepFinish bool
+	var hasRepoAlias, hasStepTelemetry, hasTraceID bool
 	for _, ev := range evs {
 		switch ev.Type {
 		case monitor.EventJobStart:
 			if ev.JobID == "job-mon-test" {
 				hasJobStart = true
+				if ev.RepoAlias == "cxstatusline" {
+					hasRepoAlias = true
+				}
 			}
 		case monitor.EventJobFinish:
 			if ev.JobID == "job-mon-test" {
@@ -863,6 +867,14 @@ func TestCoordinator_ExecuteJob_WithMonitor(t *testing.T) {
 			}
 		case monitor.EventTelemetry:
 			hasTelemetry = true
+			if ev.Telemetry != nil {
+				if ev.Telemetry.ActiveStepName == "Run Build" {
+					hasStepTelemetry = true
+				}
+				if ev.Telemetry.TraceID != "" {
+					hasTraceID = true
+				}
+			}
 		case monitor.EventStepFinish:
 			if ev.JobID == "job-mon-test" {
 				hasStepFinish = true
@@ -872,6 +884,9 @@ func TestCoordinator_ExecuteJob_WithMonitor(t *testing.T) {
 
 	if !hasJobStart {
 		t.Error("missing EventJobStart")
+	}
+	if !hasRepoAlias {
+		t.Error("missing RepoAlias cxstatusline in EventJobStart")
 	}
 	if !hasJobFinish {
 		t.Error("missing EventJobFinish")
@@ -884,6 +899,12 @@ func TestCoordinator_ExecuteJob_WithMonitor(t *testing.T) {
 	}
 	if !hasTelemetry {
 		t.Error("missing EventTelemetry during step execution")
+	}
+	if !hasStepTelemetry {
+		t.Error("missing StepTelemetry with ActiveStepName='Run Build'")
+	}
+	if !hasTraceID {
+		t.Error("missing TraceID in step telemetry")
 	}
 	if !hasStepFinish {
 		t.Error("missing EventStepFinish")
@@ -1052,7 +1073,7 @@ func TestCoordinator_ExecuteJob_ProcessStartPIDAndJobEvents(t *testing.T) {
 		},
 	}
 
-	coord := NewCoordinator(mock, nil, filepath.Join(tmpDir, "work")).WithStepLogger(true)
+	coord := NewCoordinator(mock, nil, filepath.Join(tmpDir, "work")).WithStepLogger(true).WithRepoAlias("cxstatusline")
 	coord.SetMonitorServer(server)
 
 	// Wrap executeFunc to capture PID while process is running
@@ -1367,7 +1388,14 @@ func TestEvaluateExpressionAndParseContextData(t *testing.T) {
 			"d": [
 				{"k": "event_name", "v": "workflow_dispatch"},
 				{"k": "repository", "v": "adrijshikhar/cxstatusline"},
+				{"k": "server_url", "v": "https://github.com"},
 				{"k": "token", "v": "ghs_secret_123"}
+			],
+			"t": 2
+		},
+		"runner": {
+			"d": [
+				{"k": "temp", "v": "/tmp/runner/temp"}
 			],
 			"t": 2
 		},
@@ -1425,12 +1453,67 @@ func TestEvaluateExpressionAndParseContextData(t *testing.T) {
 		{"needs.detect.outputs.should_build", "false"},
 		{"needs.detect.result", "success"},
 		{"github.token", "ghs_secret_123"},
+		{"${{ github.token }}", "ghs_secret_123"},
+		{"${{ github.server_url == 'https://github.com' && github.token || '' }}", "ghs_secret_123"},
+		{"${{ github.server_url == 'https://other.com' && github.token || '' }}", ""},
 		{"github.repository", "adrijshikhar/cxstatusline"},
+		{"prefix-${{ github.repository }}-suffix", "prefix-adrijshikhar/cxstatusline-suffix"},
+		{"${{ runner.temp }}/prebuilt-detect.log", "/tmp/runner/temp/prebuilt-detect.log"},
+		{"format('{0}/prebuilt-detect.log', runner.temp)", "/tmp/runner/temp/prebuilt-detect.log"},
+		{"format('logs-detect-{0}', github.token)", "logs-detect-ghs_secret_123"},
 		{"'plain literal'", "plain literal"},
 	}
 
 	for _, tt := range tests {
 		got := evaluateExpression(tt.expr, parsed)
+		if got != tt.expected {
+			t.Errorf("evaluateExpression(%q) = %q; want %q", tt.expr, got, tt.expected)
+		}
+	}
+}
+
+func TestEvaluateExpression_FormatWithEscapedQuotes(t *testing.T) {
+	input := `format('IFS='','' read -ra ADDR <<< "$PLATFORMS"
+for p in "${ADDR[@]}"; do
+  part="parts/release-$TAG-$p"
+  if [ ! -f "$part/manifest.json" ]; then
+    echo "::warning::$part/manifest.json missing; falling back to gh run download"
+    rm -rf "$part"
+    mkdir -p "$part"
+    gh run download "{0}" --repo "{1}" -n "release-$TAG-$p" -D "$part"
+  fi
+done
+', github.run_id, github.repository)`
+
+	ctx := map[string]any{
+		"github": map[string]any{
+			"run_id":     "44657469251",
+			"repository": "adrijshikhar/cxstatusline",
+		},
+	}
+	res := evaluateExpression(input, ctx)
+	if strings.HasPrefix(res, "format(") {
+		t.Fatalf("FAILED: evaluateExpression did not evaluate format(): %q", res)
+	}
+	if !strings.Contains(res, "IFS=',' read") {
+		t.Errorf("expected IFS=',' read with single quotes unescaped, got:\n%s", res)
+	}
+	if !strings.Contains(res, `gh run download "44657469251" --repo "adrijshikhar/cxstatusline"`) {
+		t.Errorf("expected placeholder substitution for run_id and repository, got:\n%s", res)
+	}
+
+	// Test single quote escaping in string literals and format
+	escapedTests := []struct {
+		expr     string
+		expected string
+	}{
+		{"''''", "'"},
+		{"'a''b'", "a'b"},
+		{"format('hello ''{0}''', 'world')", "hello 'world'"},
+		{"format('a'',''b')", "a','b"},
+	}
+	for _, tt := range escapedTests {
+		got := evaluateExpression(tt.expr, nil)
 		if got != tt.expected {
 			t.Errorf("evaluateExpression(%q) = %q; want %q", tt.expr, got, tt.expected)
 		}
@@ -2654,5 +2737,185 @@ func TestResolveActionScriptPath_PathTraversalRejection(t *testing.T) {
 	// Empty path
 	if _, err := resolveActionScriptPath(actionDir, ""); err == nil {
 		t.Error("expected error for empty script path, got nil")
+	}
+}
+
+func TestShouldExecuteStep(t *testing.T) {
+	ctx := map[string]any{
+		"runner": map[string]any{
+			"os": "macOS",
+		},
+		"matrix": map[string]any{
+			"platform": "darwin-arm64",
+		},
+	}
+
+	// 1. Success condition when not failed
+	if !shouldExecuteStep("success()", ctx, false, false) {
+		t.Error("expected success() to be true when not failed")
+	}
+	if shouldExecuteStep("success()", ctx, true, false) {
+		t.Error("expected success() to be false when failed")
+	}
+
+	// 2. Always condition
+	if !shouldExecuteStep("always()", ctx, false, false) {
+		t.Error("expected always() to be true when not failed")
+	}
+	if !shouldExecuteStep("always()", ctx, true, false) {
+		t.Error("expected always() to be true when failed")
+	}
+
+	// 3. Failure condition
+	if shouldExecuteStep("failure()", ctx, false, false) {
+		t.Error("expected failure() to be false when not failed")
+	}
+	if !shouldExecuteStep("failure()", ctx, true, false) {
+		t.Error("expected failure() to be true when failed")
+	}
+
+	// 4. Expression evaluating to false: runner.os == 'macOS' && startsWith(matrix.platform, 'linux-')
+	dockerCond := "runner.os == 'macOS' && startsWith(matrix.platform, 'linux-')"
+	if shouldExecuteStep(dockerCond, ctx, false, false) {
+		t.Error("expected dockerCond to be false for darwin platform")
+	}
+
+	// 5. Expression evaluating to true for native macOS
+	nativeCond := "${{ runner.os != 'macOS' || !startsWith(matrix.platform, 'linux-') }}"
+	if !shouldExecuteStep(nativeCond, ctx, false, false) {
+		t.Error("expected nativeCond to be true for darwin platform")
+	}
+
+	// 6. Test with linux matrix platform
+	linuxCtx := map[string]any{
+		"runner": map[string]any{
+			"os": "macOS",
+		},
+		"matrix": map[string]any{
+			"platform": "linux-arm64",
+		},
+	}
+	if !shouldExecuteStep(dockerCond, linuxCtx, false, false) {
+		t.Error("expected dockerCond to be true for linux-arm64")
+	}
+	if shouldExecuteStep(nativeCond, linuxCtx, false, false) {
+		t.Error("expected nativeCond to be false for linux-arm64")
+	}
+}
+
+func TestEvaluateExpression_ContextPathVsLiteral(t *testing.T) {
+	ctx := map[string]any{
+		"github": map[string]any{
+			"event_name": "push",
+		},
+		"env": map[string]any{
+			"FOO": "bar",
+		},
+	}
+
+	// String literals containing dot should NOT be treated as context paths and stripped
+	for _, lit := range []string{"14.0", "1.4.0", "v1.2.3"} {
+		if got := evaluateExpression(lit, ctx); got != lit {
+			t.Errorf("evaluateExpression(%q) = %q, want %q", lit, got, lit)
+		}
+	}
+
+	// Valid context paths should resolve
+	if got := evaluateExpression("github.event_name", ctx); got != "push" {
+		t.Errorf("evaluateExpression(github.event_name) = %q, want 'push'", got)
+	}
+	if got := evaluateExpression("env.FOO", ctx); got != "bar" {
+		t.Errorf("evaluateExpression(env.FOO) = %q, want 'bar'", got)
+	}
+
+	// Unknown context paths should resolve to empty string
+	if got := evaluateExpression("github.unknown_var", ctx); got != "" {
+		t.Errorf("evaluateExpression(github.unknown_var) = %q, want empty", got)
+	}
+	if got := evaluateExpression("needs.detect.outputs.nonexistent", ctx); got != "" {
+		t.Errorf("evaluateExpression(needs.detect.outputs.nonexistent) = %q, want empty", got)
+	}
+}
+
+func TestCoordinator_GitHubContextAndEnvSync(t *testing.T) {
+	d := &mockDriver{}
+	tmpWorkDir := t.TempDir()
+	c := NewCoordinator(d, nil, tmpWorkDir)
+
+	job := &protocol.JobSpecification{
+		JobID:   "test-env-sync",
+		JobName: "test-env-sync",
+		Variables: map[string]string{
+			"system.github.runid":      "12345678",
+			"system.github.runnumber":  "42",
+			"system.github.runattempt": "1",
+			"system.github.actor":      "test-actor",
+			"system.github.repository": "org/repo",
+		},
+		Steps: []protocol.JobStep{
+			{ID: "s1", Name: "step 1", Script: "echo test"},
+		},
+	}
+
+	_, err := c.ExecuteJob(context.Background(), job, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(d.stepsRun) != 1 {
+		t.Fatalf("expected 1 step run, got %d", len(d.stepsRun))
+	}
+
+	env := d.stepsRun[0].Environment
+	expected := map[string]string{
+		"GITHUB_RUN_ID":     "12345678",
+		"GITHUB_RUN_NUMBER": "42",
+		"GITHUB_RUN_ATTEMPT": "1",
+		"GITHUB_ACTOR":      "test-actor",
+		"GITHUB_REPOSITORY": "org/repo",
+	}
+
+	for k, expectedVal := range expected {
+		if got := env[k]; got != expectedVal {
+			t.Errorf("expected env %q = %q, got %q", k, expectedVal, got)
+		}
+	}
+}
+
+func TestEvaluateExpression_CaseInsensitiveFunctions(t *testing.T) {
+	ctx := map[string]any{
+		"github": map[string]any{
+			"ref": "refs/HEADS/main",
+		},
+		"matrix": map[string]any{
+			"file": "REPORT.PDF",
+			"msg":  "Error: Failure in Job",
+		},
+	}
+
+	if got := evaluateExpression("startsWith(github.ref, 'refs/heads/')", ctx); got != "true" {
+		t.Errorf("expected startsWith to be 'true', got %q", got)
+	}
+	if got := evaluateExpression("endsWith(matrix.file, '.pdf')", ctx); got != "true" {
+		t.Errorf("expected endsWith to be 'true', got %q", got)
+	}
+	if got := evaluateExpression("contains(matrix.msg, 'failure')", ctx); got != "true" {
+		t.Errorf("expected contains to be 'true', got %q", got)
+	}
+}
+
+func TestShouldExecuteStep_BooleanLiterals(t *testing.T) {
+	ctx := map[string]any{}
+	if shouldExecuteStep("false", ctx, false, false) {
+		t.Error("expected shouldExecuteStep('false') to be false")
+	}
+	if shouldExecuteStep("False", ctx, false, false) {
+		t.Error("expected shouldExecuteStep('False') to be false")
+	}
+	if !shouldExecuteStep("true", ctx, false, false) {
+		t.Error("expected shouldExecuteStep('true') to be true")
+	}
+	if shouldExecuteStep("true", ctx, true, false) {
+		t.Error("expected shouldExecuteStep('true') with jobFailed to be false")
 	}
 }

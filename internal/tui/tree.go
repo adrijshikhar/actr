@@ -103,6 +103,8 @@ type FlatRow struct {
 type TreeWidget struct {
 	Root          *TreeNode
 	Cursor        int
+	Offset        int
+	Height        int
 	rows          []FlatRow
 	filter        string
 	savedExpanded map[string]bool
@@ -355,6 +357,7 @@ func (tw *TreeWidget) Rebuild() {
 	}
 	if len(tw.rows) == 0 {
 		tw.Cursor = 0
+		tw.Offset = 0
 		return
 	}
 	if tw.Cursor >= len(tw.rows) {
@@ -363,6 +366,7 @@ func (tw *TreeWidget) Rebuild() {
 	if tw.Cursor < 0 {
 		tw.Cursor = 0
 	}
+	tw.EnsureVisible()
 }
 
 func (tw *TreeWidget) flattenFiltered(node *TreeNode, depth int, query string) {
@@ -412,10 +416,95 @@ func (tw *TreeWidget) flatten(node *TreeNode, depth int) {
 	}
 }
 
+// SetHeight sets the visible row height and ensures the current cursor is visible.
+func (tw *TreeWidget) SetHeight(h int) {
+	if tw == nil {
+		return
+	}
+	tw.Height = h
+	tw.EnsureVisible()
+}
+
+// EnsureVisible adjusts Offset so that Cursor is visible within Height rows.
+func (tw *TreeWidget) EnsureVisible() {
+	if tw == nil {
+		return
+	}
+	if tw.Height <= 0 || len(tw.rows) == 0 {
+		tw.Offset = 0
+		return
+	}
+	if tw.Cursor < 0 {
+		tw.Cursor = 0
+	}
+	if tw.Cursor >= len(tw.rows) {
+		tw.Cursor = len(tw.rows) - 1
+	}
+	if tw.Cursor < tw.Offset {
+		tw.Offset = tw.Cursor
+	}
+	if tw.Cursor >= tw.Offset+tw.Height {
+		tw.Offset = tw.Cursor - tw.Height + 1
+	}
+	maxOffset := len(tw.rows) - tw.Height
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if tw.Offset > maxOffset {
+		tw.Offset = maxOffset
+	}
+	if tw.Offset < 0 {
+		tw.Offset = 0
+	}
+}
+
+// ScrollUp scrolls the visible window up by delta rows.
+func (tw *TreeWidget) ScrollUp(delta int) {
+	if tw == nil || delta <= 0 {
+		return
+	}
+	tw.Offset -= delta
+	if tw.Offset < 0 {
+		tw.Offset = 0
+	}
+	if tw.Height > 0 {
+		if tw.Cursor > tw.Offset+tw.Height-1 {
+			tw.Cursor = tw.Offset + tw.Height - 1
+		}
+		if tw.Cursor < tw.Offset {
+			tw.Cursor = tw.Offset
+		}
+	}
+}
+
+// ScrollDown scrolls the visible window down by delta rows.
+func (tw *TreeWidget) ScrollDown(delta int) {
+	if tw == nil || delta <= 0 {
+		return
+	}
+	maxOffset := len(tw.rows) - tw.Height
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	tw.Offset += delta
+	if tw.Offset > maxOffset {
+		tw.Offset = maxOffset
+	}
+	if tw.Height > 0 {
+		if tw.Cursor < tw.Offset {
+			tw.Cursor = tw.Offset
+		}
+		if tw.Cursor > tw.Offset+tw.Height-1 {
+			tw.Cursor = tw.Offset + tw.Height - 1
+		}
+	}
+}
+
 // Up moves the selection cursor up by one row if possible.
 func (tw *TreeWidget) Up() {
 	if tw.Cursor > 0 {
 		tw.Cursor--
+		tw.EnsureVisible()
 	}
 }
 
@@ -423,6 +512,7 @@ func (tw *TreeWidget) Up() {
 func (tw *TreeWidget) Down() {
 	if tw.Cursor < len(tw.rows)-1 {
 		tw.Cursor++
+		tw.EnsureVisible()
 	}
 }
 
@@ -476,6 +566,7 @@ func (tw *TreeWidget) selectNode(target *TreeNode) bool {
 	for i, r := range tw.rows {
 		if r.Node == target {
 			tw.Cursor = i
+			tw.EnsureVisible()
 			return true
 		}
 	}
@@ -497,6 +588,7 @@ func (tw *TreeWidget) SelectRow(rowIdx int) bool {
 		return false
 	}
 	tw.Cursor = rowIdx
+	tw.EnsureVisible()
 	return true
 }
 
@@ -516,6 +608,7 @@ func (tw *TreeWidget) SelectByID(id string) bool {
 	for i, r := range tw.rows {
 		if r.Node != nil && r.Node.ID == id {
 			tw.Cursor = i
+			tw.EnsureVisible()
 			return true
 		}
 	}
@@ -575,7 +668,7 @@ func (tw *TreeWidget) SelectFirst(fn func(node *TreeNode) bool) bool {
 	return false
 }
 
-// View renders the tree within the specified width. If width <= 0, returns empty string.
+// View renders the tree within the specified width, windowing and scrolling if Height > 0.
 func (tw *TreeWidget) View(width int) string {
 	if width <= 0 {
 		return ""
@@ -587,17 +680,66 @@ func (tw *TreeWidget) View(width int) string {
 		return ""
 	}
 
+	tw.EnsureVisible()
+
+	startRow := 0
+	endRow := len(tw.rows)
+	hasScrollbar := false
+
+	if tw.Height > 0 && len(tw.rows) > tw.Height {
+		startRow = tw.Offset
+		endRow = tw.Offset + tw.Height
+		if endRow > len(tw.rows) {
+			endRow = len(tw.rows)
+		}
+		hasScrollbar = true
+	}
+
+	contentWidth := width
+	if hasScrollbar && contentWidth > 1 {
+		contentWidth = width - 1
+	}
+
+	var thumbStart, thumbEnd int
+	if hasScrollbar {
+		h := tw.Height
+		total := len(tw.rows)
+		thumbSize := (h * h) / total
+		if thumbSize < 1 {
+			thumbSize = 1
+		}
+		maxOffset := total - h
+		if maxOffset > 0 {
+			thumbStart = (tw.Offset * (h - thumbSize)) / maxOffset
+		}
+		thumbEnd = thumbStart + thumbSize
+		if thumbEnd > h {
+			thumbEnd = h
+		}
+	}
+
 	var b strings.Builder
-	for i, r := range tw.rows {
+	for i := startRow; i < endRow; i++ {
+		r := tw.rows[i]
 		if r.Node == nil {
 			continue
+		}
+
+		lineIdx := i - startRow
+		var scrollChar string
+		if hasScrollbar {
+			if lineIdx >= thumbStart && lineIdx < thumbEnd {
+				scrollChar = lipgloss.NewStyle().Foreground(lipgloss.Color("#94A3B8")).Render("█")
+			} else {
+				scrollChar = lipgloss.NewStyle().Foreground(lipgloss.Color("#475569")).Render("│")
+			}
 		}
 
 		indent := strings.Repeat("  ", r.Depth)
 		indentWidth := r.Depth * 2
 		glyphWidth := 2
 		prefixWidth := indentWidth + glyphWidth
-		avail := width - prefixWidth
+		avail := contentWidth - prefixWidth
 
 		label := r.Node.Label
 		if avail <= 0 {
@@ -660,19 +802,22 @@ func (tw *TreeWidget) View(width int) string {
 			renderedIndent := selectedStyle.Render(indent)
 			content := renderedIndent + glyph + renderedLabel
 
-			contentWidth := ansi.StringWidth(content)
-			if contentWidth < width {
-				content += selectedStyle.Render(strings.Repeat(" ", width-contentWidth))
-			} else if contentWidth > width {
-				content = ansi.Truncate(content, width, "")
+			contentW := ansi.StringWidth(content)
+			if contentW < contentWidth {
+				content += selectedStyle.Render(strings.Repeat(" ", contentWidth-contentW))
+			} else if contentW > contentWidth {
+				content = ansi.Truncate(content, contentWidth, "")
 			}
-			b.WriteString(content)
+			b.WriteString(content + scrollChar)
 		} else {
 			line := normalStyle.Render(indent) + glyph + renderedLabel
-			if ansi.StringWidth(line) > width {
-				line = ansi.Truncate(line, width, "")
+			lineW := ansi.StringWidth(line)
+			if lineW < contentWidth {
+				line += strings.Repeat(" ", contentWidth-lineW)
+			} else if lineW > contentWidth {
+				line = ansi.Truncate(line, contentWidth, "")
 			}
-			b.WriteString(line)
+			b.WriteString(line + scrollChar)
 		}
 		b.WriteString("\n")
 	}
