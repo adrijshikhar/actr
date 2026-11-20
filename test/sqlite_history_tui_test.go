@@ -331,6 +331,10 @@ func TestSQLiteHistory_TUI_EndToEndIntegration(t *testing.T) {
 	require.Len(t, cxHistRepo.Children, 1)
 	assert.Equal(t, jobIDCxHist, cxHistRepo.Children[0].ID)
 
+	histBranch.Expanded = true
+	aimHistRepo.Expanded = true
+	m.Tree().Rebuild()
+
 	// -------------------------------------------------------------------------
 	// 6. Test Tree Search Filtering
 	// -------------------------------------------------------------------------

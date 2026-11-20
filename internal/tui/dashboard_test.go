@@ -2566,3 +2566,92 @@ func TestDashboard_SidebarHeightStabilityAndPreciseClickInteraction(t *testing.T
 	m = res.(*DashboardModel)
 	assert.Equal(t, "npm install\nnpm test", mockClip.copied, "clipboard must receive pure log lines without gutter numbers")
 }
+
+func TestDashboard_MouseEscapeArtifactFiltering(t *testing.T) {
+	// 1. Direct unit tests on isMouseEscapeArtifact
+	assert.True(t, isMouseEscapeArtifact(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'[', '<', '6', '5', ';', '8', '2', ';', '6', '3', 'M'}}))
+	assert.True(t, isMouseEscapeArtifact(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3', 'M'}}))
+	assert.True(t, isMouseEscapeArtifact(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'<', '6', '5', ';', '8', '2', ';', '6', '3', 'M'}}))
+	assert.False(t, isMouseEscapeArtifact(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}}))
+	assert.False(t, isMouseEscapeArtifact(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b', 'u', 'i', 'l', 'd'}}))
+	assert.False(t, isMouseEscapeArtifact(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'M'}}))
+
+	// 2. Integration test in dashboard during log search
+	m := NewDashboardModel("/tmp/test.sock")
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m.stepLogs["root"] = []string{"test output line"}
+	m.updateActiveStepLogs()
+
+	// Open log search via ctrl+f
+	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlF})
+	m = res.(*DashboardModel)
+	assert.True(t, m.IsLogSearching())
+
+	// Type valid query
+	for _, ch := range "test" {
+		res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		m = res.(*DashboardModel)
+	}
+	assert.Equal(t, "test", m.logSearchInput.Value())
+
+	// Simulate fragmented SGR mouse sequence arriving as KeyMsg
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'[', '<', '6', '5', ';', '8', '2', ';', '6', '3', 'M'}})
+	m = res.(*DashboardModel)
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3', 'M'}})
+	m = res.(*DashboardModel)
+
+	// Search value MUST remain "test" without escape artifacts
+	assert.Equal(t, "test", m.logSearchInput.Value(), "mouse escape sequences must not contaminate search query")
+}
+
+func TestDashboard_DedicatedSearchKeyAndTabFocus(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	// Initial focus is tree
+	assert.Equal(t, FocusTree, m.Focus())
+	assert.False(t, m.IsTreeSearching())
+
+	// Switch focus to viewport via Tab
+	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = res.(*DashboardModel)
+	assert.Equal(t, FocusViewport, m.Focus())
+
+	// While focused on Viewport, pressing 's' directly activates tree search
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = res.(*DashboardModel)
+	assert.True(t, m.IsTreeSearching(), "pressing 's' must open tree search directly")
+	assert.Equal(t, FocusTree, m.Focus(), "pressing 's' must switch focus to tree")
+
+	// Press Esc to dismiss tree search
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = res.(*DashboardModel)
+	assert.False(t, m.IsTreeSearching())
+
+	// Press Tab to switch back to Viewport
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = res.(*DashboardModel)
+	assert.Equal(t, FocusViewport, m.Focus())
+
+	// Press 'ctrl+f' to activate log search
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlF})
+	m = res.(*DashboardModel)
+	assert.True(t, m.IsLogSearching(), "pressing 'ctrl+f' must open log search directly")
+}
+
+func TestDashboard_MouseToggleShortcut(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	assert.False(t, m.MouseEnabled(), "mouse should be disabled by default for native terminal text selection")
+
+	// Press 'm' to enable mouse tracking
+	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	m = res.(*DashboardModel)
+	assert.True(t, m.MouseEnabled())
+	assert.Contains(t, m.toastMsg, "Mouse tracking enabled")
+
+	// Press 'm' again to disable mouse tracking
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	m = res.(*DashboardModel)
+	assert.False(t, m.MouseEnabled())
+	assert.Contains(t, m.toastMsg, "Mouse tracking disabled")
+}

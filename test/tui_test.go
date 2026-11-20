@@ -161,6 +161,10 @@ func TestTUI_AsyncHistoricalLogLoading(t *testing.T) {
 	histBranch := m.Tree().Root.Children[1]
 	require.Equal(t, "historical-runs", histBranch.ID)
 	require.NotEmpty(t, histBranch.Children)
+	histBranch.Expanded = true
+	for _, ch := range histBranch.Children {
+		ch.Expanded = true
+	}
 	jobNode := m.Tree().FindNode("job-past-1")
 	require.NotNil(t, jobNode, "job-past-1 must exist in tree")
 	jobNode.Expanded = true
@@ -373,6 +377,14 @@ func TestTUI_SnapshotPropagatesLogLoadingCommand(t *testing.T) {
 	require.True(t, ok)
 
 	// Expand historical node and select the step node
+	histBranch := dm.Tree().FindNode("historical-runs")
+	if histBranch != nil {
+		histBranch.Expanded = true
+		for _, ch := range histBranch.Children {
+			ch.Expanded = true
+		}
+		dm.Tree().Rebuild()
+	}
 	require.True(t, dm.Tree().SelectFirst(func(n *tui.TreeNode) bool {
 		if n.ID == jobID {
 			n.Expanded = true

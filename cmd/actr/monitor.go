@@ -30,6 +30,7 @@ func newMonitorCmd() *cobra.Command {
 		configDirFlag string
 		runsDirFlag   string
 		demoFlag      bool
+		mouseFlag     bool
 	)
 
 	cmd := &cobra.Command{
@@ -143,7 +144,12 @@ func newMonitorCmd() *cobra.Command {
 			}
 
 			model.AutoFocusRunningStep()
-			if err := runProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion()); err != nil {
+			opts := []tea.ProgramOption{tea.WithAltScreen()}
+			if mouseFlag {
+				model.SetMouseEnabled(true)
+				opts = append(opts, tea.WithMouseCellMotion())
+			}
+			if err := runProgram(model, opts...); err != nil {
 				return fmt.Errorf("dashboard execution: %w", err)
 			}
 			return nil
@@ -154,6 +160,7 @@ func newMonitorCmd() *cobra.Command {
 	cmd.Flags().StringVar(&configDirFlag, "config-dir", config.DefaultConfigDir(), "path to directory containing runner configuration and daemon socket")
 	cmd.Flags().StringVar(&runsDirFlag, "runs-dir", "", "path to runs history directory or database file (defaults to <config-dir>/history.db)")
 	cmd.Flags().BoolVar(&demoFlag, "demo", false, "launch monitor with simulated live workflow execution and telemetry")
+	cmd.Flags().BoolVar(&mouseFlag, "mouse", false, "enable mouse tracking mode (note: in most terminals, this disables native text selection)")
 	_ = cmd.MarkFlagFilename("sock")
 	_ = cmd.MarkFlagDirname("config-dir")
 	_ = cmd.MarkFlagDirname("runs-dir")

@@ -126,6 +126,7 @@ type DashboardModel struct {
 	clipboard        Clipboard
 	supervisorStatus *monitor.SupervisorStatus
 	isOffline        bool
+	mouseEnabled     bool
 
 	events <-chan monitor.Event
 	errs   <-chan error
@@ -214,6 +215,21 @@ func (m *DashboardModel) Focus() FocusPanel {
 func (m *DashboardModel) SetFocus(f FocusPanel) {
 	if m != nil {
 		m.focus = f
+	}
+}
+
+// MouseEnabled returns whether mouse tracking mode is currently enabled.
+func (m *DashboardModel) MouseEnabled() bool {
+	if m == nil {
+		return false
+	}
+	return m.mouseEnabled
+}
+
+// SetMouseEnabled sets whether mouse tracking mode is enabled.
+func (m *DashboardModel) SetMouseEnabled(enabled bool) {
+	if m != nil {
+		m.mouseEnabled = enabled
 	}
 }
 
@@ -604,6 +620,34 @@ func fetchHistoricalLogsCmd(client *monitor.Client, runID, stepID string) tea.Cm
 	}
 }
 
+// isMouseEscapeArtifact detects fragmented SGR 1006 mouse tracking sequences
+// that leak as tea.KeyMsg runes when scrolling fast or when escape sequences split.
+func isMouseEscapeArtifact(msg tea.KeyMsg) bool {
+	s := msg.String()
+	if strings.Contains(s, "[<") {
+		return true
+	}
+	if strings.HasPrefix(s, "<") && strings.Contains(s, ";") {
+		return true
+	}
+	if strings.Contains(string(msg.Runes), "[<") {
+		return true
+	}
+	if len(s) >= 2 && (s[len(s)-1] == 'M' || s[len(s)-1] == 'm') {
+		allDigitsOrSemi := true
+		for _, ch := range s[:len(s)-1] {
+			if (ch < '0' || ch > '9') && ch != ';' && ch != '<' && ch != '[' {
+				allDigitsOrSemi = false
+				break
+			}
+		}
+		if allDigitsOrSemi {
+			return true
+		}
+	}
+	return false
+}
+
 // Update handles Bubbletea messages including window resize, keyboard navigation,
 // zoom toggle, snapshots, and streaming IPC events.
 func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -615,6 +659,9 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ready = true
 
 	case tea.KeyMsg:
+		if isMouseEscapeArtifact(msg) {
+			return m, nil
+		}
 		if m.treeSearching {
 			switch msg.Type {
 			case tea.KeyEsc:
@@ -714,6 +761,22 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, cmd
 			}
 			return m, nil
+		case "s", "S":
+			if !m.isZoomed {
+				m.treeSearching = true
+				m.focus = FocusTree
+				cmd := m.treeSearchInput.Focus()
+				return m, cmd
+			}
+		case "m", "M":
+			m.mouseEnabled = !m.mouseEnabled
+			var cmd tea.Cmd
+			if m.mouseEnabled {
+				cmd = tea.Batch(tea.EnableMouseCellMotion, m.setToast("✓ Mouse tracking enabled"))
+			} else {
+				cmd = tea.Batch(tea.DisableMouse, m.setToast("○ Mouse tracking disabled (native text select enabled)"))
+			}
+			return m, cmd
 		case "tab":
 			if m.focus == FocusTree {
 				m.focus = FocusViewport
@@ -941,6 +1004,7 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.refreshHighlightedLogs()
 				return m, nil
 			}
+			return m, nil
 		}
 
 		// Press event (left click)
@@ -2631,14 +2695,15 @@ func (m *DashboardModel) View() string {
 	m.telemetry.SetOffline(m.isOffline)
 	m.syncHistoricalHUD()
 
-	borderStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#475569"))
+	activeBorder := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#38BDF8"))
+	inactiveBorder := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#334155"))
 
 	var content string
 	if m.isZoomed {
 		_, zoomWidth, targetOuterHeight, zoomHeight := m.calcDimensions()
 		_ = targetOuterHeight
 		logContent := m.renderLogViewport(zoomWidth, zoomHeight)
-		content = borderStyle.Width(zoomWidth).Height(zoomHeight).Render(logContent)
+		content = activeBorder.Width(zoomWidth).Height(zoomHeight).Render(logContent)
 	} else {
 		treeWidth, rightWidth, targetOuterHeight, logInnerHeight := m.calcDimensions()
 		_ = logInnerHeight
@@ -2674,7 +2739,15 @@ func (m *DashboardModel) View() string {
 			treeContent = m.tree.View(treeWidth)
 		}
 
-		treeBox := borderStyle.Width(treeWidth).Height(treeInnerHeight).Render(treeContent)
+		treeStyle := inactiveBorder
+		logStyle := inactiveBorder
+		if m.focus == FocusTree {
+			treeStyle = activeBorder
+		} else {
+			logStyle = activeBorder
+		}
+
+		treeBox := treeStyle.Width(treeWidth).Height(treeInnerHeight).Render(treeContent)
 
 		telemWidth := rightWidth
 		var telemContent string
@@ -2683,7 +2756,7 @@ func (m *DashboardModel) View() string {
 		} else {
 			telemContent = m.telemetry.View(telemWidth)
 		}
-		telemBox := borderStyle.Width(rightWidth).Render(telemContent)
+		telemBox := inactiveBorder.Width(rightWidth).Render(telemContent)
 		telemOuterHeight := lipgloss.Height(telemBox)
 
 		logOuterHeight := targetOuterHeight - telemOuterHeight
@@ -2692,7 +2765,7 @@ func (m *DashboardModel) View() string {
 			actualLogInnerHeight = 1
 		}
 		logContent := m.renderLogViewport(rightWidth, actualLogInnerHeight)
-		logBox := borderStyle.Width(rightWidth).Height(actualLogInnerHeight).Render(logContent)
+		logBox := logStyle.Width(rightWidth).Height(actualLogInnerHeight).Render(logContent)
 		rightPane := lipgloss.JoinVertical(lipgloss.Left, telemBox, logBox)
 		content = lipgloss.JoinHorizontal(lipgloss.Top, treeBox, rightPane)
 	}
@@ -2708,18 +2781,18 @@ func leftNavText(width int, err error, autoFollow bool) string {
 	}
 	var nav string
 	switch {
-	case width >= 150 && err == nil:
-		nav = fmt.Sprintf(" ↑/k up • ↓/j down • Enter toggle • / filter • ctrl+f search • c copy • z zoom • %s • q quit", followStr)
-	case width >= 130 && err == nil:
-		nav = fmt.Sprintf(" ↑/k up • ↓/j down • Enter toggle • / filter • ctrl+f find • c copy • z zoom • %s • q quit", followStr)
-	case width >= 95 && err == nil:
-		nav = fmt.Sprintf(" ↑/k up • ↓/j down • Enter toggle • z zoom • %s • q quit", followStr)
+	case width >= 140 && err == nil:
+		nav = fmt.Sprintf(" ↑/k up • ↓/j down • Enter toggle • s search tree • ctrl+f find logs • Tab switch • c copy • z zoom • %s • q quit", followStr)
+	case width >= 100 && err == nil:
+		nav = fmt.Sprintf(" ↑/k up • ↓/j down • s search • z zoom • %s • q quit", followStr)
+	case width >= 70 && err == nil:
+		nav = fmt.Sprintf(" ↑/k up • ↓/j down • s search • %s • q quit", followStr)
 	case width >= 50 && err == nil:
-		nav = " ↑/k up • ↓/j down • Enter toggle • / find • q quit"
+		nav = " ↑/k up • ↓/j down • s search • q quit"
 	case err != nil:
 		nav = "↑/k up • ↓/j down • Enter toggle • q quit"
 	default:
-		nav = " ↑/↓ nav • Enter toggle • q quit"
+		nav = " ↑/k up • ↓/j down • q quit"
 	}
 	if err != nil {
 		return fmt.Sprintf(" Error: %v • %s", err, nav)
