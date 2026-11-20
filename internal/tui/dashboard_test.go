@@ -2358,8 +2358,10 @@ func TestDashboard_SidebarScrollingWithManyHistoricalRuns(t *testing.T) {
 	assert.NotEmpty(t, v)
 	assert.Greater(t, m.tree.Height, 0)
 	assert.Equal(t, 0, m.tree.Offset)
-	assert.Contains(t, v, "█", "scrollbar thumb should be visible with > 50 rows")
-	assert.Contains(t, v, "│", "scrollbar track should be visible")
+	treeW := m.calcTreeWidth()
+	treeV := m.tree.View(treeW)
+	assert.NotContains(t, treeV, "█", "tree view should not render scrollbar block")
+	assert.NotContains(t, treeV, "│", "tree view should not render scrollbar track")
 
 	// Navigate down 30 rows
 	m.focus = FocusTree
@@ -2373,8 +2375,9 @@ func TestDashboard_SidebarScrollingWithManyHistoricalRuns(t *testing.T) {
 	assert.LessOrEqual(t, m.tree.Offset, m.tree.Cursor)
 	assert.Greater(t, m.tree.Offset+m.tree.Height, m.tree.Cursor)
 
-	vScrolled := m.View()
-	assert.Contains(t, vScrolled, "█")
+	treeVScrolled := m.tree.View(treeW)
+	assert.NotContains(t, treeVScrolled, "█")
+	assert.NotContains(t, treeVScrolled, "│")
 
 	// Test PageDown key
 	prevOffset := m.tree.Offset
@@ -2498,26 +2501,42 @@ func TestDashboard_SidebarHeightStabilityAndPreciseClickInteraction(t *testing.T
 	m = res.(*DashboardModel)
 	assert.False(t, defaultRepoNode.Expanded, "clicking on already-selected container node should toggle expansion")
 
-	// 5. Test clicking on scrollbar column
+	// 5. Verify no scrollbar characters in sidebar view even when rows exceed height
 	defaultRepoNode.Expanded = true
 	m.tree.Rebuild()
 	m.tree.SetHeight(10)
-	m.tree.Offset = 5
-	hasScroll, thumbStart, _ := m.tree.ScrollbarInfo()
-	require.True(t, hasScroll)
-
 	treeWidth := m.calcTreeWidth()
-	// Click above thumb on scrollbar
-	clickY := thumbStart - 1
-	if clickY < 0 {
-		clickY = 0
+	treeView := m.tree.View(treeWidth)
+	assert.NotContains(t, treeView, "█", "tree view should not render scrollbar block")
+	assert.NotContains(t, treeView, "│", "tree view should not render scrollbar track")
+
+	// 6. Verify CircleCI-style log line numbers gutter and pure text copy
+	jobNode := m.tree.FindNode("hist-job-01")
+	require.NotNil(t, jobNode)
+	stepNode := &TreeNode{
+		ID:       "step-1",
+		Label:    "Setup Node",
+		NodeType: NodeStep,
+		Status:   monitor.StatusSuccess,
 	}
-	res, _ = m.Update(tea.MouseMsg{
-		X:      treeWidth, // On scrollbar column
-		Y:      clickY + 1,
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonLeft,
-	})
+	jobNode.AddChild(stepNode)
+	jobNode.Expanded = true
+	m.tree.Rebuild()
+	m.tree.SelectNode(stepNode)
+	m.stepLogs["hist-job-01/step-1"] = []string{
+		"npm install",
+		"npm test",
+	}
+	_ = m.updateActiveStepLogs()
+
+	vpOutput := m.viewport.View()
+	assert.Contains(t, vpOutput, "  1 │ npm install")
+	assert.Contains(t, vpOutput, "  2 │ npm test")
+
+	// Verify copying via 'c' key copies pure logs without line numbers or gutter
+	mockClip := &mockClipboard{}
+	m.SetClipboard(mockClip)
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
 	m = res.(*DashboardModel)
-	assert.Less(t, m.tree.Offset, 5, "clicking above thumb on scrollbar should scroll up")
+	assert.Equal(t, "npm install\nnpm test", mockClip.copied, "clipboard must receive pure log lines without gutter numbers")
 }

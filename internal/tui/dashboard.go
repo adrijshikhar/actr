@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -131,10 +132,13 @@ type DashboardModel struct {
 }
 
 var (
-	normalMatchStyle = lipgloss.NewStyle().Background(lipgloss.Color("226")).Foreground(lipgloss.Color("0"))
-	activeMatchStyle = lipgloss.NewStyle().Background(lipgloss.Color("208")).Foreground(lipgloss.Color("0")).Bold(true)
-	selectedLogStyle = lipgloss.NewStyle().Background(lipgloss.Color("#2563EB")).Foreground(lipgloss.Color("#FFFFFF"))
-	toastStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#22C55E")).Bold(true)
+	normalMatchStyle     = lipgloss.NewStyle().Background(lipgloss.Color("226")).Foreground(lipgloss.Color("0"))
+	activeMatchStyle     = lipgloss.NewStyle().Background(lipgloss.Color("208")).Foreground(lipgloss.Color("0")).Bold(true)
+	selectedLogStyle     = lipgloss.NewStyle().Background(lipgloss.Color("#2563EB")).Foreground(lipgloss.Color("#FFFFFF"))
+	toastStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("#22C55E")).Bold(true)
+	logGutterStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#475569"))
+	logGutterActiveStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#38BDF8")).Bold(true)
+	logGutterSep         = lipgloss.NewStyle().Foreground(lipgloss.Color("#334155")).Render("│ ")
 )
 
 // NewDashboardModel creates a new DashboardModel configured to connect to the given socket.
@@ -953,18 +957,6 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 
-				// Check for scrollbar click on the right edge of sidebar
-				treeWidth := m.calcTreeWidth()
-				hasScrollbar, thumbStart, thumbEnd := m.tree.ScrollbarInfo()
-				if hasScrollbar && msg.X == treeWidth {
-					visualY := msg.Y - treeTopOffset
-					if visualY < thumbStart {
-						m.tree.ScrollUp(m.tree.Height)
-					} else if visualY >= thumbEnd {
-						m.tree.ScrollDown(m.tree.Height)
-					}
-					return m, m.updateActiveStepLogs()
-				}
 
 				if msg.Y >= treeTopOffset && (m.tree.Height <= 0 || msg.Y < treeTopOffset+m.tree.Height) {
 					row := m.tree.Offset + msg.Y - treeTopOffset
@@ -2646,12 +2638,16 @@ func (m *DashboardModel) View() string {
 func leftNavText(width int, err error) string {
 	var nav string
 	switch {
+	case width >= 150 && err == nil:
+		nav = " ↑/k up • ↓/j down • Enter toggle • / filter • ctrl+f search • c copy • z zoom • f follow • q quit"
+	case width >= 135 && err == nil:
+		nav = " ↑/k up • ↓/j down • Enter toggle • / filter • ctrl+f find • c copy • z zoom • q quit"
 	case width >= 125 && err == nil:
 		nav = " ↑/k up • ↓/j down • Enter/Space toggle • z zoom • f follow • q quit"
 	case width >= 100 && err == nil:
-		nav = " ↑/k up • ↓/j down • Enter toggle • z zoom • f follow • q quit"
+		nav = " ↑/k up • ↓/j down • Enter toggle • / find • z zoom • q quit"
 	case width >= 50 && err == nil:
-		nav = " ↑/k up • ↓/j down • Enter toggle • q quit"
+		nav = " ↑/k up • ↓/j down • Enter toggle • / find • q quit"
 	case err != nil:
 		nav = "↑/k up • ↓/j down • Enter toggle • q quit"
 	default:
@@ -2938,6 +2934,18 @@ func highlightLine(line, query string, style lipgloss.Style) string {
 	return sb.String()
 }
 
+func (m *DashboardModel) formatLogGutter(lineIdx, totalLines int, isActive bool) string {
+	digits := len(strconv.Itoa(totalLines))
+	if digits < 3 {
+		digits = 3
+	}
+	numStr := fmt.Sprintf("%*d ", digits, lineIdx+1)
+	if isActive {
+		return logGutterActiveStyle.Render(numStr) + logGutterSep
+	}
+	return logGutterStyle.Render(numStr) + logGutterSep
+}
+
 func (m *DashboardModel) renderHighlightedLines(lines []string) string {
 	minLine, maxLine := -1, -1
 	if m.isSelecting {
@@ -2953,23 +2961,30 @@ func (m *DashboardModel) renderHighlightedLines(lines []string) string {
 		activeLine = m.searchMatches[m.currentMatchIdx]
 	}
 
-	renderedLines := make([]string, len(lines))
+	totalLines := len(lines)
+	renderedLines := make([]string, totalLines)
 	for i, line := range lines {
+		gutter := m.formatLogGutter(i, totalLines, activeLine == i)
+		gutterWidth := ansi.StringWidth(gutter)
+
+		var content string
 		if minLine != -1 && i >= minLine && i <= maxLine {
 			stripped := ansi.Strip(line)
-			if m.viewport.Width > 0 && ansi.StringWidth(stripped) < m.viewport.Width {
-				stripped += strings.Repeat(" ", m.viewport.Width-ansi.StringWidth(stripped))
+			availWidth := m.viewport.Width - gutterWidth
+			if availWidth > 0 && ansi.StringWidth(stripped) < availWidth {
+				stripped += strings.Repeat(" ", availWidth-ansi.StringWidth(stripped))
 			}
-			renderedLines[i] = selectedLogStyle.Render(stripped)
+			content = selectedLogStyle.Render(stripped)
 		} else if m.searchQuery != "" {
 			if activeLine == i {
-				renderedLines[i] = highlightLine(line, m.searchQuery, activeMatchStyle)
+				content = highlightLine(line, m.searchQuery, activeMatchStyle)
 			} else {
-				renderedLines[i] = highlightLine(line, m.searchQuery, normalMatchStyle)
+				content = highlightLine(line, m.searchQuery, normalMatchStyle)
 			}
 		} else {
-			renderedLines[i] = line
+			content = line
 		}
+		renderedLines[i] = gutter + content
 	}
 	return strings.Join(renderedLines, "\n")
 }
@@ -2978,15 +2993,11 @@ func (m *DashboardModel) renderAndSetLogs(lines []string) {
 	if len(lines) == 0 {
 		return
 	}
-	if m.searchQuery != "" || m.isSelecting {
-		if m.searchQuery != "" {
-			m.updateSearchMatches(lines)
-		}
-		rendered := m.renderHighlightedLines(lines)
-		m.viewport.SetContent(rendered)
-	} else {
-		m.viewport.SetContent(strings.Join(lines, "\n"))
+	if m.searchQuery != "" {
+		m.updateSearchMatches(lines)
 	}
+	rendered := m.renderHighlightedLines(lines)
+	m.viewport.SetContent(rendered)
 }
 
 func (m *DashboardModel) refreshHighlightedLogs() {
@@ -2994,12 +3005,8 @@ func (m *DashboardModel) refreshHighlightedLogs() {
 	if len(lines) == 0 {
 		return
 	}
-	if m.searchQuery != "" || m.isSelecting {
-		rendered := m.renderHighlightedLines(lines)
-		m.viewport.SetContent(rendered)
-	} else {
-		m.viewport.SetContent(strings.Join(lines, "\n"))
-	}
+	rendered := m.renderHighlightedLines(lines)
+	m.viewport.SetContent(rendered)
 }
 
 func (m *DashboardModel) scrollToMatch(lineIdx int) {

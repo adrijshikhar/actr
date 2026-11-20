@@ -706,9 +706,7 @@ func (tw *TreeWidget) View(width int) string {
 
 	startRow := 0
 	endRow := len(tw.rows)
-	hasScrollbar, thumbStart, thumbEnd := tw.ScrollbarInfo()
-
-	if hasScrollbar {
+	if tw.Height > 0 && len(tw.rows) > tw.Height {
 		startRow = tw.Offset
 		endRow = tw.Offset + tw.Height
 		if endRow > len(tw.rows) {
@@ -717,25 +715,11 @@ func (tw *TreeWidget) View(width int) string {
 	}
 
 	contentWidth := width
-	if hasScrollbar && contentWidth > 1 {
-		contentWidth = width - 1
-	}
-
 	lines := make([]string, 0, endRow-startRow)
 	for i := startRow; i < endRow; i++ {
 		r := tw.rows[i]
 		if r.Node == nil {
 			continue
-		}
-
-		lineIdx := i - startRow
-		var scrollChar string
-		if hasScrollbar {
-			if lineIdx >= thumbStart && lineIdx < thumbEnd {
-				scrollChar = lipgloss.NewStyle().Foreground(lipgloss.Color("#94A3B8")).Render("█")
-			} else {
-				scrollChar = lipgloss.NewStyle().Foreground(lipgloss.Color("#475569")).Render("│")
-			}
 		}
 
 		indent := strings.Repeat("  ", r.Depth)
@@ -812,7 +796,7 @@ func (tw *TreeWidget) View(width int) string {
 			} else if contentW > contentWidth {
 				content = ansi.Truncate(content, contentWidth, "")
 			}
-			lineStr = content + scrollChar
+			lineStr = content
 		} else {
 			line := normalStyle.Render(indent) + glyph + renderedLabel
 			lineW := ansi.StringWidth(line)
@@ -821,7 +805,7 @@ func (tw *TreeWidget) View(width int) string {
 			} else if lineW > contentWidth {
 				line = ansi.Truncate(line, contentWidth, "")
 			}
-			lineStr = line + scrollChar
+			lineStr = line
 		}
 		lines = append(lines, lineStr)
 	}
