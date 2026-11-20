@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -125,16 +126,20 @@ type DashboardModel struct {
 	clipboard        Clipboard
 	supervisorStatus *monitor.SupervisorStatus
 	isOffline        bool
+	mouseEnabled     bool
 
 	events <-chan monitor.Event
 	errs   <-chan error
 }
 
 var (
-	normalMatchStyle = lipgloss.NewStyle().Background(lipgloss.Color("226")).Foreground(lipgloss.Color("0"))
-	activeMatchStyle = lipgloss.NewStyle().Background(lipgloss.Color("208")).Foreground(lipgloss.Color("0")).Bold(true)
-	selectedLogStyle = lipgloss.NewStyle().Background(lipgloss.Color("#2563EB")).Foreground(lipgloss.Color("#FFFFFF"))
-	toastStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#22C55E")).Bold(true)
+	normalMatchStyle     = lipgloss.NewStyle().Background(lipgloss.Color("226")).Foreground(lipgloss.Color("0"))
+	activeMatchStyle     = lipgloss.NewStyle().Background(lipgloss.Color("208")).Foreground(lipgloss.Color("0")).Bold(true)
+	selectedLogStyle     = lipgloss.NewStyle().Background(lipgloss.Color("#2563EB")).Foreground(lipgloss.Color("#FFFFFF"))
+	toastStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("#22C55E")).Bold(true)
+	logGutterStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#475569"))
+	logGutterActiveStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#38BDF8")).Bold(true)
+	logGutterSep         = lipgloss.NewStyle().Foreground(lipgloss.Color("#334155")).Render("│ ")
 )
 
 // NewDashboardModel creates a new DashboardModel configured to connect to the given socket.
@@ -154,7 +159,7 @@ func NewDashboardModel(sockPath string) *DashboardModel {
 	histNode := &TreeNode{
 		ID:       "historical-runs",
 		Label:    "HISTORICAL RUNS (0 past runs)",
-		Expanded: true,
+		Expanded: false,
 		NodeType: NodeBranch,
 	}
 	root.AddChild(liveNode)
@@ -210,6 +215,21 @@ func (m *DashboardModel) Focus() FocusPanel {
 func (m *DashboardModel) SetFocus(f FocusPanel) {
 	if m != nil {
 		m.focus = f
+	}
+}
+
+// MouseEnabled returns whether mouse tracking mode is currently enabled.
+func (m *DashboardModel) MouseEnabled() bool {
+	if m == nil {
+		return false
+	}
+	return m.mouseEnabled
+}
+
+// SetMouseEnabled sets whether mouse tracking mode is enabled.
+func (m *DashboardModel) SetMouseEnabled(enabled bool) {
+	if m != nil {
+		m.mouseEnabled = enabled
 	}
 }
 
@@ -600,6 +620,34 @@ func fetchHistoricalLogsCmd(client *monitor.Client, runID, stepID string) tea.Cm
 	}
 }
 
+// isMouseEscapeArtifact detects fragmented SGR 1006 mouse tracking sequences
+// that leak as tea.KeyMsg runes when scrolling fast or when escape sequences split.
+func isMouseEscapeArtifact(msg tea.KeyMsg) bool {
+	s := msg.String()
+	if strings.Contains(s, "[<") {
+		return true
+	}
+	if strings.HasPrefix(s, "<") && strings.Contains(s, ";") {
+		return true
+	}
+	if strings.Contains(string(msg.Runes), "[<") {
+		return true
+	}
+	if len(s) >= 2 && (s[len(s)-1] == 'M' || s[len(s)-1] == 'm') {
+		allDigitsOrSemi := true
+		for _, ch := range s[:len(s)-1] {
+			if (ch < '0' || ch > '9') && ch != ';' && ch != '<' && ch != '[' {
+				allDigitsOrSemi = false
+				break
+			}
+		}
+		if allDigitsOrSemi {
+			return true
+		}
+	}
+	return false
+}
+
 // Update handles Bubbletea messages including window resize, keyboard navigation,
 // zoom toggle, snapshots, and streaming IPC events.
 func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -611,6 +659,9 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ready = true
 
 	case tea.KeyMsg:
+		if isMouseEscapeArtifact(msg) {
+			return m, nil
+		}
 		if m.treeSearching {
 			switch msg.Type {
 			case tea.KeyEsc:
@@ -710,6 +761,22 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, cmd
 			}
 			return m, nil
+		case "s", "S":
+			if !m.isZoomed {
+				m.treeSearching = true
+				m.focus = FocusTree
+				cmd := m.treeSearchInput.Focus()
+				return m, cmd
+			}
+		case "m", "M":
+			m.mouseEnabled = !m.mouseEnabled
+			var cmd tea.Cmd
+			if m.mouseEnabled {
+				cmd = tea.Batch(tea.EnableMouseCellMotion, m.setToast("✓ Mouse tracking enabled"))
+			} else {
+				cmd = tea.Batch(tea.DisableMouse, m.setToast("○ Mouse tracking disabled (native text select enabled)"))
+			}
+			return m, cmd
 		case "tab":
 			if m.focus == FocusTree {
 				m.focus = FocusViewport
@@ -768,20 +835,31 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.autoFollow = !m.autoFollow
 			if m.autoFollow {
 				m.viewport.GotoBottom()
+				m.setToast("✓ Auto-follow ON (following live logs)")
+			} else {
+				m.setToast("○ Auto-follow OFF (manual scrolling)")
 			}
 			return m, nil
 		case "k", "up":
-			m.focus = FocusTree
-			if !m.isZoomed {
-				m.tree.Up()
-				return m, m.updateActiveStepLogs()
+			if m.isZoomed || m.focus == FocusViewport {
+				m.autoFollow = false
+				m.viewport.LineUp(1)
+				return m, nil
 			}
+			m.focus = FocusTree
+			m.tree.Up()
+			return m, m.updateActiveStepLogs()
 		case "j", "down":
-			m.focus = FocusTree
-			if !m.isZoomed {
-				m.tree.Down()
-				return m, m.updateActiveStepLogs()
+			if m.isZoomed || m.focus == FocusViewport {
+				m.viewport.LineDown(1)
+				if m.viewport.AtBottom() {
+					m.autoFollow = true
+				}
+				return m, nil
 			}
+			m.focus = FocusTree
+			m.tree.Down()
+			return m, m.updateActiveStepLogs()
 		case "enter", " ":
 			m.focus = FocusTree
 			if !m.isZoomed {
@@ -816,12 +894,16 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			var cmd tea.Cmd
 			m.viewport, cmd = m.viewport.Update(msg)
+			if m.viewport.AtBottom() {
+				m.autoFollow = true
+			}
 			return m, cmd
 		case "pgup", "pageup", "ctrl+u":
 			if !m.isZoomed && m.focus == FocusTree && m.tree != nil && m.tree.Height > 0 {
 				m.tree.ScrollUp(m.tree.Height)
 				return m, m.updateActiveStepLogs()
 			}
+			m.autoFollow = false
 			var cmd tea.Cmd
 			m.viewport, cmd = m.viewport.Update(msg)
 			return m, cmd
@@ -934,6 +1016,7 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.refreshHighlightedLogs()
 				return m, nil
 			}
+			return m, nil
 		}
 
 		// Press event (left click)
@@ -953,28 +1036,39 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 
+
 				if msg.Y >= treeTopOffset && (m.tree.Height <= 0 || msg.Y < treeTopOffset+m.tree.Height) {
 					row := m.tree.Offset + msg.Y - treeTopOffset
 					if row >= 0 && row < len(m.tree.Rows()) {
 						clickedNode := m.tree.NodeAtRow(row)
 
-						// Double click detection: same node within 350ms
+						// Double click detection: same node within 500ms
 						isDoubleClick := !m.lastTreeClickTime.IsZero() &&
-							time.Since(m.lastTreeClickTime) <= 350*time.Millisecond &&
+							time.Since(m.lastTreeClickTime) <= 500*time.Millisecond &&
 							clickedNode != nil && m.lastTreeClickNodeID == clickedNode.ID
 
-						// Chevron click detection: indent + glyph
+						// Chevron click detection: indent + glyph with generous hit target
 						isChevron := false
 						if clickedNode != nil && len(clickedNode.Children) > 0 {
 							chevronStart := 1 + clickedNode.Depth*2
-							chevronEnd := chevronStart + 2
+							chevronEnd := chevronStart + 3
 							if msg.X >= 1 && msg.X <= chevronEnd {
 								isChevron = true
 							}
 						}
 
+						// Toggle expansion on:
+						// 1. Double click anywhere on a container node
+						// 2. Direct click on the chevron / arrow prefix
+						// 3. Click on a container node that is already selected
+						// 4. Click on a top-level branch header (like HISTORICAL RUNS or LIVE RUNS)
+						wasAlreadySelected := (m.tree.Cursor == row)
+						isBranchHeader := clickedNode != nil && (clickedNode.NodeType == NodeBranch || clickedNode.ID == "historical-runs" || clickedNode.ID == "live-runs")
+						isContainer := clickedNode != nil && len(clickedNode.Children) > 0
+						shouldToggle := (isContainer && (isDoubleClick || isChevron || wasAlreadySelected)) || isBranchHeader
+
 						m.tree.SelectRow(row)
-						if isDoubleClick || isChevron {
+						if shouldToggle {
 							m.tree.ToggleExpandSelected()
 						}
 						if clickedNode != nil && clickedNode.NodeType == NodeRepo {
@@ -1267,8 +1361,10 @@ func (m *DashboardModel) applySnapshot(snap *monitor.Snapshot) tea.Cmd {
 	if snap == nil {
 		return nil
 	}
-	if snap.Telemetry != nil {
+	if snap.Telemetry != nil && len(snap.ActiveJobs) > 0 {
 		m.telemetry.Update(snap.Telemetry)
+	} else if len(snap.ActiveJobs) == 0 {
+		m.telemetry.Update(nil)
 	}
 	if snap.SupervisorStatus != nil {
 		m.supervisorStatus = snap.SupervisorStatus
@@ -1345,10 +1441,14 @@ func (m *DashboardModel) ensureBranches() (*TreeNode, *TreeNode) {
 	}
 	hist := m.getHistoricalBranch()
 	if hist == nil {
+		histExpanded := false
+		if exp, ok := m.seenRepoExpansion["historical-runs"]; ok {
+			histExpanded = exp
+		}
 		hist = &TreeNode{
 			ID:       "historical-runs",
 			Label:    "HISTORICAL RUNS (0 past runs)",
-			Expanded: true,
+			Expanded: histExpanded,
 			NodeType: NodeBranch,
 		}
 		m.tree.Root.AddChild(hist)
@@ -1582,13 +1682,32 @@ func (m *DashboardModel) resolveJobRepoAlias(repoAlias, repo string) string {
 		}
 		return repo
 	}
-	if m.supervisorStatus != nil && len(m.supervisorStatus.RepoSlots) == 1 {
-		return m.supervisorStatus.RepoSlots[0].Alias
+	if m.supervisorStatus != nil {
+		var busySlots []string
+		for _, s := range m.supervisorStatus.RepoSlots {
+			if s.ActiveJobs > 0 {
+				busySlots = append(busySlots, s.Alias)
+			}
+		}
+		if len(busySlots) == 1 {
+			return busySlots[0]
+		}
+		if len(m.supervisorStatus.RepoSlots) == 1 {
+			return m.supervisorStatus.RepoSlots[0].Alias
+		}
 	}
 	return "default"
 }
 
 func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
+	savedExpanded := make(map[string]bool)
+	if m.tree != nil && m.tree.Root != nil {
+		m.tree.Root.Walk(func(n *TreeNode) bool {
+			savedExpanded[n.ID] = n.Expanded
+			return true
+		})
+	}
+
 	label := formatRunnerRootLabel(snap.RunnerName)
 	root := &TreeNode{
 		ID:       "root",
@@ -1608,9 +1727,17 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 		liveNode.Label = fmt.Sprintf("LIVE RUNS (%d active)", len(snap.ActiveJobs))
 	}
 
+	histExpanded := false
+	if exp, ok := m.seenRepoExpansion["historical-runs"]; ok {
+		histExpanded = exp
+	} else if existingHist := m.getHistoricalBranch(); existingHist != nil && existingHist.Expanded {
+		histExpanded = true
+	} else {
+		histExpanded = m.isOffline
+	}
 	histNode := &TreeNode{
 		ID:       "historical-runs",
-		Expanded: true,
+		Expanded: histExpanded,
 		NodeType: NodeBranch,
 	}
 
@@ -1648,13 +1775,34 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 				}
 			}
 			if matchedAlias == "" {
-				matchedAlias = job.RepoAlias
-				if matchedAlias == "" {
-					matchedAlias = job.Repo
+				for _, s := range slots {
+					sLower := strings.ToLower(s.Alias)
+					if len(sLower) >= 3 && ((job.Workflow != "" && strings.Contains(strings.ToLower(job.Workflow), sLower)) ||
+						(job.Name != "" && strings.Contains(strings.ToLower(job.Name), sLower))) {
+						matchedAlias = s.Alias
+						break
+					}
 				}
-				if matchedAlias == "" {
-					matchedAlias = "default"
+			}
+			if matchedAlias == "" {
+				var busySlots []string
+				for _, s := range slots {
+					if s.ActiveJobs > 0 {
+						busySlots = append(busySlots, s.Alias)
+					}
 				}
+				if len(busySlots) == 1 {
+					matchedAlias = busySlots[0]
+				}
+			}
+			if matchedAlias == "" && len(slots) == 1 {
+				matchedAlias = slots[0].Alias
+			}
+			if matchedAlias == "" {
+				matchedAlias = m.resolveJobRepoAlias(job.RepoAlias, job.Repo)
+			}
+			if matchedAlias == "" {
+				matchedAlias = "default"
 			}
 			repoJobs[matchedAlias] = append(repoJobs[matchedAlias], job)
 		}
@@ -1926,9 +2074,13 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 
 	for _, alias := range histRepoAliases {
 		repoID := "hist-repo:" + alias
-		expanded := true
+		expanded := false
 		if exp, ok := m.seenRepoExpansion[repoID]; ok {
 			expanded = exp
+		} else if existingRepo := m.tree.FindNode(repoID); existingRepo != nil && existingRepo.Expanded {
+			expanded = true
+		} else {
+			expanded = m.isOffline
 		}
 		repoNode := &TreeNode{
 			ID:       repoID,
@@ -2282,7 +2434,7 @@ func (m *DashboardModel) handleJobFinish(jobID string, job *monitor.JobInfo) tea
 		}
 	}
 	if repoNode == nil {
-		expanded := true
+		expanded := false
 		if exp, ok := m.seenRepoExpansion[histRepoID]; ok {
 			expanded = exp
 		}
@@ -2305,6 +2457,11 @@ func (m *DashboardModel) handleJobFinish(jobID string, job *monitor.JobInfo) tea
 	if !alreadyInHist {
 		target.Parent = repoNode
 		repoNode.Children = append([]*TreeNode{target}, repoNode.Children...)
+	}
+
+	if selectedBefore != nil && (selectedBefore.ID == target.ID || (selectedBefore.FindParentJob() != nil && selectedBefore.FindParentJob().ID == target.ID)) {
+		hist.Expanded = true
+		repoNode.Expanded = true
 	}
 
 	m.updateBranchLabels()
@@ -2550,14 +2707,15 @@ func (m *DashboardModel) View() string {
 	m.telemetry.SetOffline(m.isOffline)
 	m.syncHistoricalHUD()
 
-	borderStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#475569"))
+	activeBorder := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#38BDF8"))
+	inactiveBorder := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#334155"))
 
 	var content string
 	if m.isZoomed {
 		_, zoomWidth, targetOuterHeight, zoomHeight := m.calcDimensions()
 		_ = targetOuterHeight
 		logContent := m.renderLogViewport(zoomWidth, zoomHeight)
-		content = borderStyle.Width(zoomWidth).Height(zoomHeight).Render(logContent)
+		content = activeBorder.Width(zoomWidth).Height(zoomHeight).Render(logContent)
 	} else {
 		treeWidth, rightWidth, targetOuterHeight, logInnerHeight := m.calcDimensions()
 		_ = logInnerHeight
@@ -2593,7 +2751,15 @@ func (m *DashboardModel) View() string {
 			treeContent = m.tree.View(treeWidth)
 		}
 
-		treeBox := borderStyle.Width(treeWidth).Height(treeInnerHeight).Render(treeContent)
+		treeStyle := inactiveBorder
+		logStyle := inactiveBorder
+		if m.focus == FocusTree {
+			treeStyle = activeBorder
+		} else {
+			logStyle = activeBorder
+		}
+
+		treeBox := treeStyle.Width(treeWidth).Height(treeInnerHeight).Render(treeContent)
 
 		telemWidth := rightWidth
 		var telemContent string
@@ -2602,7 +2768,7 @@ func (m *DashboardModel) View() string {
 		} else {
 			telemContent = m.telemetry.View(telemWidth)
 		}
-		telemBox := borderStyle.Width(rightWidth).Render(telemContent)
+		telemBox := inactiveBorder.Width(rightWidth).Render(telemContent)
 		telemOuterHeight := lipgloss.Height(telemBox)
 
 		logOuterHeight := targetOuterHeight - telemOuterHeight
@@ -2611,7 +2777,7 @@ func (m *DashboardModel) View() string {
 			actualLogInnerHeight = 1
 		}
 		logContent := m.renderLogViewport(rightWidth, actualLogInnerHeight)
-		logBox := borderStyle.Width(rightWidth).Height(actualLogInnerHeight).Render(logContent)
+		logBox := logStyle.Width(rightWidth).Height(actualLogInnerHeight).Render(logContent)
 		rightPane := lipgloss.JoinVertical(lipgloss.Left, telemBox, logBox)
 		content = lipgloss.JoinHorizontal(lipgloss.Top, treeBox, rightPane)
 	}
@@ -2620,19 +2786,25 @@ func (m *DashboardModel) View() string {
 	return lipgloss.JoinVertical(lipgloss.Left, content, footer)
 }
 
-func leftNavText(width int, err error) string {
+func leftNavText(width int, err error, autoFollow bool) string {
+	followStr := "f follow:ON"
+	if !autoFollow {
+		followStr = "f follow:OFF"
+	}
 	var nav string
 	switch {
-	case width >= 125 && err == nil:
-		nav = " ↑/k up • ↓/j down • Enter/Space toggle • z zoom • f follow • q quit"
+	case width >= 140 && err == nil:
+		nav = fmt.Sprintf(" ↑/k up • ↓/j down • Enter toggle • s search tree • ctrl+f find logs • Tab switch • c copy • z zoom • %s • q quit", followStr)
 	case width >= 100 && err == nil:
-		nav = " ↑/k up • ↓/j down • Enter toggle • z zoom • f follow • q quit"
+		nav = fmt.Sprintf(" ↑/k up • ↓/j down • s search • z zoom • %s • q quit", followStr)
+	case width >= 70 && err == nil:
+		nav = fmt.Sprintf(" ↑/k up • ↓/j down • s search • %s • q quit", followStr)
 	case width >= 50 && err == nil:
-		nav = " ↑/k up • ↓/j down • Enter toggle • q quit"
+		nav = " ↑/k up • ↓/j down • s search • q quit"
 	case err != nil:
 		nav = "↑/k up • ↓/j down • Enter toggle • q quit"
 	default:
-		nav = " ↑/↓ nav • Enter toggle • q quit"
+		nav = " ↑/k up • ↓/j down • q quit"
 	}
 	if err != nil {
 		return fmt.Sprintf(" Error: %v • %s", err, nav)
@@ -2650,7 +2822,7 @@ func (m *DashboardModel) renderFooter() string {
 	} else if m.logSearching {
 		leftStr = " Esc cancel • Enter navigate"
 	} else {
-		leftStr = leftNavText(m.width, m.lastErr)
+		leftStr = leftNavText(m.width, m.lastErr, m.autoFollow)
 	}
 
 	var left string
@@ -2915,6 +3087,18 @@ func highlightLine(line, query string, style lipgloss.Style) string {
 	return sb.String()
 }
 
+func (m *DashboardModel) formatLogGutter(lineIdx, totalLines int, isActive bool) string {
+	digits := len(strconv.Itoa(totalLines))
+	if digits < 3 {
+		digits = 3
+	}
+	numStr := fmt.Sprintf("%*d ", digits, lineIdx+1)
+	if isActive {
+		return logGutterActiveStyle.Render(numStr) + logGutterSep
+	}
+	return logGutterStyle.Render(numStr) + logGutterSep
+}
+
 func (m *DashboardModel) renderHighlightedLines(lines []string) string {
 	minLine, maxLine := -1, -1
 	if m.isSelecting {
@@ -2930,23 +3114,30 @@ func (m *DashboardModel) renderHighlightedLines(lines []string) string {
 		activeLine = m.searchMatches[m.currentMatchIdx]
 	}
 
-	renderedLines := make([]string, len(lines))
+	totalLines := len(lines)
+	renderedLines := make([]string, totalLines)
 	for i, line := range lines {
+		gutter := m.formatLogGutter(i, totalLines, activeLine == i)
+		gutterWidth := ansi.StringWidth(gutter)
+
+		var content string
 		if minLine != -1 && i >= minLine && i <= maxLine {
 			stripped := ansi.Strip(line)
-			if m.viewport.Width > 0 && ansi.StringWidth(stripped) < m.viewport.Width {
-				stripped += strings.Repeat(" ", m.viewport.Width-ansi.StringWidth(stripped))
+			availWidth := m.viewport.Width - gutterWidth
+			if availWidth > 0 && ansi.StringWidth(stripped) < availWidth {
+				stripped += strings.Repeat(" ", availWidth-ansi.StringWidth(stripped))
 			}
-			renderedLines[i] = selectedLogStyle.Render(stripped)
+			content = selectedLogStyle.Render(stripped)
 		} else if m.searchQuery != "" {
 			if activeLine == i {
-				renderedLines[i] = highlightLine(line, m.searchQuery, activeMatchStyle)
+				content = highlightLine(line, m.searchQuery, activeMatchStyle)
 			} else {
-				renderedLines[i] = highlightLine(line, m.searchQuery, normalMatchStyle)
+				content = highlightLine(line, m.searchQuery, normalMatchStyle)
 			}
 		} else {
-			renderedLines[i] = line
+			content = line
 		}
+		renderedLines[i] = gutter + content
 	}
 	return strings.Join(renderedLines, "\n")
 }
@@ -2955,15 +3146,11 @@ func (m *DashboardModel) renderAndSetLogs(lines []string) {
 	if len(lines) == 0 {
 		return
 	}
-	if m.searchQuery != "" || m.isSelecting {
-		if m.searchQuery != "" {
-			m.updateSearchMatches(lines)
-		}
-		rendered := m.renderHighlightedLines(lines)
-		m.viewport.SetContent(rendered)
-	} else {
-		m.viewport.SetContent(strings.Join(lines, "\n"))
+	if m.searchQuery != "" {
+		m.updateSearchMatches(lines)
 	}
+	rendered := m.renderHighlightedLines(lines)
+	m.viewport.SetContent(rendered)
 }
 
 func (m *DashboardModel) refreshHighlightedLogs() {
@@ -2971,12 +3158,8 @@ func (m *DashboardModel) refreshHighlightedLogs() {
 	if len(lines) == 0 {
 		return
 	}
-	if m.searchQuery != "" || m.isSelecting {
-		rendered := m.renderHighlightedLines(lines)
-		m.viewport.SetContent(rendered)
-	} else {
-		m.viewport.SetContent(strings.Join(lines, "\n"))
-	}
+	rendered := m.renderHighlightedLines(lines)
+	m.viewport.SetContent(rendered)
 }
 
 func (m *DashboardModel) scrollToMatch(lineIdx int) {

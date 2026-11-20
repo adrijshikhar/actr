@@ -55,6 +55,9 @@ func TestMonitorCmd_Setup(t *testing.T) {
 	if cmd.Flags().Lookup("demo") == nil {
 		t.Fatal("expected --demo flag")
 	}
+	if cmd.Flags().Lookup("mouse") == nil {
+		t.Fatal("expected --mouse flag")
+	}
 }
 
 func TestMonitorCmd_DemoFlag(t *testing.T) {

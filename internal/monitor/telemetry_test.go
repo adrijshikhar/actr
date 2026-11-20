@@ -143,7 +143,7 @@ func TestTelemetrySampler_RunnerMetricsFields(t *testing.T) {
 
 func TestSampleProcessGroup_CurrentProcess(t *testing.T) {
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
-		t.Skip("sampleProcessGroup ps -g is only supported on Unix")
+		t.Skip("sampleProcessGroup ps -eo is only supported on Unix")
 	}
 
 	rawPID := os.Getpid()

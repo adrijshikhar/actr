@@ -478,7 +478,7 @@ func TestServer_Publish_SlowSubscriberChannelClosed(t *testing.T) {
 	}
 
 	// Flood publish without reading to fill buffer (channel capacity is 100)
-	for i := 0; i < 150; i++ {
+	for i := 0; i < 500; i++ {
 		server.Publish(Event{Type: EventStepLog, StepID: "s1", LogLine: fmt.Sprintf("line %d", i)})
 	}
 

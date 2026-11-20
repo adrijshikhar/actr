@@ -16,7 +16,6 @@ import (
 	"github.com/shirou/gopsutil/v4/disk"
 	"github.com/shirou/gopsutil/v4/load"
 	"github.com/shirou/gopsutil/v4/mem"
-	"github.com/shirou/gopsutil/v4/net"
 	"github.com/shirou/gopsutil/v4/process"
 )
 
@@ -46,12 +45,6 @@ type TelemetrySampler struct {
 	containerCancel context.CancelFunc
 	cStatsMu        sync.RWMutex
 	containerStats  *containerMetrics
-
-	lastNetTime  time.Time
-	lastNetRx    uint64
-	lastNetTx    uint64
-	lastDiskTime time.Time
-	lastDiskWr   uint64
 }
 
 func NewTelemetrySampler() *TelemetrySampler {
@@ -315,50 +308,6 @@ func (s *TelemetrySampler) Sample() (sample *RunnerMetrics) {
 		}
 	}
 
-	// Disk Write Rate
-	func() {
-		defer func() { _ = recover() }()
-		if diskCounters, err := disk.IOCounters(); err == nil {
-			var totalWriteBytes uint64
-			for _, c := range diskCounters {
-				totalWriteBytes += c.WriteBytes
-			}
-			if !s.lastDiskTime.IsZero() && now.After(s.lastDiskTime) {
-				durationSec := now.Sub(s.lastDiskTime).Seconds()
-				if durationSec > 0 && totalWriteBytes >= s.lastDiskWr {
-					sample.DiskWriteRate = uint64(float64(totalWriteBytes-s.lastDiskWr) / durationSec)
-				}
-			}
-			s.lastDiskTime = now
-			s.lastDiskWr = totalWriteBytes
-		}
-	}()
-
-	// Network I/O Rate (host fallback when no container targeted)
-	if targetContainerID == "" {
-		func() {
-			defer func() { _ = recover() }()
-			if netCounters, err := net.IOCounters(false); err == nil && len(netCounters) > 0 {
-				rx := netCounters[0].BytesRecv
-				tx := netCounters[0].BytesSent
-				if !s.lastNetTime.IsZero() && now.After(s.lastNetTime) {
-					durationSec := now.Sub(s.lastNetTime).Seconds()
-					if durationSec > 0 {
-						if rx >= s.lastNetRx {
-							sample.NetRxRate = uint64(float64(rx-s.lastNetRx) / durationSec)
-						}
-						if tx >= s.lastNetTx {
-							sample.NetTxRate = uint64(float64(tx-s.lastNetTx) / durationSec)
-						}
-					}
-				}
-				s.lastNetTime = now
-				s.lastNetRx = rx
-				s.lastNetTx = tx
-			}
-		}()
-	}
-
 	return sample
 }
 
@@ -371,16 +320,7 @@ func sampleProcessGroup(pgid int32) (cpu float64, rss uint64, count int, err err
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 
-	var cmd *exec.Cmd
-	var pgidStr string
-	isLinux := runtime.GOOS == "linux"
-	if isLinux {
-		pgidStr = strconv.Itoa(int(pgid))
-		cmd = exec.CommandContext(ctx, "ps", "-eo", "pid,pgid,%cpu,rss")
-	} else {
-		cmd = exec.CommandContext(ctx, "ps", "-o", "pid,%cpu,rss", "-g", strconv.Itoa(int(pgid))) // #nosec G204 -- pgid is an integer
-	}
-
+	cmd := exec.CommandContext(ctx, "ps", "-eo", "pid,pgid,%cpu,rss") // #nosec G204 -- fixed args
 	out, err := cmd.Output()
 	if err != nil {
 		return 0, 0, 0, err
@@ -389,30 +329,18 @@ func sampleProcessGroup(pgid int32) (cpu float64, rss uint64, count int, err err
 	if len(lines) <= 1 {
 		return 0, 0, 0, nil
 	}
+	pgidStr := strconv.Itoa(int(pgid))
 	for _, line := range lines[1:] {
 		fields := strings.Fields(line)
-		if isLinux {
-			if len(fields) < 4 || fields[1] != pgidStr {
-				continue
-			}
-			cVal, errC := strconv.ParseFloat(fields[2], 64)
-			rssKB, errM := strconv.ParseUint(fields[3], 10, 64)
-			if errC == nil && errM == nil {
-				cpu += cVal
-				rss += rssKB * 1024
-				count++
-			}
-		} else {
-			if len(fields) < 3 {
-				continue
-			}
-			cVal, errC := strconv.ParseFloat(fields[1], 64)
-			rssKB, errM := strconv.ParseUint(fields[2], 10, 64)
-			if errC == nil && errM == nil {
-				cpu += cVal
-				rss += rssKB * 1024
-				count++
-			}
+		if len(fields) < 4 || fields[1] != pgidStr {
+			continue
+		}
+		cVal, errC := strconv.ParseFloat(fields[2], 64)
+		rssKB, errM := strconv.ParseUint(fields[3], 10, 64)
+		if errC == nil && errM == nil {
+			cpu += cVal
+			rss += rssKB * 1024
+			count++
 		}
 	}
 	return cpu, rss, count, nil

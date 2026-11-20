@@ -1014,6 +1014,10 @@ func TestDashboard_UnifiedTree_LiveAndHistoricalBranches(t *testing.T) {
 		t.Fatalf("expected second historical job ID 'job-hist-2', got %q", defaultRepo.Children[1].ID)
 	}
 
+	histBranch.Expanded = true
+	defaultRepo.Expanded = true
+	m.tree.Rebuild()
+
 	view := m.tree.View(60)
 	for _, expectedText := range []string{
 		"LIVE RUNS (1 active)",
@@ -1194,6 +1198,12 @@ func TestDashboard_HistoricalStepSelection_LoadsLogs(t *testing.T) {
 	}
 
 	// Expand historical job to expose its steps
+	if n := m.tree.FindNode("historical-runs"); n != nil {
+		n.Expanded = true
+	}
+	if n := m.tree.FindNode("hist-repo:default"); n != nil {
+		n.Expanded = true
+	}
 	jobNode := m.tree.FindNode("job-hist-1")
 	require.NotNil(t, jobNode, "job-hist-1 must exist in tree")
 	jobNode.Expanded = true
@@ -1293,10 +1303,17 @@ func TestDashboard_HistoricalSelection_PeakVitalsHUD(t *testing.T) {
 	m.updateActiveStepLogs()
 	assert.False(t, m.telemetry.IsHistorical(), "expected live mode when live step selected")
 	dashView := m.View()
-	assert.Contains(t, dashView, "∿ SYSTEM VITALS & RADAR")
+	assert.Contains(t, dashView, "∿ RUN VITALS & RADAR")
 	assert.NotContains(t, dashView, "∿ RUN VITALS (PEAK SUMMARY)")
 
 	// 2. Select historical job: telemetry switches to Peak Vitals mode
+	if n := m.tree.FindNode("historical-runs"); n != nil {
+		n.Expanded = true
+	}
+	if n := m.tree.FindNode("hist-repo:default"); n != nil {
+		n.Expanded = true
+	}
+	m.tree.Rebuild()
 	found := m.tree.SelectFirst(func(n *TreeNode) bool { return n.ID == "job-hist-1" })
 	require.True(t, found, "job-hist-1 must be found in tree")
 	m.updateActiveStepLogs()
@@ -1327,7 +1344,7 @@ func TestDashboard_HistoricalSelection_PeakVitalsHUD(t *testing.T) {
 	m.updateActiveStepLogs()
 	assert.False(t, m.telemetry.IsHistorical(), "expected live mode when moved back to live job")
 	dashView = m.View()
-	assert.Contains(t, dashView, "∿ SYSTEM VITALS & RADAR")
+	assert.Contains(t, dashView, "∿ RUN VITALS & RADAR")
 	assert.NotContains(t, dashView, "∿ RUN VITALS (PEAK SUMMARY)")
 
 	// 5. Select historical-runs branch header: telemetry clears historical mode
@@ -1335,7 +1352,7 @@ func TestDashboard_HistoricalSelection_PeakVitalsHUD(t *testing.T) {
 	m.updateActiveStepLogs()
 	assert.False(t, m.telemetry.IsHistorical(), "expected live/cleared mode on historical branch root")
 	dashView = m.View()
-	assert.Contains(t, dashView, "∿ SYSTEM VITALS & RADAR")
+	assert.Contains(t, dashView, "∿ RUN VITALS & RADAR")
 }
 
 func TestDashboard_MultiRepoTreeGrouping(t *testing.T) {
@@ -1598,6 +1615,13 @@ func TestDashboard_NodeTraversalAndStepSelection(t *testing.T) {
 	model.SetHistoricalRunSummary("job-aim-h1", histSummary)
 
 	// 1. Select the repo group node: HUD should NOT treat it as a job
+	if n := model.tree.FindNode("historical-runs"); n != nil {
+		n.Expanded = true
+	}
+	if n := model.tree.FindNode("hist-repo:aim"); n != nil {
+		n.Expanded = true
+	}
+	model.tree.Rebuild()
 	foundRepo := model.tree.SelectFirst(func(n *TreeNode) bool { return n.ID == "hist-repo:aim" })
 	require.True(t, foundRepo)
 	_ = model.updateActiveStepLogs()
@@ -2343,10 +2367,11 @@ func TestDashboard_SidebarScrollingWithManyHistoricalRuns(t *testing.T) {
 	m.ApplySnapshot(snap)
 
 	// Expand historical root and default repo
-	for _, r := range m.tree.Rows() {
-		if r.Node != nil && (r.Node.ID == "historical-root" || r.Node.ID == "hist-repo:default") {
-			r.Node.Expanded = true
-		}
+	if n := m.tree.FindNode("historical-runs"); n != nil {
+		n.Expanded = true
+	}
+	if n := m.tree.FindNode("hist-repo:default"); n != nil {
+		n.Expanded = true
 	}
 	m.tree.Rebuild()
 
@@ -2358,8 +2383,10 @@ func TestDashboard_SidebarScrollingWithManyHistoricalRuns(t *testing.T) {
 	assert.NotEmpty(t, v)
 	assert.Greater(t, m.tree.Height, 0)
 	assert.Equal(t, 0, m.tree.Offset)
-	assert.Contains(t, v, "█", "scrollbar thumb should be visible with > 50 rows")
-	assert.Contains(t, v, "│", "scrollbar track should be visible")
+	treeW := m.calcTreeWidth()
+	treeV := m.tree.View(treeW)
+	assert.NotContains(t, treeV, "█", "tree view should not render scrollbar block")
+	assert.NotContains(t, treeV, "│", "tree view should not render scrollbar track")
 
 	// Navigate down 30 rows
 	m.focus = FocusTree
@@ -2373,8 +2400,9 @@ func TestDashboard_SidebarScrollingWithManyHistoricalRuns(t *testing.T) {
 	assert.LessOrEqual(t, m.tree.Offset, m.tree.Cursor)
 	assert.Greater(t, m.tree.Offset+m.tree.Height, m.tree.Cursor)
 
-	vScrolled := m.View()
-	assert.Contains(t, vScrolled, "█")
+	treeVScrolled := m.tree.View(treeW)
+	assert.NotContains(t, treeVScrolled, "█")
+	assert.NotContains(t, treeVScrolled, "│")
 
 	// Test PageDown key
 	prevOffset := m.tree.Offset
@@ -2400,3 +2428,271 @@ func TestDashboard_SidebarScrollingWithManyHistoricalRuns(t *testing.T) {
 	m = res.(*DashboardModel)
 	assert.Equal(t, expectedRow, m.tree.Cursor, "clicked row should account for m.tree.Offset")
 }
+
+func TestDashboard_SidebarHeightStabilityAndPreciseClickInteraction(t *testing.T) {
+	termHeight := 30
+	m := NewDashboardModel(testSocketPath(t))
+	m.ready = true
+	resModel, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: termHeight})
+	m = resModel.(*DashboardModel)
+
+	snap := &monitor.Snapshot{
+		RunnerName: "test-runner",
+	}
+	for i := 1; i <= 50; i++ {
+		snap.RecentJobs = append(snap.RecentJobs, &monitor.JobInfo{
+			ID:        fmt.Sprintf("hist-job-%02d", i),
+			Name:      fmt.Sprintf("workflow-%02d", i),
+			RepoAlias: "default",
+			Status:    monitor.StatusSuccess,
+		})
+	}
+	m.ApplySnapshot(snap)
+
+	// 1. When collapsed (only ~5 rows visible in tree, no scrollbar)
+	viewCollapsed := m.View()
+	heightCollapsed := lipgloss.Height(viewCollapsed)
+	assert.Equal(t, termHeight, heightCollapsed, "view height when collapsed should exactly equal terminal height")
+
+	// 2. Expand HISTORICAL RUNS (> 50 rows visible, scrollbar opens)
+	if n := m.tree.FindNode("historical-runs"); n != nil {
+		n.Expanded = true
+	}
+	if n := m.tree.FindNode("hist-repo:default"); n != nil {
+		n.Expanded = true
+	}
+	m.tree.Rebuild()
+	assert.Greater(t, len(m.tree.Rows()), 50)
+
+	viewExpanded := m.View()
+	heightExpanded := lipgloss.Height(viewExpanded)
+	assert.Equal(t, termHeight, heightExpanded, "view height when expanded with scrollbar MUST NOT increase")
+	assert.Equal(t, heightCollapsed, heightExpanded, "view height must remain invariant between collapsed and expanded")
+
+	// 3. Test single-click toggling of branch header
+	histRow := -1
+	for idx, r := range m.tree.Rows() {
+		if r.Node != nil && r.Node.ID == "historical-runs" {
+			histRow = idx
+			break
+		}
+	}
+	require.GreaterOrEqual(t, histRow, 0)
+	histNode := m.tree.NodeAtRow(histRow)
+	require.True(t, histNode.Expanded)
+
+	// Click on the branch row to collapse it
+	res, _ := m.Update(tea.MouseMsg{
+		X:      10, // Clicking in the middle of "HISTORICAL RUNS" label
+		Y:      histRow + 1,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	m = res.(*DashboardModel)
+	assert.False(t, histNode.Expanded, "single click on branch header should collapse it")
+
+	// Click again to expand it
+	res, _ = m.Update(tea.MouseMsg{
+		X:      10,
+		Y:      histRow + 1,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	m = res.(*DashboardModel)
+	assert.True(t, histNode.Expanded, "second click on branch header should re-expand it")
+
+	// 4. Test clicking on an already-selected container node toggles it
+	defaultRepoRow := -1
+	for idx, r := range m.tree.Rows() {
+		if r.Node != nil && r.Node.ID == "hist-repo:default" {
+			defaultRepoRow = idx
+			break
+		}
+	}
+	require.GreaterOrEqual(t, defaultRepoRow, 0)
+	defaultRepoNode := m.tree.NodeAtRow(defaultRepoRow)
+	require.True(t, defaultRepoNode.Expanded)
+
+	// Select it first
+	m.tree.SelectRow(defaultRepoRow)
+	assert.Equal(t, defaultRepoRow, m.tree.Cursor)
+
+	// Click on already-selected row (on label) -> should toggle
+	res, _ = m.Update(tea.MouseMsg{
+		X:      8,
+		Y:      defaultRepoRow + 1,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	m = res.(*DashboardModel)
+	assert.False(t, defaultRepoNode.Expanded, "clicking on already-selected container node should toggle expansion")
+
+	// 5. Verify no scrollbar characters in sidebar view even when rows exceed height
+	defaultRepoNode.Expanded = true
+	m.tree.Rebuild()
+	m.tree.SetHeight(10)
+	treeWidth := m.calcTreeWidth()
+	treeView := m.tree.View(treeWidth)
+	assert.NotContains(t, treeView, "█", "tree view should not render scrollbar block")
+	assert.NotContains(t, treeView, "│", "tree view should not render scrollbar track")
+
+	// 6. Verify CircleCI-style log line numbers gutter and pure text copy
+	jobNode := m.tree.FindNode("hist-job-01")
+	require.NotNil(t, jobNode)
+	stepNode := &TreeNode{
+		ID:       "step-1",
+		Label:    "Setup Node",
+		NodeType: NodeStep,
+		Status:   monitor.StatusSuccess,
+	}
+	jobNode.AddChild(stepNode)
+	jobNode.Expanded = true
+	m.tree.Rebuild()
+	m.tree.SelectNode(stepNode)
+	m.stepLogs["hist-job-01/step-1"] = []string{
+		"npm install",
+		"npm test",
+	}
+	_ = m.updateActiveStepLogs()
+
+	vpOutput := m.viewport.View()
+	assert.Contains(t, vpOutput, "  1 │ npm install")
+	assert.Contains(t, vpOutput, "  2 │ npm test")
+
+	// Verify copying via 'c' key copies pure logs without line numbers or gutter
+	mockClip := &mockClipboard{}
+	m.SetClipboard(mockClip)
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	assert.Equal(t, "npm install\nnpm test", mockClip.copied, "clipboard must receive pure log lines without gutter numbers")
+}
+
+func TestDashboard_MouseEscapeArtifactFiltering(t *testing.T) {
+	// 1. Direct unit tests on isMouseEscapeArtifact
+	assert.True(t, isMouseEscapeArtifact(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'[', '<', '6', '5', ';', '8', '2', ';', '6', '3', 'M'}}))
+	assert.True(t, isMouseEscapeArtifact(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3', 'M'}}))
+	assert.True(t, isMouseEscapeArtifact(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'<', '6', '5', ';', '8', '2', ';', '6', '3', 'M'}}))
+	assert.False(t, isMouseEscapeArtifact(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}}))
+	assert.False(t, isMouseEscapeArtifact(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b', 'u', 'i', 'l', 'd'}}))
+	assert.False(t, isMouseEscapeArtifact(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'M'}}))
+
+	// 2. Integration test in dashboard during log search
+	m := NewDashboardModel("/tmp/test.sock")
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m.stepLogs["root"] = []string{"test output line"}
+	m.updateActiveStepLogs()
+
+	// Open log search via ctrl+f
+	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlF})
+	m = res.(*DashboardModel)
+	assert.True(t, m.IsLogSearching())
+
+	// Type valid query
+	for _, ch := range "test" {
+		res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		m = res.(*DashboardModel)
+	}
+	assert.Equal(t, "test", m.logSearchInput.Value())
+
+	// Simulate fragmented SGR mouse sequence arriving as KeyMsg
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'[', '<', '6', '5', ';', '8', '2', ';', '6', '3', 'M'}})
+	m = res.(*DashboardModel)
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3', 'M'}})
+	m = res.(*DashboardModel)
+
+	// Search value MUST remain "test" without escape artifacts
+	assert.Equal(t, "test", m.logSearchInput.Value(), "mouse escape sequences must not contaminate search query")
+}
+
+func TestDashboard_DedicatedSearchKeyAndTabFocus(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	// Initial focus is tree
+	assert.Equal(t, FocusTree, m.Focus())
+	assert.False(t, m.IsTreeSearching())
+
+	// Switch focus to viewport via Tab
+	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = res.(*DashboardModel)
+	assert.Equal(t, FocusViewport, m.Focus())
+
+	// While focused on Viewport, pressing 's' directly activates tree search
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = res.(*DashboardModel)
+	assert.True(t, m.IsTreeSearching(), "pressing 's' must open tree search directly")
+	assert.Equal(t, FocusTree, m.Focus(), "pressing 's' must switch focus to tree")
+
+	// Press Esc to dismiss tree search
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = res.(*DashboardModel)
+	assert.False(t, m.IsTreeSearching())
+
+	// Press Tab to switch back to Viewport
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = res.(*DashboardModel)
+	assert.Equal(t, FocusViewport, m.Focus())
+
+	// Press 'ctrl+f' to activate log search
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlF})
+	m = res.(*DashboardModel)
+	assert.True(t, m.IsLogSearching(), "pressing 'ctrl+f' must open log search directly")
+}
+
+func TestDashboard_MouseToggleShortcut(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	assert.False(t, m.MouseEnabled(), "mouse should be disabled by default for native terminal text selection")
+
+	// Press 'm' to enable mouse tracking
+	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	m = res.(*DashboardModel)
+	assert.True(t, m.MouseEnabled())
+	assert.Contains(t, m.toastMsg, "Mouse tracking enabled")
+
+	// Press 'm' again to disable mouse tracking
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	m = res.(*DashboardModel)
+	assert.False(t, m.MouseEnabled())
+	assert.Contains(t, m.toastMsg, "Mouse tracking disabled")
+}
+
+func TestDashboard_ViewportKeyboardNavigationAndAutoFollow(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	// Add 50 lines of logs so viewport can scroll
+	lines := make([]string, 50)
+	for i := 0; i < 50; i++ {
+		lines[i] = fmt.Sprintf("line %02d", i+1)
+	}
+	m.stepLogs["root"] = lines
+	_ = m.updateActiveStepLogs()
+
+	// Switch focus to viewport
+	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = res.(*DashboardModel)
+	assert.Equal(t, FocusViewport, m.Focus())
+
+	// Viewport starts scrolled to bottom (autoFollow = true)
+	assert.True(t, m.autoFollow)
+
+	// Pressing 'k' or 'up' when viewport is focused scrolls up and disables autoFollow
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	m = res.(*DashboardModel)
+	assert.Equal(t, FocusViewport, m.Focus(), "k key must not jump focus to tree when viewport is focused")
+	assert.False(t, m.autoFollow, "scrolling up via k must disable autoFollow")
+
+	// Pressing 'pgup' or 'ctrl+u' also disables autoFollow
+	m.autoFollow = true
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	m = res.(*DashboardModel)
+	assert.False(t, m.autoFollow, "pgup must disable autoFollow")
+
+	// Pressing 'j' or 'down' scrolls down; when bottom is reached, autoFollow is restored
+	for i := 0; i < 50; i++ {
+		res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+		m = res.(*DashboardModel)
+	}
+	assert.Equal(t, FocusViewport, m.Focus(), "j key must not jump focus to tree when viewport is focused")
+	assert.True(t, m.autoFollow, "reaching bottom via j must restore autoFollow")
+}
+

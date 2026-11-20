@@ -636,6 +636,9 @@ func (s *Server) Publish(ev Event) {
 			s.sortRecentJobsLocked()
 		}
 		s.activeJobs = updatedActive
+		if len(s.activeJobs) == 0 {
+			s.telemetry = nil
+		}
 
 		var peakMetrics *RunMetricsSummary
 		if metrics, ok := s.peakMetrics[jobID]; ok {
@@ -677,6 +680,9 @@ func (s *Server) Publish(ev Event) {
 				}
 				s.jobs[ev.JobID] = job
 				s.activeJobs = append(s.activeJobs, job)
+			}
+			if ev.RepoAlias != "" && job.RepoAlias == "" {
+				job.RepoAlias = ev.RepoAlias
 			}
 			stepClone := *ev.Step
 			found := false
@@ -736,6 +742,15 @@ func (s *Server) Publish(ev Event) {
 	case EventTelemetry:
 		s.telemetry = ev.Telemetry
 		if ev.Telemetry != nil {
+			if ev.RepoAlias != "" {
+				if ev.JobID != "" {
+					if j, ok := s.jobs[ev.JobID]; ok && j.RepoAlias == "" {
+						j.RepoAlias = ev.RepoAlias
+					}
+				} else if len(s.activeJobs) == 1 && s.activeJobs[0].RepoAlias == "" {
+					s.activeJobs[0].RepoAlias = ev.RepoAlias
+				}
+			}
 			targetJobIDs := make([]string, 0, 1)
 			if ev.JobID != "" {
 				targetJobIDs = append(targetJobIDs, ev.JobID)

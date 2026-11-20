@@ -684,55 +684,20 @@ func (tw *TreeWidget) View(width int) string {
 
 	startRow := 0
 	endRow := len(tw.rows)
-	hasScrollbar := false
-
 	if tw.Height > 0 && len(tw.rows) > tw.Height {
 		startRow = tw.Offset
 		endRow = tw.Offset + tw.Height
 		if endRow > len(tw.rows) {
 			endRow = len(tw.rows)
 		}
-		hasScrollbar = true
 	}
 
 	contentWidth := width
-	if hasScrollbar && contentWidth > 1 {
-		contentWidth = width - 1
-	}
-
-	var thumbStart, thumbEnd int
-	if hasScrollbar {
-		h := tw.Height
-		total := len(tw.rows)
-		thumbSize := (h * h) / total
-		if thumbSize < 1 {
-			thumbSize = 1
-		}
-		maxOffset := total - h
-		if maxOffset > 0 {
-			thumbStart = (tw.Offset * (h - thumbSize)) / maxOffset
-		}
-		thumbEnd = thumbStart + thumbSize
-		if thumbEnd > h {
-			thumbEnd = h
-		}
-	}
-
-	var b strings.Builder
+	lines := make([]string, 0, endRow-startRow)
 	for i := startRow; i < endRow; i++ {
 		r := tw.rows[i]
 		if r.Node == nil {
 			continue
-		}
-
-		lineIdx := i - startRow
-		var scrollChar string
-		if hasScrollbar {
-			if lineIdx >= thumbStart && lineIdx < thumbEnd {
-				scrollChar = lipgloss.NewStyle().Foreground(lipgloss.Color("#94A3B8")).Render("█")
-			} else {
-				scrollChar = lipgloss.NewStyle().Foreground(lipgloss.Color("#475569")).Render("│")
-			}
 		}
 
 		indent := strings.Repeat("  ", r.Depth)
@@ -798,6 +763,7 @@ func (tw *TreeWidget) View(width int) string {
 			renderedLabel = normalStyle.Render(label)
 		}
 
+		var lineStr string
 		if isSelected {
 			renderedIndent := selectedStyle.Render(indent)
 			content := renderedIndent + glyph + renderedLabel
@@ -808,7 +774,7 @@ func (tw *TreeWidget) View(width int) string {
 			} else if contentW > contentWidth {
 				content = ansi.Truncate(content, contentWidth, "")
 			}
-			b.WriteString(content + scrollChar)
+			lineStr = content
 		} else {
 			line := normalStyle.Render(indent) + glyph + renderedLabel
 			lineW := ansi.StringWidth(line)
@@ -817,9 +783,9 @@ func (tw *TreeWidget) View(width int) string {
 			} else if lineW > contentWidth {
 				line = ansi.Truncate(line, contentWidth, "")
 			}
-			b.WriteString(line + scrollChar)
+			lineStr = line
 		}
-		b.WriteString("\n")
+		lines = append(lines, lineStr)
 	}
-	return b.String()
+	return strings.Join(lines, "\n")
 }

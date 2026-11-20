@@ -211,7 +211,7 @@ func (tw *TelemetryWidget) formatSlotSummary() string {
 }
 
 // View renders the telemetry widget into a monospace tabular HUD:
-// Line 1: ∿ SYSTEM VITALS & RADAR with status pill (● ACTIVE or ● IDLE)
+// Line 1: ∿ RUN VITALS & RADAR with status pill (● ACTIVE or ● IDLE)
 // Line 2: Monospace metadata with STEP, PID, TIME, and TRACE
 // Line 3: CPU percentage with purple-to-cyan gradient progress bar
 // Line 4: RAM consumption with cyan-to-emerald gradient progress bar
@@ -224,7 +224,7 @@ func (tw *TelemetryWidget) View(width int) string {
 	}
 
 	if tw == nil || tw.sample == nil {
-		header := radarTitleStyle.Render("∿ SYSTEM VITALS & RADAR")
+		header := radarTitleStyle.Render("∿ RUN VITALS & RADAR")
 		var pill string
 		var stateLine string
 		if tw != nil && tw.offline {
@@ -255,7 +255,7 @@ func (tw *TelemetryWidget) View(width int) string {
 		return lipgloss.JoinVertical(lipgloss.Left, idleLines...)
 	}
 
-	header := radarTitleStyle.Render("∿ SYSTEM VITALS & RADAR")
+	header := radarTitleStyle.Render("∿ RUN VITALS & RADAR")
 	pill := activePillStyle.Render("● ACTIVE")
 
 	gap := width - lipgloss.Width(header) - lipgloss.Width(pill)

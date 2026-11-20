@@ -767,14 +767,17 @@ func TestTreeWidget_ScrollingAndWindowing(t *testing.T) {
 
 	// First view should show top items and scrollbar
 	v1 := tw.View(30)
+	if lipgloss.Height(v1) != 10 {
+		t.Fatalf("expected lipgloss.Height(v1) == 10, got %d", lipgloss.Height(v1))
+	}
 	if !strings.Contains(v1, "Run Item A") {
 		t.Fatalf("expected v1 to contain 'Run Item A', got:\n%s", v1)
 	}
 	if strings.Contains(v1, "Run Item Z") {
 		t.Fatalf("expected v1 NOT to contain 'Run Item Z' (offscreen)")
 	}
-	if !strings.Contains(v1, "█") || !strings.Contains(v1, "│") {
-		t.Fatalf("expected scrollbar characters in v1, got:\n%s", v1)
+	if strings.Contains(v1, "█") || strings.Contains(v1, "│") {
+		t.Fatalf("expected no scrollbar characters in v1, got:\n%s", v1)
 	}
 
 	// Move cursor down past row 10
@@ -822,7 +825,13 @@ func TestTreeWidget_ScrollingAndWindowing(t *testing.T) {
 		t.Fatalf("expected offset 0 when Height <= 0, got %d", tw.Offset)
 	}
 	vNoScroll := tw.View(30)
-	if strings.Contains(vNoScroll, "│") {
-		t.Fatalf("expected no scrollbar when Height == 0, got:\n%s", vNoScroll)
+	if strings.Contains(vNoScroll, "│") || strings.Contains(vNoScroll, "█") {
+		t.Fatalf("expected no scrollbar characters when Height == 0, got:\n%s", vNoScroll)
+	}
+
+	tw.SetHeight(10)
+	vWithHeight := tw.View(30)
+	if strings.Contains(vWithHeight, "│") || strings.Contains(vWithHeight, "█") {
+		t.Fatalf("expected no scrollbar characters when Height > 0, got:\n%s", vWithHeight)
 	}
 }
