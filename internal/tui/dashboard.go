@@ -810,10 +810,18 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.updateActiveStepLogs()
 			}
 		case "pgdown", "pagedown", "ctrl+d":
+			if !m.isZoomed && m.focus == FocusTree && m.tree != nil && m.tree.Height > 0 {
+				m.tree.ScrollDown(m.tree.Height)
+				return m, m.updateActiveStepLogs()
+			}
 			var cmd tea.Cmd
 			m.viewport, cmd = m.viewport.Update(msg)
 			return m, cmd
 		case "pgup", "pageup", "ctrl+u":
+			if !m.isZoomed && m.focus == FocusTree && m.tree != nil && m.tree.Height > 0 {
+				m.tree.ScrollUp(m.tree.Height)
+				return m, m.updateActiveStepLogs()
+			}
 			var cmd tea.Cmd
 			m.viewport, cmd = m.viewport.Update(msg)
 			return m, cmd
@@ -945,39 +953,41 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 
-				row := msg.Y - treeTopOffset
-				if row >= 0 && row < len(m.tree.Rows()) {
-					clickedNode := m.tree.NodeAtRow(row)
+				if msg.Y >= treeTopOffset && (m.tree.Height <= 0 || msg.Y < treeTopOffset+m.tree.Height) {
+					row := m.tree.Offset + msg.Y - treeTopOffset
+					if row >= 0 && row < len(m.tree.Rows()) {
+						clickedNode := m.tree.NodeAtRow(row)
 
-					// Double click detection: same node within 350ms
-					isDoubleClick := !m.lastTreeClickTime.IsZero() &&
-						time.Since(m.lastTreeClickTime) <= 350*time.Millisecond &&
-						clickedNode != nil && m.lastTreeClickNodeID == clickedNode.ID
+						// Double click detection: same node within 350ms
+						isDoubleClick := !m.lastTreeClickTime.IsZero() &&
+							time.Since(m.lastTreeClickTime) <= 350*time.Millisecond &&
+							clickedNode != nil && m.lastTreeClickNodeID == clickedNode.ID
 
-					// Chevron click detection: indent + glyph
-					isChevron := false
-					if clickedNode != nil && len(clickedNode.Children) > 0 {
-						chevronStart := 1 + clickedNode.Depth*2
-						chevronEnd := chevronStart + 2
-						if msg.X >= 1 && msg.X <= chevronEnd {
-							isChevron = true
+						// Chevron click detection: indent + glyph
+						isChevron := false
+						if clickedNode != nil && len(clickedNode.Children) > 0 {
+							chevronStart := 1 + clickedNode.Depth*2
+							chevronEnd := chevronStart + 2
+							if msg.X >= 1 && msg.X <= chevronEnd {
+								isChevron = true
+							}
 						}
-					}
 
-					m.tree.SelectRow(row)
-					if isDoubleClick || isChevron {
-						m.tree.ToggleExpandSelected()
-					}
-					if clickedNode != nil && clickedNode.NodeType == NodeRepo {
-						m.seenRepoExpansion[clickedNode.ID] = clickedNode.Expanded
-					}
+						m.tree.SelectRow(row)
+						if isDoubleClick || isChevron {
+							m.tree.ToggleExpandSelected()
+						}
+						if clickedNode != nil && clickedNode.NodeType == NodeRepo {
+							m.seenRepoExpansion[clickedNode.ID] = clickedNode.Expanded
+						}
 
-					m.lastTreeClickTime = time.Now()
-					if clickedNode != nil {
-						m.lastTreeClickNodeID = clickedNode.ID
-					}
+						m.lastTreeClickTime = time.Now()
+						if clickedNode != nil {
+							m.lastTreeClickNodeID = clickedNode.ID
+						}
 
-					return m, m.updateActiveStepLogs()
+						return m, m.updateActiveStepLogs()
+					}
 				}
 				return m, nil
 			}
@@ -1225,7 +1235,7 @@ func (m *DashboardModel) calcDimensions() (treeWidth, rightWidth, targetOuterHei
 }
 
 func (m *DashboardModel) updateSizes() {
-	treeWidth, rightWidth, _, logHeight := m.calcDimensions()
+	treeWidth, rightWidth, targetOuterHeight, logHeight := m.calcDimensions()
 	m.viewport.Width = rightWidth
 	m.viewport.Height = logHeight
 	m.treeSearchInput.Width = treeWidth - 9
@@ -1240,6 +1250,17 @@ func (m *DashboardModel) updateSizes() {
 		logInputW = 40
 	}
 	m.logSearchInput.Width = logInputW
+
+	treeInnerHeight := targetOuterHeight - 2
+	if m.treeSearching || m.treeSearchInput.Value() != "" {
+		treeInnerHeight--
+	}
+	if treeInnerHeight < 1 {
+		treeInnerHeight = 1
+	}
+	if m.tree != nil {
+		m.tree.SetHeight(treeInnerHeight)
+	}
 }
 
 func (m *DashboardModel) applySnapshot(snap *monitor.Snapshot) tea.Cmd {
@@ -2544,6 +2565,17 @@ func (m *DashboardModel) View() string {
 		treeInnerHeight := targetOuterHeight - 2
 		if treeInnerHeight < 1 {
 			treeInnerHeight = 1
+		}
+
+		visibleTreeHeight := treeInnerHeight
+		if m.treeSearching || m.treeSearchInput.Value() != "" {
+			visibleTreeHeight--
+		}
+		if visibleTreeHeight < 1 {
+			visibleTreeHeight = 1
+		}
+		if m.tree != nil {
+			m.tree.SetHeight(visibleTreeHeight)
 		}
 
 		var treeContent string

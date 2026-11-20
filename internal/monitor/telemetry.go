@@ -372,11 +372,15 @@ func sampleProcessGroup(pgid int32) (cpu float64, rss uint64, count int, err err
 	defer cancel()
 
 	var cmd *exec.Cmd
-	if runtime.GOOS == "linux" {
-		cmd = exec.CommandContext(ctx, "ps", "-o", "pid,%cpu,rss", "--pgid", strconv.Itoa(int(pgid))) // #nosec G204 -- pgid is an integer
+	var pgidStr string
+	isLinux := runtime.GOOS == "linux"
+	if isLinux {
+		pgidStr = strconv.Itoa(int(pgid))
+		cmd = exec.CommandContext(ctx, "ps", "-eo", "pid,pgid,%cpu,rss")
 	} else {
 		cmd = exec.CommandContext(ctx, "ps", "-o", "pid,%cpu,rss", "-g", strconv.Itoa(int(pgid))) // #nosec G204 -- pgid is an integer
 	}
+
 	out, err := cmd.Output()
 	if err != nil {
 		return 0, 0, 0, err
@@ -387,15 +391,28 @@ func sampleProcessGroup(pgid int32) (cpu float64, rss uint64, count int, err err
 	}
 	for _, line := range lines[1:] {
 		fields := strings.Fields(line)
-		if len(fields) < 3 {
-			continue
-		}
-		cVal, errC := strconv.ParseFloat(fields[1], 64)
-		rssKB, errM := strconv.ParseUint(fields[2], 10, 64)
-		if errC == nil && errM == nil {
-			cpu += cVal
-			rss += rssKB * 1024
-			count++
+		if isLinux {
+			if len(fields) < 4 || fields[1] != pgidStr {
+				continue
+			}
+			cVal, errC := strconv.ParseFloat(fields[2], 64)
+			rssKB, errM := strconv.ParseUint(fields[3], 10, 64)
+			if errC == nil && errM == nil {
+				cpu += cVal
+				rss += rssKB * 1024
+				count++
+			}
+		} else {
+			if len(fields) < 3 {
+				continue
+			}
+			cVal, errC := strconv.ParseFloat(fields[1], 64)
+			rssKB, errM := strconv.ParseUint(fields[2], 10, 64)
+			if errC == nil && errM == nil {
+				cpu += cVal
+				rss += rssKB * 1024
+				count++
+			}
 		}
 	}
 	return cpu, rss, count, nil
