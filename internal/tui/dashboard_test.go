@@ -2562,8 +2562,7 @@ func TestDashboard_SidebarHeightStabilityAndPreciseClickInteraction(t *testing.T
 	// Verify copying via 'c' key copies pure logs without line numbers or gutter
 	mockClip := &mockClipboard{}
 	m.SetClipboard(mockClip)
-	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
-	m = res.(*DashboardModel)
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
 	assert.Equal(t, "npm install\nnpm test", mockClip.copied, "clipboard must receive pure log lines without gutter numbers")
 }
 
