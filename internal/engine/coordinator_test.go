@@ -1451,6 +1451,54 @@ func TestEvaluateExpressionAndParseContextData(t *testing.T) {
 	}
 }
 
+func TestEvaluateExpression_FormatWithEscapedQuotes(t *testing.T) {
+	input := `format('IFS='','' read -ra ADDR <<< "$PLATFORMS"
+for p in "${ADDR[@]}"; do
+  part="parts/release-$TAG-$p"
+  if [ ! -f "$part/manifest.json" ]; then
+    echo "::warning::$part/manifest.json missing; falling back to gh run download"
+    rm -rf "$part"
+    mkdir -p "$part"
+    gh run download "{0}" --repo "{1}" -n "release-$TAG-$p" -D "$part"
+  fi
+done
+', github.run_id, github.repository)`
+
+	ctx := map[string]any{
+		"github": map[string]any{
+			"run_id":     "44657469251",
+			"repository": "adrijshikhar/cxstatusline",
+		},
+	}
+	res := evaluateExpression(input, ctx)
+	if strings.HasPrefix(res, "format(") {
+		t.Fatalf("FAILED: evaluateExpression did not evaluate format(): %q", res)
+	}
+	if !strings.Contains(res, "IFS=',' read") {
+		t.Errorf("expected IFS=',' read with single quotes unescaped, got:\n%s", res)
+	}
+	if !strings.Contains(res, `gh run download "44657469251" --repo "adrijshikhar/cxstatusline"`) {
+		t.Errorf("expected placeholder substitution for run_id and repository, got:\n%s", res)
+	}
+
+	// Test single quote escaping in string literals and format
+	escapedTests := []struct {
+		expr     string
+		expected string
+	}{
+		{"''''", "'"},
+		{"'a''b'", "a'b"},
+		{"format('hello ''{0}''', 'world')", "hello 'world'"},
+		{"format('a'',''b')", "a','b"},
+	}
+	for _, tt := range escapedTests {
+		got := evaluateExpression(tt.expr, nil)
+		if got != tt.expected {
+			t.Errorf("evaluateExpression(%q) = %q; want %q", tt.expr, got, tt.expected)
+		}
+	}
+}
+
 func TestCoordinator_Lifecycle_PrepareJobAndCleanupJob(t *testing.T) {
 	workDir := t.TempDir()
 	mock := &mockDriver{}

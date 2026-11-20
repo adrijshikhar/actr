@@ -1519,6 +1519,12 @@ func parseExpressionArgs(s string) []string {
 		ch := s[i]
 		switch ch {
 		case '\'':
+			if inQuotes && i+1 < len(s) && s[i+1] == '\'' {
+				current.WriteByte('\'')
+				current.WriteByte('\'')
+				i++
+				continue
+			}
 			inQuotes = !inQuotes
 			current.WriteByte(ch)
 		case '(':
@@ -1566,6 +1572,10 @@ func splitTopLevel(s, sep string) []string {
 		ch := s[i]
 		switch ch {
 		case '\'':
+			if inQuotes && i+1 < len(s) && s[i+1] == '\'' {
+				i++
+				continue
+			}
 			inQuotes = !inQuotes
 		case '(':
 			if !inQuotes {
@@ -1897,7 +1907,8 @@ func evaluateExpression(expr string, ctx map[string]any) string {
 
 	// String literals: 'foo'
 	if strings.HasPrefix(trimmed, "'") && strings.HasSuffix(trimmed, "'") && len(trimmed) >= 2 {
-		return trimmed[1 : len(trimmed)-1]
+		unquoted := trimmed[1 : len(trimmed)-1]
+		return strings.ReplaceAll(unquoted, "''", "'")
 	}
 
 	// Boolean/null literals
