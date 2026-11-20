@@ -188,7 +188,11 @@ func (s *TelemetrySampler) SetTraceContext(traceID, spanID, stepName string, sta
 	s.stepStarted = startedAt
 }
 
-func (s *TelemetrySampler) Sample() *RunnerMetrics {
+func (s *TelemetrySampler) Sample() (sample *RunnerMetrics) {
+	defer func() {
+		_ = recover() // Protect against panics in third-party metric collectors (e.g. gopsutil net/disk parsing on Darwin)
+	}()
+
 	s.sampleMu.Lock()
 	defer s.sampleMu.Unlock()
 
@@ -204,7 +208,7 @@ func (s *TelemetrySampler) Sample() *RunnerMetrics {
 	s.mu.RUnlock()
 
 	now := time.Now()
-	sample := &RunnerMetrics{
+	sample = &RunnerMetrics{
 		Timestamp:      now,
 		PID:            targetPID,
 		PGID:           targetPGID,
@@ -295,41 +299,47 @@ func (s *TelemetrySampler) Sample() *RunnerMetrics {
 	}
 
 	// Disk Write Rate
-	if diskCounters, err := disk.IOCounters(); err == nil {
-		var totalWriteBytes uint64
-		for _, c := range diskCounters {
-			totalWriteBytes += c.WriteBytes
-		}
-		if !s.lastDiskTime.IsZero() && now.After(s.lastDiskTime) {
-			durationSec := now.Sub(s.lastDiskTime).Seconds()
-			if durationSec > 0 && totalWriteBytes >= s.lastDiskWr {
-				sample.DiskWriteRate = uint64(float64(totalWriteBytes-s.lastDiskWr) / durationSec)
+	func() {
+		defer func() { _ = recover() }()
+		if diskCounters, err := disk.IOCounters(); err == nil {
+			var totalWriteBytes uint64
+			for _, c := range diskCounters {
+				totalWriteBytes += c.WriteBytes
 			}
+			if !s.lastDiskTime.IsZero() && now.After(s.lastDiskTime) {
+				durationSec := now.Sub(s.lastDiskTime).Seconds()
+				if durationSec > 0 && totalWriteBytes >= s.lastDiskWr {
+					sample.DiskWriteRate = uint64(float64(totalWriteBytes-s.lastDiskWr) / durationSec)
+				}
+			}
+			s.lastDiskTime = now
+			s.lastDiskWr = totalWriteBytes
 		}
-		s.lastDiskTime = now
-		s.lastDiskWr = totalWriteBytes
-	}
+	}()
 
 	// Network I/O Rate (host fallback when no container targeted)
 	if targetContainerID == "" {
-		if netCounters, err := net.IOCounters(false); err == nil && len(netCounters) > 0 {
-			rx := netCounters[0].BytesRecv
-			tx := netCounters[0].BytesSent
-			if !s.lastNetTime.IsZero() && now.After(s.lastNetTime) {
-				durationSec := now.Sub(s.lastNetTime).Seconds()
-				if durationSec > 0 {
-					if rx >= s.lastNetRx {
-						sample.NetRxRate = uint64(float64(rx-s.lastNetRx) / durationSec)
-					}
-					if tx >= s.lastNetTx {
-						sample.NetTxRate = uint64(float64(tx-s.lastNetTx) / durationSec)
+		func() {
+			defer func() { _ = recover() }()
+			if netCounters, err := net.IOCounters(false); err == nil && len(netCounters) > 0 {
+				rx := netCounters[0].BytesRecv
+				tx := netCounters[0].BytesSent
+				if !s.lastNetTime.IsZero() && now.After(s.lastNetTime) {
+					durationSec := now.Sub(s.lastNetTime).Seconds()
+					if durationSec > 0 {
+						if rx >= s.lastNetRx {
+							sample.NetRxRate = uint64(float64(rx-s.lastNetRx) / durationSec)
+						}
+						if tx >= s.lastNetTx {
+							sample.NetTxRate = uint64(float64(tx-s.lastNetTx) / durationSec)
+						}
 					}
 				}
+				s.lastNetTime = now
+				s.lastNetRx = rx
+				s.lastNetTx = tx
 			}
-			s.lastNetTime = now
-			s.lastNetRx = rx
-			s.lastNetTx = tx
-		}
+		}()
 	}
 
 	return sample

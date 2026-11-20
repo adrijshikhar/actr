@@ -1236,32 +1236,38 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 		}()
 		go func() {
 			defer close(telemetryDone)
+			defer func() { _ = recover() }()
 			ticker := time.NewTicker(500 * time.Millisecond)
 			defer ticker.Stop()
 
-			sample := sampler.Sample()
-			monSrv.SetTelemetry(sample)
+			if sample := sampler.Sample(); sample != nil {
+				monSrv.SetTelemetry(sample)
+			}
 
 			for {
 				select {
 				case <-stopTelemetry:
 					return
 				case <-ticker.C:
-					sample := sampler.Sample()
-					monSrv.SetTelemetry(sample)
+					if sample := sampler.Sample(); sample != nil {
+						monSrv.SetTelemetry(sample)
+					}
 				}
 			}
 		}()
 	}
 
 	defer func() {
+		defer func() { _ = recover() }()
 		c.mu.RLock()
 		s := c.sampler
 		c.mu.RUnlock()
 		if s != nil {
 			s.SetTargetPID(0, 0)
 			if monSrv != nil {
-				monSrv.SetTelemetry(s.Sample())
+				if smp := s.Sample(); smp != nil {
+					monSrv.SetTelemetry(smp)
+				}
 			}
 		}
 	}()
