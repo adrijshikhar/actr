@@ -2654,3 +2654,45 @@ func TestDashboard_MouseToggleShortcut(t *testing.T) {
 	assert.False(t, m.MouseEnabled())
 	assert.Contains(t, m.toastMsg, "Mouse tracking disabled")
 }
+
+func TestDashboard_ViewportKeyboardNavigationAndAutoFollow(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	// Add 50 lines of logs so viewport can scroll
+	lines := make([]string, 50)
+	for i := 0; i < 50; i++ {
+		lines[i] = fmt.Sprintf("line %02d", i+1)
+	}
+	m.stepLogs["root"] = lines
+	_ = m.updateActiveStepLogs()
+
+	// Switch focus to viewport
+	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = res.(*DashboardModel)
+	assert.Equal(t, FocusViewport, m.Focus())
+
+	// Viewport starts scrolled to bottom (autoFollow = true)
+	assert.True(t, m.autoFollow)
+
+	// Pressing 'k' or 'up' when viewport is focused scrolls up and disables autoFollow
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	m = res.(*DashboardModel)
+	assert.Equal(t, FocusViewport, m.Focus(), "k key must not jump focus to tree when viewport is focused")
+	assert.False(t, m.autoFollow, "scrolling up via k must disable autoFollow")
+
+	// Pressing 'pgup' or 'ctrl+u' also disables autoFollow
+	m.autoFollow = true
+	res, _ = m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	m = res.(*DashboardModel)
+	assert.False(t, m.autoFollow, "pgup must disable autoFollow")
+
+	// Pressing 'j' or 'down' scrolls down; when bottom is reached, autoFollow is restored
+	for i := 0; i < 50; i++ {
+		res, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+		m = res.(*DashboardModel)
+	}
+	assert.Equal(t, FocusViewport, m.Focus(), "j key must not jump focus to tree when viewport is focused")
+	assert.True(t, m.autoFollow, "reaching bottom via j must restore autoFollow")
+}
+

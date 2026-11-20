@@ -841,17 +841,25 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "k", "up":
-			m.focus = FocusTree
-			if !m.isZoomed {
-				m.tree.Up()
-				return m, m.updateActiveStepLogs()
+			if m.isZoomed || m.focus == FocusViewport {
+				m.autoFollow = false
+				m.viewport.LineUp(1)
+				return m, nil
 			}
+			m.focus = FocusTree
+			m.tree.Up()
+			return m, m.updateActiveStepLogs()
 		case "j", "down":
-			m.focus = FocusTree
-			if !m.isZoomed {
-				m.tree.Down()
-				return m, m.updateActiveStepLogs()
+			if m.isZoomed || m.focus == FocusViewport {
+				m.viewport.LineDown(1)
+				if m.viewport.AtBottom() {
+					m.autoFollow = true
+				}
+				return m, nil
 			}
+			m.focus = FocusTree
+			m.tree.Down()
+			return m, m.updateActiveStepLogs()
 		case "enter", " ":
 			m.focus = FocusTree
 			if !m.isZoomed {
@@ -886,12 +894,16 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			var cmd tea.Cmd
 			m.viewport, cmd = m.viewport.Update(msg)
+			if m.viewport.AtBottom() {
+				m.autoFollow = true
+			}
 			return m, cmd
 		case "pgup", "pageup", "ctrl+u":
 			if !m.isZoomed && m.focus == FocusTree && m.tree != nil && m.tree.Height > 0 {
 				m.tree.ScrollUp(m.tree.Height)
 				return m, m.updateActiveStepLogs()
 			}
+			m.autoFollow = false
 			var cmd tea.Cmd
 			m.viewport, cmd = m.viewport.Update(msg)
 			return m, cmd
@@ -1765,8 +1777,8 @@ func (m *DashboardModel) rebuildTreeFromSnapshot(snap *monitor.Snapshot) {
 			if matchedAlias == "" {
 				for _, s := range slots {
 					sLower := strings.ToLower(s.Alias)
-					if (job.Workflow != "" && strings.Contains(strings.ToLower(job.Workflow), sLower)) ||
-						(job.Name != "" && strings.Contains(strings.ToLower(job.Name), sLower)) {
+					if len(sLower) >= 3 && ((job.Workflow != "" && strings.Contains(strings.ToLower(job.Workflow), sLower)) ||
+						(job.Name != "" && strings.Contains(strings.ToLower(job.Name), sLower))) {
 						matchedAlias = s.Alias
 						break
 					}

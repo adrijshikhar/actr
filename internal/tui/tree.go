@@ -668,28 +668,6 @@ func (tw *TreeWidget) SelectFirst(fn func(node *TreeNode) bool) bool {
 	return false
 }
 
-// ScrollbarInfo returns whether the scrollbar is active, along with thumbStart and thumbEnd row indices.
-func (tw *TreeWidget) ScrollbarInfo() (hasScrollbar bool, thumbStart int, thumbEnd int) {
-	if tw == nil || tw.Height <= 0 || len(tw.rows) <= tw.Height {
-		return false, 0, 0
-	}
-	h := tw.Height
-	total := len(tw.rows)
-	thumbSize := (h * h) / total
-	if thumbSize < 1 {
-		thumbSize = 1
-	}
-	maxOffset := total - h
-	if maxOffset > 0 {
-		thumbStart = (tw.Offset * (h - thumbSize)) / maxOffset
-	}
-	thumbEnd = thumbStart + thumbSize
-	if thumbEnd > h {
-		thumbEnd = h
-	}
-	return true, thumbStart, thumbEnd
-}
-
 // View renders the tree within the specified width, windowing and scrolling if Height > 0.
 func (tw *TreeWidget) View(width int) string {
 	if width <= 0 {

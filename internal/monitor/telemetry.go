@@ -45,12 +45,6 @@ type TelemetrySampler struct {
 	containerCancel context.CancelFunc
 	cStatsMu        sync.RWMutex
 	containerStats  *containerMetrics
-
-	lastNetTime  time.Time
-	lastNetRx    uint64
-	lastNetTx    uint64
-	lastDiskTime time.Time
-	lastDiskWr   uint64
 }
 
 func NewTelemetrySampler() *TelemetrySampler {
