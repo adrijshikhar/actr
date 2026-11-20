@@ -795,7 +795,7 @@ func TestCoordinator_ExecuteJob_WithMonitor(t *testing.T) {
 		},
 	}
 
-	coord := NewCoordinator(mock, nil, filepath.Join(tmpDir, "work")).WithStepLogger(true)
+	coord := NewCoordinator(mock, nil, filepath.Join(tmpDir, "work")).WithStepLogger(true).WithRepoAlias("cxstatusline")
 	coord.SetMonitorServer(server)
 
 	client := monitor.NewClient(sockPath)
@@ -843,11 +843,15 @@ func TestCoordinator_ExecuteJob_WithMonitor(t *testing.T) {
 	mu.Unlock()
 
 	var hasJobStart, hasJobFinish, hasStepStart, hasStepLog, hasTelemetry, hasStepFinish bool
+	var hasRepoAlias, hasStepTelemetry, hasTraceID bool
 	for _, ev := range evs {
 		switch ev.Type {
 		case monitor.EventJobStart:
 			if ev.JobID == "job-mon-test" {
 				hasJobStart = true
+				if ev.RepoAlias == "cxstatusline" {
+					hasRepoAlias = true
+				}
 			}
 		case monitor.EventJobFinish:
 			if ev.JobID == "job-mon-test" {
@@ -863,6 +867,14 @@ func TestCoordinator_ExecuteJob_WithMonitor(t *testing.T) {
 			}
 		case monitor.EventTelemetry:
 			hasTelemetry = true
+			if ev.Telemetry != nil {
+				if ev.Telemetry.ActiveStepName == "Run Build" {
+					hasStepTelemetry = true
+				}
+				if ev.Telemetry.TraceID != "" {
+					hasTraceID = true
+				}
+			}
 		case monitor.EventStepFinish:
 			if ev.JobID == "job-mon-test" {
 				hasStepFinish = true
@@ -872,6 +884,9 @@ func TestCoordinator_ExecuteJob_WithMonitor(t *testing.T) {
 
 	if !hasJobStart {
 		t.Error("missing EventJobStart")
+	}
+	if !hasRepoAlias {
+		t.Error("missing RepoAlias cxstatusline in EventJobStart")
 	}
 	if !hasJobFinish {
 		t.Error("missing EventJobFinish")
@@ -884,6 +899,12 @@ func TestCoordinator_ExecuteJob_WithMonitor(t *testing.T) {
 	}
 	if !hasTelemetry {
 		t.Error("missing EventTelemetry during step execution")
+	}
+	if !hasStepTelemetry {
+		t.Error("missing StepTelemetry with ActiveStepName='Run Build'")
+	}
+	if !hasTraceID {
+		t.Error("missing TraceID in step telemetry")
 	}
 	if !hasStepFinish {
 		t.Error("missing EventStepFinish")
@@ -1052,7 +1073,7 @@ func TestCoordinator_ExecuteJob_ProcessStartPIDAndJobEvents(t *testing.T) {
 		},
 	}
 
-	coord := NewCoordinator(mock, nil, filepath.Join(tmpDir, "work")).WithStepLogger(true)
+	coord := NewCoordinator(mock, nil, filepath.Join(tmpDir, "work")).WithStepLogger(true).WithRepoAlias("cxstatusline")
 	coord.SetMonitorServer(server)
 
 	// Wrap executeFunc to capture PID while process is running
@@ -2858,5 +2879,43 @@ func TestCoordinator_GitHubContextAndEnvSync(t *testing.T) {
 		if got := env[k]; got != expectedVal {
 			t.Errorf("expected env %q = %q, got %q", k, expectedVal, got)
 		}
+	}
+}
+
+func TestEvaluateExpression_CaseInsensitiveFunctions(t *testing.T) {
+	ctx := map[string]any{
+		"github": map[string]any{
+			"ref": "refs/HEADS/main",
+		},
+		"matrix": map[string]any{
+			"file": "REPORT.PDF",
+			"msg":  "Error: Failure in Job",
+		},
+	}
+
+	if got := evaluateExpression("startsWith(github.ref, 'refs/heads/')", ctx); got != "true" {
+		t.Errorf("expected startsWith to be 'true', got %q", got)
+	}
+	if got := evaluateExpression("endsWith(matrix.file, '.pdf')", ctx); got != "true" {
+		t.Errorf("expected endsWith to be 'true', got %q", got)
+	}
+	if got := evaluateExpression("contains(matrix.msg, 'failure')", ctx); got != "true" {
+		t.Errorf("expected contains to be 'true', got %q", got)
+	}
+}
+
+func TestShouldExecuteStep_BooleanLiterals(t *testing.T) {
+	ctx := map[string]any{}
+	if shouldExecuteStep("false", ctx, false, false) {
+		t.Error("expected shouldExecuteStep('false') to be false")
+	}
+	if shouldExecuteStep("False", ctx, false, false) {
+		t.Error("expected shouldExecuteStep('False') to be false")
+	}
+	if !shouldExecuteStep("true", ctx, false, false) {
+		t.Error("expected shouldExecuteStep('true') to be true")
+	}
+	if shouldExecuteStep("true", ctx, true, false) {
+		t.Error("expected shouldExecuteStep('true') with jobFailed to be false")
 	}
 }

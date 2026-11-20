@@ -1561,6 +1561,9 @@ func (m *DashboardModel) resolveJobRepoAlias(repoAlias, repo string) string {
 		}
 		return repo
 	}
+	if m.supervisorStatus != nil && len(m.supervisorStatus.RepoSlots) == 1 {
+		return m.supervisorStatus.RepoSlots[0].Alias
+	}
 	return "default"
 }
 

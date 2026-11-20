@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -38,20 +37,11 @@ func (ai *ActionInput) UnmarshalYAML(value *yaml.Node) error {
 	if v, ok := m["description"].(string); ok {
 		ai.Description = v
 	}
-	if def, ok := m["default"]; ok && def != nil {
-		switch d := def.(type) {
-		case string:
-			ai.Default = d
-		case bool:
-			ai.Default = strconv.FormatBool(d)
-		case int:
-			ai.Default = strconv.Itoa(d)
-		case int64:
-			ai.Default = strconv.FormatInt(d, 10)
-		case float64:
-			ai.Default = strconv.FormatFloat(d, 'f', -1, 64)
-		default:
-			ai.Default = fmt.Sprintf("%v", d)
+	// Extract default as literal text directly from yaml.Node to avoid float64 precision loss (e.g. 3.10 -> 3.1)
+	for i := 0; i < len(value.Content)-1; i += 2 {
+		if value.Content[i].Value == "default" {
+			ai.Default = value.Content[i+1].Value
+			break
 		}
 	}
 	if v, ok := m["deprecationMessage"].(string); ok {

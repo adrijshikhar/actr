@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,8 @@ import (
 	"github.com/adrijshikhar/actr/internal/driver"
 	"github.com/adrijshikhar/actr/internal/monitor"
 	"github.com/adrijshikhar/actr/internal/protocol"
+	"github.com/adrijshikhar/actr/internal/telemetry"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Coordinator orchestrates job execution across runner drivers,
@@ -41,6 +44,8 @@ type Coordinator struct {
 	sampler           *monitor.TelemetrySampler
 	repoURL           string
 	defaultRepo       string
+	repoAlias         string
+	tracer            *telemetry.Manager
 	actionResolver    action.Resolver
 	nodeDetector      action.NodeDetector
 	mu                sync.RWMutex
@@ -57,6 +62,7 @@ type PostStepHook struct {
 	Env        map[string]string
 	State      map[string]string
 	Inputs     map[string]string
+	Context    map[string]any
 }
 
 // NewCoordinator creates a new Coordinator with the provided driver, RunServiceClient, and base working directory.
@@ -64,6 +70,7 @@ func NewCoordinator(d driver.Driver, runClient *protocol.RunServiceClient, workD
 	if workDir == "" {
 		workDir = "_work"
 	}
+	tracer, _ := telemetry.NewManager(context.Background(), "actr")
 	return &Coordinator{
 		hostDriver:        d,
 		runClient:         runClient,
@@ -74,7 +81,30 @@ func NewCoordinator(d driver.Driver, runClient *protocol.RunServiceClient, workD
 		stderr:            os.Stderr,
 		stepLoggerEnabled: true,
 		colorEnabled:      os.Getenv("NO_COLOR") == "",
+		tracer:            tracer,
 	}
+}
+
+// WithRepoAlias configures the repository alias (e.g. from runner config) for this Coordinator.
+func (c *Coordinator) WithRepoAlias(alias string) *Coordinator {
+	c.repoAlias = alias
+	return c
+}
+
+// WithTracer overrides the OpenTelemetry tracer manager on the Coordinator.
+func (c *Coordinator) WithTracer(tm *telemetry.Manager) *Coordinator {
+	c.tracer = tm
+	return c
+}
+
+// Shutdown flushes and terminates the coordinator's telemetry tracer exporter.
+func (c *Coordinator) Shutdown(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tracer != nil {
+		return c.tracer.Shutdown(ctx)
+	}
+	return nil
 }
 
 // WithDockerDriver configures the driver used for container-based jobs.
@@ -216,9 +246,10 @@ func (c *Coordinator) NotifyStepStart(jobID, stepID, stepName string) {
 
 	if srv != nil {
 		srv.Publish(monitor.Event{
-			Type:   monitor.EventStepStart,
-			JobID:  jobID,
-			StepID: stepID,
+			Type:      monitor.EventStepStart,
+			JobID:     jobID,
+			RepoAlias: c.repoAlias,
+			StepID:    stepID,
 			Step: &monitor.StepInfo{
 				ID:        stepID,
 				Name:      stepName,
@@ -260,9 +291,10 @@ func (c *Coordinator) NotifyStepFinish(jobID, stepID, stepName string, status mo
 
 	if srv != nil {
 		srv.Publish(monitor.Event{
-			Type:   monitor.EventStepFinish,
-			JobID:  jobID,
-			StepID: stepID,
+			Type:      monitor.EventStepFinish,
+			JobID:     jobID,
+			RepoAlias: c.repoAlias,
+			StepID:    stepID,
 			Step: &monitor.StepInfo{
 				ID:       stepID,
 				Name:     stepName,
@@ -325,6 +357,40 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		jobDisplayName = jobID
 	}
 
+	var workflowName, repo, owner string
+	if job.Variables != nil {
+		workflowName = job.Variables["GITHUB_WORKFLOW"]
+		repo = job.Variables["GITHUB_REPOSITORY"]
+		owner = job.Variables["GITHUB_REPOSITORY_OWNER"]
+	}
+	if job.ContextData != nil {
+		if m, ok := parseContextData(job.ContextData).(map[string]any); ok {
+			if gh, ok := m["github"].(map[string]any); ok {
+				if workflowName == "" && gh["workflow"] != nil {
+					workflowName = fmt.Sprint(gh["workflow"])
+				}
+				if repo == "" && gh["repository"] != nil {
+					repo = fmt.Sprint(gh["repository"])
+				}
+				if owner == "" && gh["repository_owner"] != nil {
+					owner = fmt.Sprint(gh["repository_owner"])
+				}
+			}
+		}
+	}
+	if repo == "" {
+		repo = c.defaultRepo
+	}
+	if repo == "" {
+		repo = c.repoAlias
+	}
+
+	var jobSpan trace.Span
+	if c.tracer != nil {
+		ctx, jobSpan = c.tracer.StartJobSpan(ctx, jobID, workflowName, repo, owner)
+		defer jobSpan.End()
+	}
+
 	c.mu.RLock()
 	monSrv := c.monServer
 	c.mu.RUnlock()
@@ -333,6 +399,11 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		jobInfo := &monitor.JobInfo{
 			ID:        jobID,
 			Name:      jobDisplayName,
+			Workflow:  workflowName,
+			Repo:      repo,
+			RepoAlias: c.repoAlias,
+			RepoURL:   c.repoURL,
+			Owner:     owner,
 			Status:    monitor.StatusRunning,
 			StartedAt: time.Now(),
 			Steps:     make([]*monitor.StepInfo, 0, len(job.Steps)),
@@ -345,21 +416,16 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 				Status: monitor.StatusQueued,
 			})
 		}
-		if job.Variables != nil {
-			if wf, ok := job.Variables["GITHUB_WORKFLOW"]; ok {
-				jobInfo.Workflow = wf
-			}
-			if repo, ok := job.Variables["GITHUB_REPOSITORY"]; ok {
-				jobInfo.Repo = repo
-			}
-			if owner, ok := job.Variables["GITHUB_REPOSITORY_OWNER"]; ok {
-				jobInfo.Owner = owner
-			}
+		driverName := "host"
+		if job.Container != nil {
+			driverName = "docker"
 		}
 		monSrv.Publish(monitor.Event{
-			Type:  monitor.EventJobStart,
-			JobID: jobID,
-			Job:   jobInfo,
+			Type:      monitor.EventJobStart,
+			JobID:     jobID,
+			RepoAlias: c.repoAlias,
+			Job:       jobInfo,
+			Driver:    driverName,
 		})
 	}
 
@@ -373,14 +439,25 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			if conclusion != "success" {
 				finalStatus = monitor.StatusFailed
 			}
+			driverName := "host"
+			if job.Container != nil {
+				driverName = "docker"
+			}
 			s.Publish(monitor.Event{
-				Type:  monitor.EventJobFinish,
-				JobID: jobID,
+				Type:      monitor.EventJobFinish,
+				JobID:     jobID,
+				RepoAlias: c.repoAlias,
+				Driver:    driverName,
 				Job: &monitor.JobInfo{
-					ID:      jobID,
-					Name:    jobDisplayName,
-					Status:  finalStatus,
-					EndedAt: time.Now(),
+					ID:        jobID,
+					Name:      jobDisplayName,
+					Workflow:  workflowName,
+					Repo:      repo,
+					RepoAlias: c.repoAlias,
+					RepoURL:   c.repoURL,
+					Owner:     owner,
+					Status:    finalStatus,
+					EndedAt:   time.Now(),
 				},
 			})
 		}
@@ -551,24 +628,6 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	if cumulativeEnv["ACTIONS_CACHE_URL"] == "" && cumulativeEnv["ACTIONS_RUNTIME_URL"] != "" {
 		cumulativeEnv["ACTIONS_CACHE_URL"] = cumulativeEnv["ACTIONS_RUNTIME_URL"]
 	}
-	if cumulativeEnv["ACTIONS_RESULTS_URL"] == "" {
-		serverURL := cumulativeEnv["GITHUB_SERVER_URL"]
-		if serverURL == "" || serverURL == "https://github.com" {
-			cumulativeEnv["ACTIONS_RESULTS_URL"] = "https://results-receiver.actions.githubusercontent.com/"
-		} else if cumulativeEnv["ACTIONS_RUNTIME_URL"] != "" {
-			cumulativeEnv["ACTIONS_RESULTS_URL"] = cumulativeEnv["ACTIONS_RUNTIME_URL"]
-		}
-	}
-	if cumulativeEnv["GITHUB_SERVER_URL"] == "" {
-		cumulativeEnv["GITHUB_SERVER_URL"] = "https://github.com"
-	}
-	if cumulativeEnv["GITHUB_API_URL"] == "" {
-		cumulativeEnv["GITHUB_API_URL"] = "https://api.github.com"
-	}
-	if cumulativeEnv["GITHUB_GRAPHQL_URL"] == "" {
-		cumulativeEnv["GITHUB_GRAPHQL_URL"] = "https://api.github.com/graphql"
-	}
-
 	var parsedContext map[string]any
 	if job.ContextData != nil {
 		if m, ok := parseContextData(job.ContextData).(map[string]any); ok {
@@ -612,6 +671,34 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		}
 		if cumulativeEnv[pair.envKey] == "" && ghCtx[pair.ctxKey] != nil {
 			cumulativeEnv[pair.envKey] = fmt.Sprint(ghCtx[pair.ctxKey])
+		}
+	}
+
+	if cumulativeEnv["GITHUB_SERVER_URL"] == "" {
+		cumulativeEnv["GITHUB_SERVER_URL"] = "https://github.com"
+	}
+	if cumulativeEnv["GITHUB_API_URL"] == "" {
+		cumulativeEnv["GITHUB_API_URL"] = "https://api.github.com"
+	}
+	if cumulativeEnv["GITHUB_GRAPHQL_URL"] == "" {
+		cumulativeEnv["GITHUB_GRAPHQL_URL"] = "https://api.github.com/graphql"
+	}
+	if ghCtx["server_url"] == nil {
+		ghCtx["server_url"] = cumulativeEnv["GITHUB_SERVER_URL"]
+	}
+	if ghCtx["api_url"] == nil {
+		ghCtx["api_url"] = cumulativeEnv["GITHUB_API_URL"]
+	}
+	if ghCtx["graphql_url"] == nil {
+		ghCtx["graphql_url"] = cumulativeEnv["GITHUB_GRAPHQL_URL"]
+	}
+
+	if cumulativeEnv["ACTIONS_RESULTS_URL"] == "" {
+		serverURL := cumulativeEnv["GITHUB_SERVER_URL"]
+		if serverURL == "" || serverURL == "https://github.com" {
+			cumulativeEnv["ACTIONS_RESULTS_URL"] = "https://results-receiver.actions.githubusercontent.com/"
+		} else if cumulativeEnv["ACTIONS_RUNTIME_URL"] != "" {
+			cumulativeEnv["ACTIONS_RESULTS_URL"] = cumulativeEnv["ACTIONS_RUNTIME_URL"]
 		}
 	}
 	runnerName := c.runnerName
@@ -666,13 +753,12 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 
 	if job.Environment != nil {
 		for k, v := range job.Environment {
-			cumulativeEnv[k] = evaluateExpression(v, parsedContext)
+			cumulativeEnv[k] = evaluateValue(v, parsedContext)
 		}
 	}
 	parsedContext["env"] = cumulativeEnv
 
-	workflowName := ""
-	if job.Variables != nil {
+	if workflowName == "" && job.Variables != nil {
 		workflowName = job.Variables["GITHUB_WORKFLOW"]
 	}
 	jobCtx := &driver.JobContext{
@@ -748,7 +834,8 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	// Defer post-hooks teardown (LIFO) so that action cleanups run even on step setup failure or cancel
 	defer func() {
 		if len(postHooks) > 0 {
-			if postErr := c.executePostHooks(ctx, jobID, postHooks, stepLogger, jobMasker); postErr != nil {
+			jobFailed := conclusion != "success"
+			if postErr := c.executePostHooks(ctx, jobID, postHooks, stepLogger, jobMasker, jobFailed); postErr != nil {
 				if conclusion == "success" {
 					conclusion = "failure"
 				}
@@ -846,11 +933,20 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		statePath := stateFile.Name()
 		_ = stateFile.Close()
 
+		stepCtx := ctx
+		var stepCancel context.CancelFunc
+		if jobCancelled || ctx.Err() != nil {
+			stepCtx, stepCancel = context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
+		}
+
 		cleanupStepFiles := func() {
 			_ = os.Remove(envPath)
 			_ = os.Remove(outputPath)
 			_ = os.Remove(pathFilePath)
 			_ = os.Remove(statePath)
+			if stepCancel != nil {
+				stepCancel()
+			}
 		}
 
 		// Build step environment: cumulative environment + step-specific overrides + command files
@@ -859,7 +955,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			stepEnv[k] = v
 		}
 		for k, v := range step.Environment {
-			stepEnv[k] = evaluateExpression(v, parsedContext)
+			stepEnv[k] = evaluateValue(v, parsedContext)
 		}
 		stepEnv["GITHUB_ENV"] = envPath
 		stepEnv["GITHUB_OUTPUT"] = outputPath
@@ -893,7 +989,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		if step.Inputs != nil {
 			evaluatedInputs = make(map[string]string, len(step.Inputs))
 			for k, v := range step.Inputs {
-				evaluatedInputs[k] = evaluateExpression(v, parsedContext)
+				evaluatedInputs[k] = evaluateValue(v, parsedContext)
 			}
 		}
 
@@ -912,8 +1008,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 				OutputFilePath: outputPath,
 				Context:        parsedContext,
 			}
-			c.NotifyJobStepLog(jobID, stepID, fmt.Sprintf("::debug::Inputs for %s: %+v | Evaluated: %+v", stepDisplayName, step.Inputs, evaluatedInputs))
-			res, _, stepErr = c.executeActionStep(ctx, jobID, stepID, stepDisplayName, ref, actCtx, stepLogger, jobMasker)
+			res, _, stepErr = c.executeActionStep(stepCtx, jobID, stepID, stepDisplayName, ref, actCtx, stepLogger, jobMasker)
 
 			// Ingest state file and queue post-step hook if manifest defines runs.post
 			stepState, _ := IngestStateFile(statePath)
@@ -935,6 +1030,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 					Env:        hookEnv,
 					State:      stepState,
 					Inputs:     evaluatedInputs,
+					Context:    parsedContext,
 				})
 			}
 		} else {
@@ -954,10 +1050,10 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 				Script:           stepScript,
 			}
 
-			res, _, stepErr = c.executeStep(ctx, d, jobID, spec, stepLogger, stepDisplayName, jobMasker)
+			res, _, stepErr = c.executeStep(stepCtx, d, jobID, spec, stepLogger, stepDisplayName, jobMasker)
 		}
 
-		if ctx.Err() != nil {
+		if stepCtx.Err() != nil {
 			exitCode := 1
 			if res != nil && res.ExitCode != 0 {
 				exitCode = res.ExitCode
@@ -985,7 +1081,9 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			})
 			cleanupStepFiles()
 			jobFailed = true
-			conclusion = "failure"
+			if conclusion == "success" {
+				conclusion = "failure"
+			}
 			continue
 		}
 
@@ -999,7 +1097,9 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			})
 			cleanupStepFiles()
 			jobFailed = true
-			conclusion = "failure"
+			if conclusion == "success" {
+				conclusion = "failure"
+			}
 			continue
 		}
 
@@ -1013,7 +1113,9 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			})
 			cleanupStepFiles()
 			jobFailed = true
-			conclusion = "failure"
+			if conclusion == "success" {
+				conclusion = "failure"
+			}
 			continue
 		}
 		stepOutputsMap := make(map[string]any)
@@ -1048,7 +1150,9 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			})
 			cleanupStepFiles()
 			jobFailed = true
-			conclusion = "failure"
+			if conclusion == "success" {
+				conclusion = "failure"
+			}
 			continue
 		}
 		cumulativeEnv[pathKey] = updatedPath
@@ -1108,6 +1212,11 @@ func (c *Coordinator) executeActionStep(ctx context.Context, jobID, stepID, step
 		scriptDesc = fmt.Sprintf("uses: %s@%s", ref.Name, ref.Version)
 	}
 	return c.executeWithStreams(ctx, jobID, stepID, stepDisplayName, scriptDesc, stepLogger, jobMasker, func(stdout, stderr io.Writer) (*driver.StepResult, error) {
+		if actCtx == nil {
+			err := errors.New("action context is nil")
+			_, _ = fmt.Fprintf(stderr, "Error: %v\n", err)
+			return &driver.StepResult{ExitCode: 1, Error: err}, err
+		}
 		if ref == nil || strings.TrimSpace(ref.Name) == "" {
 			err := errors.New("action step is missing reference")
 			_, _ = fmt.Fprintf(stderr, "Error: %v\n", err)
@@ -1146,7 +1255,7 @@ func (c *Coordinator) executeActionStep(ctx context.Context, jobID, stepID, step
 			return &driver.StepResult{ExitCode: 1, Error: err}, err
 		}
 		actCtx.ActionDir = actionDir
-		if manifest.Inputs != nil && actCtx != nil && actCtx.Context != nil {
+		if manifest.Inputs != nil && actCtx.Context != nil {
 			for name, inputDef := range manifest.Inputs {
 				if strings.Contains(inputDef.Default, "${{") {
 					inputDef.Default = evaluateExpression(inputDef.Default, actCtx.Context)
@@ -1226,6 +1335,22 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 		stepErrStream = io.MultiWriter(stderr, stepErrWriter)
 	}
 
+	stepStartTime := time.Now()
+	var stepSpan trace.Span
+	traceID := ""
+	spanID := ""
+	if c.tracer != nil {
+		ctx, stepSpan = c.tracer.StartStepSpan(ctx, stepID, stepDisplayName)
+		defer stepSpan.End()
+		if sc := stepSpan.SpanContext(); sc.IsValid() {
+			traceID = sc.TraceID().String()
+			spanID = sc.SpanID().String()
+		}
+	}
+	if sampler != nil {
+		sampler.SetTraceContext(traceID, spanID, stepDisplayName, stepStartTime)
+	}
+
 	// Start 500ms ticker to sample telemetry when process starts
 	if monSrv != nil && sampler != nil {
 		stopTelemetry := make(chan struct{})
@@ -1264,6 +1389,7 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 		c.mu.RUnlock()
 		if s != nil {
 			s.SetTargetPID(0, 0)
+			s.SetTraceContext("", "", "", time.Time{})
 			if monSrv != nil {
 				if smp := s.Sample(); smp != nil {
 					monSrv.SetTelemetry(smp)
@@ -1449,15 +1575,26 @@ if [ -z "$TARGET_REF" ]; then
 fi
 
 if [ -n "$TARGET_REF" ]; then
+    case "$TARGET_REF" in
+        -*)
+            echo "Error: invalid ref format: $TARGET_REF" >&2
+            exit 1
+            ;;
+    esac
     CLEAN_REF="${TARGET_REF#refs/heads/}"
-    git checkout -f "$CLEAN_REF" 2>/dev/null || \
-    git checkout -f "$TARGET_REF" 2>/dev/null || (
-        git fetch --depth=1 "$CLONE_URL" "$TARGET_REF" 2>/dev/null || git fetch "$CLONE_URL"
-        git checkout -f "$CLEAN_REF" 2>/dev/null || \
-        git checkout -f "$TARGET_REF" 2>/dev/null || \
-        git checkout -f -B "$CLEAN_REF" "origin/$CLEAN_REF" 2>/dev/null || \
-        git checkout -f FETCH_HEAD 2>/dev/null || \
-        git checkout -f -- "$TARGET_REF"
+    git checkout -f -- "$CLEAN_REF" 2>/dev/null || \
+    git checkout -f -- "$TARGET_REF" 2>/dev/null || (
+        if git fetch --depth=1 "$CLONE_URL" "$TARGET_REF" 2>/dev/null; then
+            git checkout -f FETCH_HEAD 2>/dev/null || \
+            git checkout -f -- "$CLEAN_REF" 2>/dev/null || \
+            git checkout -f -- "$TARGET_REF"
+        else
+            git fetch "$CLONE_URL"
+            git checkout -f -- "$CLEAN_REF" 2>/dev/null || \
+            git checkout -f -- "$TARGET_REF" 2>/dev/null || \
+            git checkout -f -B "$CLEAN_REF" "origin/$CLEAN_REF" 2>/dev/null || \
+            git checkout -f -- "$TARGET_REF"
+        fi
     )
 fi
 `
@@ -1501,15 +1638,43 @@ func lookupContext(path string, ctx map[string]any) (any, bool) {
 	parts := strings.Split(path, ".")
 	var current any = ctx
 	for _, part := range parts {
-		m, ok := current.(map[string]any)
-		if !ok {
-			return nil, false
+		if m, ok := current.(map[string]any); ok {
+			val, exists := m[part]
+			if !exists {
+				found := false
+				for k, v := range m {
+					if strings.EqualFold(k, part) {
+						val = v
+						found = true
+						break
+					}
+				}
+				if !found {
+					return nil, false
+				}
+			}
+			current = val
+			continue
 		}
-		val, exists := m[part]
-		if !exists {
-			return nil, false
+		if sm, ok := current.(map[string]string); ok {
+			val, exists := sm[part]
+			if !exists {
+				found := false
+				for k, v := range sm {
+					if strings.EqualFold(k, part) {
+						val = v
+						found = true
+						break
+					}
+				}
+				if !found {
+					return nil, false
+				}
+			}
+			current = val
+			continue
 		}
-		current = val
+		return nil, false
 	}
 	return current, true
 }
@@ -1618,20 +1783,42 @@ func isContextPath(s string) bool {
 	return false
 }
 
+func containsStatusCheckFunction(s string) bool {
+	lower := strings.ToLower(s)
+	return strings.Contains(lower, "success()") ||
+		strings.Contains(lower, "always()") ||
+		strings.Contains(lower, "failure()") ||
+		strings.Contains(lower, "cancelled()")
+}
+
 // shouldExecuteStep determines whether a job step should execute based on its condition.
 func shouldExecuteStep(cond string, ctx map[string]any, jobFailed, jobCancelled bool) bool {
 	trimmed := strings.TrimSpace(cond)
+	if strings.EqualFold(trimmed, "false") {
+		return false
+	}
+	if strings.EqualFold(trimmed, "true") {
+		return !jobFailed && !jobCancelled
+	}
 	if trimmed == "" || strings.EqualFold(trimmed, "success()") {
 		return !jobFailed && !jobCancelled
 	}
 	if strings.EqualFold(trimmed, "always()") {
-		return !jobCancelled
+		return true
 	}
 	if strings.EqualFold(trimmed, "failure()") {
 		return jobFailed && !jobCancelled
 	}
 	if strings.EqualFold(trimmed, "cancelled()") {
 		return jobCancelled
+	}
+
+	// When the condition names none of success(), always(), failure(), or cancelled(),
+	// GitHub Actions implicitly requires !jobFailed && !jobCancelled.
+	if !containsStatusCheckFunction(trimmed) {
+		if jobFailed || jobCancelled {
+			return false
+		}
 	}
 
 	evalCtx := make(map[string]any, len(ctx)+4)
@@ -1645,42 +1832,163 @@ func shouldExecuteStep(cond string, ctx map[string]any, jobFailed, jobCancelled 
 	return isTruthy(res)
 }
 
+func evaluateValue(val string, ctx map[string]any) string {
+	trimmed := strings.TrimSpace(val)
+	if strings.Contains(trimmed, "${{") || strings.HasPrefix(trimmed, "format(") {
+		return evaluateExpression(trimmed, ctx)
+	}
+	return val
+}
+
+func formatTemplate(templateStr string, argVals []string) string {
+	var sb strings.Builder
+	for i := 0; i < len(templateStr); {
+		if templateStr[i] == '{' {
+			if i+1 < len(templateStr) && templateStr[i+1] == '{' {
+				sb.WriteByte('{')
+				i += 2
+				continue
+			}
+			closeIdx := strings.IndexByte(templateStr[i+1:], '}')
+			if closeIdx != -1 {
+				numStr := templateStr[i+1 : i+1+closeIdx]
+				if idx, err := strconv.Atoi(numStr); err == nil && idx >= 0 && idx < len(argVals) {
+					sb.WriteString(argVals[idx])
+					i += 1 + closeIdx + 1
+					continue
+				}
+			}
+			sb.WriteByte('{')
+			i++
+			continue
+		}
+		if templateStr[i] == '}' {
+			if i+1 < len(templateStr) && templateStr[i+1] == '}' {
+				sb.WriteByte('}')
+				i += 2
+				continue
+			}
+			sb.WriteByte('}')
+			i++
+			continue
+		}
+		sb.WriteByte(templateStr[i])
+		i++
+	}
+	return sb.String()
+}
+
+func findMatchingExpressionEnd(s string) int {
+	inQuotes := false
+	for i := 0; i < len(s)-1; i++ {
+		if s[i] == '\'' {
+			if inQuotes && i+1 < len(s) && s[i+1] == '\'' {
+				i++
+				continue
+			}
+			inQuotes = !inQuotes
+			continue
+		}
+		if !inQuotes && s[i] == '}' && s[i+1] == '}' {
+			return i
+		}
+	}
+	return -1
+}
+
+func isSingleQuotedLiteral(s string) bool {
+	if !strings.HasPrefix(s, "'") || !strings.HasSuffix(s, "'") || len(s) < 2 {
+		return false
+	}
+	i := 1
+	for i < len(s) {
+		if s[i] == '\'' {
+			if i+1 < len(s) && s[i+1] == '\'' {
+				// Escaped quote: ''
+				i += 2
+				continue
+			}
+			return i == len(s)-1
+		}
+		i++
+	}
+	return false
+}
+
 func evaluateExpression(expr string, ctx map[string]any) string {
 	trimmed := strings.TrimSpace(expr)
 	if trimmed == "" {
 		return ""
 	}
 
-	// Check if this string contains embedded ${{ ... }} expressions with text before or after, or multiple expressions
-	if strings.Contains(trimmed, "${{") && strings.Contains(trimmed, "}}") {
-		startIdx := strings.Index(trimmed, "${{")
-		endIdx := strings.Index(trimmed, "}}")
-		if startIdx != 0 || endIdx != len(trimmed)-2 || strings.Count(trimmed, "${{") != 1 {
-			var sb strings.Builder
-			remaining := trimmed
-			for {
-				s := strings.Index(remaining, "${{")
-				if s == -1 {
-					sb.WriteString(remaining)
-					break
-				}
-				e := strings.Index(remaining, "}}")
-				if e == -1 || e < s {
-					sb.WriteString(remaining)
-					break
-				}
-				sb.WriteString(remaining[:s])
-				inner := strings.TrimSpace(remaining[s+len("${{") : e])
-				sb.WriteString(evaluateExpression(inner, ctx))
-				remaining = remaining[e+len("}}"):]
+	// String literals: 'foo'
+	if isSingleQuotedLiteral(trimmed) {
+		unquoted := trimmed[1 : len(trimmed)-1]
+		return strings.ReplaceAll(unquoted, "''", "'")
+	}
+
+	// Handle format('template', arg0, arg1, ...) before embedded expression evaluation
+	if strings.HasPrefix(trimmed, "format(") && strings.HasSuffix(trimmed, ")") {
+		inner := strings.TrimSpace(trimmed[7 : len(trimmed)-1])
+		args := parseExpressionArgs(inner)
+		if len(args) > 0 {
+			templateStr := evaluateExpression(args[0], ctx)
+			var argVals []string
+			for i := 1; i < len(args); i++ {
+				argVals = append(argVals, evaluateExpression(args[i], ctx))
 			}
-			return sb.String()
+			return formatTemplate(templateStr, argVals)
 		}
 	}
 
-	// Strip ${{ ... }} wrappers if present
+	// Strip outer ${{ ... }} wrappers if present across the entire expression
 	if strings.HasPrefix(trimmed, "${{") && strings.HasSuffix(trimmed, "}}") {
-		trimmed = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(trimmed, "${{"), "}}"))
+		endIdx := findMatchingExpressionEnd(trimmed[3:])
+		if endIdx != -1 && endIdx == len(trimmed[3:])-2 {
+			trimmed = strings.TrimSpace(trimmed[3 : len(trimmed)-2])
+		}
+	}
+
+	// Re-check format(...) in case it was wrapped in ${{ format(...) }}
+	if strings.HasPrefix(trimmed, "format(") && strings.HasSuffix(trimmed, ")") {
+		inner := strings.TrimSpace(trimmed[7 : len(trimmed)-1])
+		args := parseExpressionArgs(inner)
+		if len(args) > 0 {
+			templateStr := evaluateExpression(args[0], ctx)
+			var argVals []string
+			for i := 1; i < len(args); i++ {
+				argVals = append(argVals, evaluateExpression(args[i], ctx))
+			}
+			return formatTemplate(templateStr, argVals)
+		}
+	}
+
+	// Check if this string contains embedded ${{ ... }} expressions with text before or after, or multiple expressions
+	if strings.Contains(trimmed, "${{") && strings.Contains(trimmed, "}}") {
+		var sb strings.Builder
+		remaining := trimmed
+		hasEmbedded := false
+		for {
+			s := strings.Index(remaining, "${{")
+			if s == -1 {
+				sb.WriteString(remaining)
+				break
+			}
+			eRel := findMatchingExpressionEnd(remaining[s+len("${{"):])
+			if eRel == -1 {
+				sb.WriteString(remaining)
+				break
+			}
+			hasEmbedded = true
+			e := s + len("${{") + eRel
+			sb.WriteString(remaining[:s])
+			inner := strings.TrimSpace(remaining[s+len("${{") : e])
+			sb.WriteString(evaluateExpression(inner, ctx))
+			remaining = remaining[e+len("}}"):]
+		}
+		if hasEmbedded {
+			return sb.String()
+		}
 	}
 
 	// Trim outer matching parentheses: (expr)
@@ -1715,11 +2023,7 @@ func evaluateExpression(expr string, ctx map[string]any) string {
 		return "false"
 	}
 	if strings.EqualFold(trimmed, "always()") {
-		cancelled, _ := ctx["_job_cancelled"].(bool)
-		if !cancelled {
-			return "true"
-		}
-		return "false"
+		return "true"
 	}
 	if strings.EqualFold(trimmed, "failure()") {
 		failed, _ := ctx["_job_failed"].(bool)
@@ -1789,29 +2093,13 @@ func evaluateExpression(expr string, ctx map[string]any) string {
 		return "true"
 	}
 
-	// Handle format('template', arg0, arg1, ...)
-	if strings.HasPrefix(trimmed, "format(") && strings.HasSuffix(trimmed, ")") {
-		inner := strings.TrimSpace(trimmed[7 : len(trimmed)-1])
-		args := parseExpressionArgs(inner)
-		if len(args) > 0 {
-			templateStr := evaluateExpression(args[0], ctx)
-			formatted := templateStr
-			for i := 1; i < len(args); i++ {
-				placeholder := fmt.Sprintf("{%d}", i-1)
-				val := evaluateExpression(args[i], ctx)
-				formatted = strings.ReplaceAll(formatted, placeholder, val)
-			}
-			return formatted
-		}
-	}
-
-	// Handle startsWith(searchString, prefix)
+	// Handle startsWith(searchString, prefix) - case-insensitive per GitHub Actions specification
 	if strings.HasPrefix(trimmed, "startsWith(") && strings.HasSuffix(trimmed, ")") {
 		inner := strings.TrimSpace(trimmed[11 : len(trimmed)-1])
 		args := parseExpressionArgs(inner)
 		if len(args) >= 2 {
-			str := evaluateExpression(args[0], ctx)
-			prefix := evaluateExpression(args[1], ctx)
+			str := strings.ToLower(evaluateExpression(args[0], ctx))
+			prefix := strings.ToLower(evaluateExpression(args[1], ctx))
 			if strings.HasPrefix(str, prefix) {
 				return "true"
 			}
@@ -1819,13 +2107,13 @@ func evaluateExpression(expr string, ctx map[string]any) string {
 		}
 	}
 
-	// Handle endsWith(searchString, suffix)
+	// Handle endsWith(searchString, suffix) - case-insensitive per GitHub Actions specification
 	if strings.HasPrefix(trimmed, "endsWith(") && strings.HasSuffix(trimmed, ")") {
 		inner := strings.TrimSpace(trimmed[9 : len(trimmed)-1])
 		args := parseExpressionArgs(inner)
 		if len(args) >= 2 {
-			str := evaluateExpression(args[0], ctx)
-			suffix := evaluateExpression(args[1], ctx)
+			str := strings.ToLower(evaluateExpression(args[0], ctx))
+			suffix := strings.ToLower(evaluateExpression(args[1], ctx))
 			if strings.HasSuffix(str, suffix) {
 				return "true"
 			}
@@ -1833,13 +2121,13 @@ func evaluateExpression(expr string, ctx map[string]any) string {
 		}
 	}
 
-	// Handle contains(searchString, item)
+	// Handle contains(searchString, item) - case-insensitive per GitHub Actions specification
 	if strings.HasPrefix(trimmed, "contains(") && strings.HasSuffix(trimmed, ")") {
 		inner := strings.TrimSpace(trimmed[9 : len(trimmed)-1])
 		args := parseExpressionArgs(inner)
 		if len(args) >= 2 {
-			str := evaluateExpression(args[0], ctx)
-			item := evaluateExpression(args[1], ctx)
+			str := strings.ToLower(evaluateExpression(args[0], ctx))
+			item := strings.ToLower(evaluateExpression(args[1], ctx))
 			if strings.Contains(str, item) {
 				return "true"
 			}
@@ -2053,12 +2341,12 @@ func IngestStateFile(filePath string) (map[string]string, error) {
 
 // ExecutePostHooks executes post-step hooks in reverse order (LIFO) with a decoupled context.
 func (c *Coordinator) ExecutePostHooks(ctx context.Context, jobID string, postHooks []PostStepHook) error {
-	return c.executePostHooks(ctx, jobID, postHooks, nil, nil)
+	return c.executePostHooks(ctx, jobID, postHooks, nil, nil, false)
 }
 
 // executePostHooks executes all queued post-step hooks in reverse order (LIFO).
 // It decouples from the job context using context.WithoutCancel with a 5-minute timeout.
-func (c *Coordinator) executePostHooks(ctx context.Context, jobID string, postHooks []PostStepHook, stepLogger *StepLogger, jobMasker *SecretMasker) error {
+func (c *Coordinator) executePostHooks(ctx context.Context, jobID string, postHooks []PostStepHook, stepLogger *StepLogger, jobMasker *SecretMasker, jobFailed bool) error {
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
 	defer postCancel()
 
@@ -2072,10 +2360,26 @@ func (c *Coordinator) executePostHooks(ctx context.Context, jobID string, postHo
 	var firstErr error
 	for i := len(postHooks) - 1; i >= 0; i-- {
 		hook := postHooks[i]
-		if strings.TrimSpace(hook.PostIf) == "success()" && hook.StepFailed {
-			continue
+		hookCtx := make(map[string]any, len(hook.Context)+4)
+		for k, v := range hook.Context {
+			hookCtx[k] = v
 		}
-		if strings.TrimSpace(hook.PostIf) == "failure()" && !hook.StepFailed {
+		if hook.Inputs != nil {
+			hookCtx["inputs"] = hook.Inputs
+		}
+		if hook.Env != nil {
+			hookCtx["env"] = hook.Env
+		}
+		if hook.State != nil {
+			hookCtx["state"] = hook.State
+		}
+
+		cond := strings.TrimSpace(hook.PostIf)
+		if cond == "" {
+			cond = "always()"
+		}
+		jobCancelled := ctx.Err() != nil
+		if !shouldExecuteStep(cond, hookCtx, jobFailed, jobCancelled) {
 			continue
 		}
 		if err := c.executeSinglePostHook(postCtx, jobID, hook, nodePath, stepLogger, jobMasker); err != nil {
@@ -2143,6 +2447,14 @@ func (c *Coordinator) executeSinglePostHook(ctx context.Context, jobID string, h
 
 	if hook.ActionDir != "" {
 		if manifest, err := action.ParseManifestFile(hook.ActionDir); err == nil {
+			if manifest.Inputs != nil && hook.Context != nil {
+				for name, inputDef := range manifest.Inputs {
+					if strings.Contains(inputDef.Default, "${{") {
+						inputDef.Default = evaluateExpression(inputDef.Default, hook.Context)
+						manifest.Inputs[name] = inputDef
+					}
+				}
+			}
 			actCtx.Manifest = manifest
 		}
 	}

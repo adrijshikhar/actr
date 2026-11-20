@@ -1206,3 +1206,156 @@ func TestParseAcquiredJob_StepConditions(t *testing.T) {
 	assert.Equal(t, "runner.os == 'macOS' && startsWith(matrix.platform, 'linux-')", job.Steps[1].Condition)
 	assert.Equal(t, "success()", job.Steps[2].Condition)
 }
+
+func TestParseAcquiredJob_NullEnvironmentEntry(t *testing.T) {
+	rawJSON := `{
+		"jobId": "job-null-env-test",
+		"environmentVariables": [
+			{"key": "FOO", "value": null},
+			{"key": "BAR", "value": "baz"}
+		],
+		"steps": []
+	}`
+
+	job, err := protocol.ParseAcquiredJob([]byte(rawJSON))
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	assert.Equal(t, "", job.Environment["FOO"])
+	assert.Equal(t, "baz", job.Environment["BAR"])
+	_, hasKey := job.Environment["key"]
+	_, hasVal := job.Environment["value"]
+	assert.False(t, hasKey, "environment should not contain bogus 'key'")
+	assert.False(t, hasVal, "environment should not contain bogus 'value'")
+}
+
+func TestParseAcquiredJob_EmptyContainerDoesNotSetImage(t *testing.T) {
+	rawJSON := `{
+		"jobId": "job-empty-container-test",
+		"container": {},
+		"steps": []
+	}`
+
+	job, err := protocol.ParseAcquiredJob([]byte(rawJSON))
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	if job.Container != nil {
+		assert.Empty(t, job.Container.Image, "container image should not be '{}'")
+	}
+}
+
+func TestJobSpecification_JSONRoundTrip(t *testing.T) {
+	orig := protocol.JobSpecification{
+		JobID:   "job-roundtrip",
+		JobName: "Test Job",
+		PlanID:  "plan-1",
+		Environment: map[string]string{
+			"VAR1": "val1",
+		},
+		Endpoints: []protocol.ServiceEndpoint{
+			{
+				Name: "TestEndpoint",
+				Type: "OAuth",
+				URL:  "https://example.com",
+				Authorization: &protocol.EndpointAuthorization{
+					Scheme:     "Bearer",
+					Parameters: map[string]string{"token": "secret"},
+				},
+			},
+		},
+	}
+
+	data, err := json.Marshal(orig)
+	require.NoError(t, err)
+
+	var restored protocol.JobSpecification
+	err = json.Unmarshal(data, &restored)
+	require.NoError(t, err)
+
+	assert.Equal(t, orig.JobID, restored.JobID)
+	assert.Equal(t, orig.Environment["VAR1"], restored.Environment["VAR1"])
+	require.Len(t, restored.Endpoints, 1)
+	assert.Equal(t, orig.Endpoints[0].Name, restored.Endpoints[0].Name)
+	assert.Equal(t, orig.Endpoints[0].Authorization.Parameters["token"], restored.Endpoints[0].Authorization.Parameters["token"])
+}
+
+func TestParseAcquiredJob_TopLevelEndpoints_ASTData(t *testing.T) {
+	wireJSON := `{
+		"jobId": "job-top-ep",
+		"endpoints": [
+			{
+				"name": "TopEP",
+				"type": "Custom",
+				"url": "https://custom.endpoint.com",
+				"data": {
+					"key1": {"lit": "literal-val"},
+					"key2": "plain-val"
+				}
+			}
+		]
+	}`
+
+	var job protocol.JobSpecification
+	err := json.Unmarshal([]byte(wireJSON), &job)
+	require.NoError(t, err)
+	require.Len(t, job.Endpoints, 1)
+	assert.Equal(t, "TopEP", job.Endpoints[0].Name)
+	assert.Equal(t, "literal-val", job.Endpoints[0].Data["key1"])
+	assert.Equal(t, "plain-val", job.Endpoints[0].Data["key2"])
+}
+
+func TestParseAcquiredJob_BooleanConditions(t *testing.T) {
+	wireJSON := `{
+		"jobId": "job-bool-cond",
+		"steps": [
+			{
+				"id": "step-false",
+				"condition": false
+			},
+			{
+				"id": "step-true",
+				"if": true
+			}
+		]
+	}`
+
+	var job protocol.JobSpecification
+	err := json.Unmarshal([]byte(wireJSON), &job)
+	require.NoError(t, err)
+	require.Len(t, job.Steps, 2)
+	assert.Equal(t, "false", job.Steps[0].Condition)
+	assert.Equal(t, "true", job.Steps[1].Condition)
+}
+
+func TestParseAcquiredJob_EndpointsDeduplication(t *testing.T) {
+	wireJSON := `{
+		"jobId": "job-dedup-ep",
+		"endpoints": [
+			{
+				"name": "SharedEP",
+				"type": "Custom",
+				"url": "https://custom.endpoint.com"
+			}
+		],
+		"resources": {
+			"endpoints": [
+				{
+					"name": "SharedEP",
+					"type": "Custom",
+					"url": "https://custom.endpoint.com"
+				},
+				{
+					"name": "OtherEP",
+					"type": "Custom",
+					"url": "https://other.endpoint.com"
+				}
+			]
+		}
+	}`
+
+	var job protocol.JobSpecification
+	err := json.Unmarshal([]byte(wireJSON), &job)
+	require.NoError(t, err)
+	require.Len(t, job.Endpoints, 2)
+	assert.Equal(t, "SharedEP", job.Endpoints[0].Name)
+	assert.Equal(t, "OtherEP", job.Endpoints[1].Name)
+}
