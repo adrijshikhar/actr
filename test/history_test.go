@@ -206,6 +206,15 @@ func TestHistory_EngineLifecycle_EndToEnd(t *testing.T) {
 
 	assert.Contains(t, view, "◉ OFFLINE (HISTORY)")
 	assert.Contains(t, view, "HISTORICAL RUNS")
+	histNode := dash.Tree().FindNode("historical-runs")
+	require.NotNil(t, histNode)
+	assert.False(t, histNode.Expanded, "historical runs should be collapsed by default")
+	histNode.Expanded = true
+	for _, ch := range histNode.Children {
+		ch.Expanded = true
+	}
+	dash.Tree().Rebuild()
+	view = dash.View()
 	assert.Contains(t, view, "E2E Integration P")
 
 	// Verify step log retrieval directly from offline store

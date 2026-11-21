@@ -408,7 +408,19 @@ func (tw *TelemetryWidget) View(width int) string {
 	if slotSummary := tw.formatSlotSummary(); slotSummary != "" {
 		lines = append(lines, slotSummary)
 	}
-	lines = append(lines, cpuLine, memLine, diskLine)
+	lines = append(lines, cpuLine, memLine)
+
+	// Distinct separation for Host / System resource metrics
+	if width >= 40 {
+		sysLabel := " HOST / SYSTEM "
+		pad := width - len(sysLabel) - 4
+		if pad < 2 {
+			pad = 2
+		}
+		sep := dimStyle.Render("──" + sysLabel + strings.Repeat("─", pad))
+		lines = append(lines, sep)
+	}
+	lines = append(lines, diskLine)
 
 	if tw.sample.NetRxRate > 0 || tw.sample.NetTxRate > 0 || tw.sample.DiskWriteRate > 0 {
 		var ioParts []string

@@ -58,6 +58,9 @@ func TestMonitorCmd_Setup(t *testing.T) {
 	if cmd.Flags().Lookup("mouse") == nil {
 		t.Fatal("expected --mouse flag")
 	}
+	if cmd.Flags().Lookup("no-mouse") == nil {
+		t.Fatal("expected --no-mouse flag")
+	}
 }
 
 func TestMonitorCmd_DemoFlag(t *testing.T) {
@@ -435,6 +438,15 @@ func TestMonitor_OfflineMode_HydratesFromSQLiteStore(t *testing.T) {
 
 	assert.Contains(t, view, "◉ OFFLINE (HISTORY)")
 	assert.Contains(t, view, "HISTORICAL RUNS")
+	histNode := dash.Tree().FindNode("historical-runs")
+	require.NotNil(t, histNode)
+	assert.False(t, histNode.Expanded, "historical runs should be collapsed by default")
+	histNode.Expanded = true
+	for _, ch := range histNode.Children {
+		ch.Expanded = true
+	}
+	dash.Tree().Rebuild()
+	view = dash.View()
 	assert.Contains(t, view, "CI Test Suite")
 	assert.Contains(t, view, "Deploy Staging")
 }
@@ -531,7 +543,7 @@ func TestMonitor_AutoReconnect_TransitionsToLive(t *testing.T) {
 	assert.True(t, model.IsOffline())
 	assert.Equal(t, tui.StatusBadgeOffline, model.StatusBadge())
 	assert.Contains(t, model.View(), "◉ OFFLINE (HISTORY)")
-	assert.Contains(t, model.View(), "Historic Build")
+	assert.Contains(t, model.View(), "HISTORICAL RUNS")
 
 	// Step 2: Start live daemon server
 	server := monitor.NewServer(sockPath, "live-reconnect-runner")
@@ -565,6 +577,15 @@ func TestMonitor_AutoReconnect_TransitionsToLive(t *testing.T) {
 	view := model.View()
 	assert.Contains(t, view, "● CONNECTED (LIVE)")
 	assert.Contains(t, view, "Live Active Workflow")
+	histNode := model.Tree().FindNode("historical-runs")
+	require.NotNil(t, histNode, "historical runs branch must exist")
+	assert.False(t, histNode.Expanded, "historical runs should be collapsed by default")
+	histNode.Expanded = true
+	for _, ch := range histNode.Children {
+		ch.Expanded = true
+	}
+	model.Tree().Rebuild()
+	view = model.View()
 	assert.Contains(t, view, "Historic Build", "expected historical runs to be retained after reconnect")
 
 	// Step 5: Deliver a live event

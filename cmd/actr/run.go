@@ -461,8 +461,16 @@ func newRunCmd() *cobra.Command {
 				if rc, ok := runServiceClient.(*protocol.RunServiceClient); ok {
 					protoRunClient = rc
 				}
+				alias := cfg.GitHubURL
+				if alias != "" {
+					alias = strings.TrimSuffix(alias, ".git")
+					if idx := strings.LastIndex(alias, "/"); idx >= 0 {
+						alias = alias[idx+1:]
+					}
+				}
 				coordEngine := engine.NewCoordinator(d, protoRunClient, cfg.WorkFolder).
 					WithRunnerName(cfg.AgentName).
+					WithRepoAlias(alias).
 					WithRepositoryURL(cfg.GitHubURL).
 					WithOutput(cmd.OutOrStdout(), cmd.ErrOrStderr())
 				if dockerDrv != nil {
