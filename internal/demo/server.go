@@ -42,12 +42,24 @@ func StartServer(ctx context.Context, sockPath string) (*monitor.Server, error) 
 func seedInitialState(server *monitor.Server) {
 	now := time.Now()
 
+	// Multi-repo supervisor slot contracts
+	server.SetSupervisorStatus(&monitor.SupervisorStatus{
+		GlobalMaxJobs: 2,
+		GlobalActive:  1,
+		RepoSlots: []*monitor.RepoSlotInfo{
+			{Alias: "aim", MaxJobs: 1, ActiveJobs: 0, Driver: "host", Status: "idle"},
+			{Alias: "cxstatusline", MaxJobs: 1, ActiveJobs: 1, Driver: "host", Status: "busy"},
+		},
+	})
+
 	// 1. Completed Linux Matrix Job
 	linuxJob := &monitor.JobInfo{
 		ID:        "job-linux-1",
 		Name:      "test-linux-amd64",
 		Workflow:  "CI (#43589138)",
 		Repo:      "actr",
+		RepoAlias: "actr",
+		RepoURL:   "https://github.com/adrijshikhar/actr",
 		Owner:     "adrijshikhar",
 		Status:    monitor.StatusSuccess,
 		StartedAt: now.Add(-5 * time.Minute),
@@ -58,8 +70,8 @@ func seedInitialState(server *monitor.Server) {
 			{ID: "l-3", Name: "Run tests (-race)", Status: monitor.StatusSuccess, StartedAt: now.Add(-4*time.Minute - 35*time.Second), EndedAt: now.Add(-3 * time.Minute)},
 		},
 	}
-	server.Publish(monitor.Event{Type: monitor.EventJobStart, JobID: linuxJob.ID, Job: linuxJob})
-	server.Publish(monitor.Event{Type: monitor.EventJobFinish, JobID: linuxJob.ID, Job: linuxJob})
+	server.Publish(monitor.Event{Type: monitor.EventJobStart, JobID: linuxJob.ID, RepoAlias: "actr", Job: linuxJob})
+	server.Publish(monitor.Event{Type: monitor.EventJobFinish, JobID: linuxJob.ID, RepoAlias: "actr", Job: linuxJob})
 
 	server.AppendJobStepLog(linuxJob.ID, "l-1", "\x1b[38;5;244m2026-11-16T14:30:00Z\x1b[0m \x1b[1;32m✓\x1b[0m Host runner environment validated (Linux x86_64)")
 	server.AppendJobStepLog(linuxJob.ID, "l-2", "\x1b[38;5;244m2026-11-16T14:30:10Z\x1b[0m \x1b[1;34m##[group]Git checkout\x1b[0m")
@@ -73,7 +85,9 @@ func seedInitialState(server *monitor.Server) {
 		ID:        "job-macos-1",
 		Name:      "test-macos-arm64",
 		Workflow:  "CI (#43589138)",
-		Repo:      "actr",
+		Repo:      "aim",
+		RepoAlias: "aim",
+		RepoURL:   "https://github.com/adrijshikhar/aim",
 		Owner:     "adrijshikhar",
 		Status:    monitor.StatusSuccess,
 		StartedAt: now.Add(-3 * time.Minute),
@@ -84,8 +98,8 @@ func seedInitialState(server *monitor.Server) {
 			{ID: "m-3", Name: "Run tests (-race)", Status: monitor.StatusSuccess, StartedAt: now.Add(-2*time.Minute - 40*time.Second), EndedAt: now.Add(-1 * time.Minute)},
 		},
 	}
-	server.Publish(monitor.Event{Type: monitor.EventJobStart, JobID: macJob.ID, Job: macJob})
-	server.Publish(monitor.Event{Type: monitor.EventJobFinish, JobID: macJob.ID, Job: macJob})
+	server.Publish(monitor.Event{Type: monitor.EventJobStart, JobID: macJob.ID, RepoAlias: "aim", Job: macJob})
+	server.Publish(monitor.Event{Type: monitor.EventJobFinish, JobID: macJob.ID, RepoAlias: "aim", Job: macJob})
 
 	server.AppendJobStepLog(macJob.ID, "m-1", "\x1b[38;5;244m2026-11-16T14:32:00Z\x1b[0m \x1b[1;32m✓\x1b[0m macOS darwin/arm64 sandbox initialized")
 	server.AppendJobStepLog(macJob.ID, "m-2", "\x1b[38;5;244m2026-11-16T14:32:15Z\x1b[0m Checked out commit 98f6bab (HEAD -> main)")
@@ -96,7 +110,9 @@ func seedInitialState(server *monitor.Server) {
 		ID:        "job-live-1",
 		Name:      "release-prebuilt",
 		Workflow:  "Release (v0.1.2)",
-		Repo:      "actr",
+		Repo:      "cxstatusline",
+		RepoAlias: "cxstatusline",
+		RepoURL:   "https://github.com/adrijshikhar/cxstatusline",
 		Owner:     "adrijshikhar",
 		Status:    monitor.StatusRunning,
 		StartedAt: now.Add(-40 * time.Second),
@@ -109,7 +125,7 @@ func seedInitialState(server *monitor.Server) {
 			{ID: "s-6", Name: "Publish GitHub Release", Status: monitor.StatusQueued},
 		},
 	}
-	server.Publish(monitor.Event{Type: monitor.EventJobStart, JobID: liveJob.ID, Job: liveJob})
+	server.Publish(monitor.Event{Type: monitor.EventJobStart, JobID: liveJob.ID, RepoAlias: "cxstatusline", Job: liveJob})
 
 	server.AppendJobStepLog(liveJob.ID, "s-1", "\x1b[38;5;244m2026-11-16T14:34:00Z\x1b[0m \x1b[1;34m##[group]Check environment\x1b[0m")
 	server.AppendJobStepLog(liveJob.ID, "s-1", "\x1b[38;5;244m2026-11-16T14:34:01Z\x1b[0m Verified Go version: 1.27.4 darwin/arm64")
@@ -266,10 +282,11 @@ func runSimulation(ctx context.Context, server *monitor.Server) {
 				switch activeStep {
 				case "s-2":
 					server.Publish(monitor.Event{
-						Type:   monitor.EventStepFinish,
-						JobID:  "job-live-1",
-						StepID: "s-2",
-						Step:   &monitor.StepInfo{ID: "s-2", Name: "Compile binaries", Status: monitor.StatusSuccess, EndedAt: time.Now()},
+						Type:      monitor.EventStepFinish,
+						JobID:     "job-live-1",
+						RepoAlias: "cxstatusline",
+						StepID:    "s-2",
+						Step:      &monitor.StepInfo{ID: "s-2", Name: "Compile binaries", Status: monitor.StatusSuccess, EndedAt: time.Now()},
 					})
 					activeStep = "s-3"
 					activeStepName = "Package distribution tarballs"
@@ -277,18 +294,20 @@ func runSimulation(ctx context.Context, server *monitor.Server) {
 					currentSeq = packageSequence
 					seqIdx = 0
 					server.Publish(monitor.Event{
-						Type:   monitor.EventStepStart,
-						JobID:  "job-live-1",
-						StepID: "s-3",
-						Step:   &monitor.StepInfo{ID: "s-3", Name: "Package distribution tarballs", Status: monitor.StatusRunning, StartedAt: time.Now()},
+						Type:      monitor.EventStepStart,
+						JobID:     "job-live-1",
+						RepoAlias: "cxstatusline",
+						StepID:    "s-3",
+						Step:      &monitor.StepInfo{ID: "s-3", Name: "Package distribution tarballs", Status: monitor.StatusRunning, StartedAt: time.Now()},
 					})
 
 				case "s-3":
 					server.Publish(monitor.Event{
-						Type:   monitor.EventStepFinish,
-						JobID:  "job-live-1",
-						StepID: "s-3",
-						Step:   &monitor.StepInfo{ID: "s-3", Name: "Package distribution tarballs", Status: monitor.StatusSuccess, EndedAt: time.Now()},
+						Type:      monitor.EventStepFinish,
+						JobID:     "job-live-1",
+						RepoAlias: "cxstatusline",
+						StepID:    "s-3",
+						Step:      &monitor.StepInfo{ID: "s-3", Name: "Package distribution tarballs", Status: monitor.StatusSuccess, EndedAt: time.Now()},
 					})
 					activeStep = "s-4"
 					activeStepName = "Generate SHA256 checksums"
@@ -296,18 +315,20 @@ func runSimulation(ctx context.Context, server *monitor.Server) {
 					currentSeq = checksumSequence
 					seqIdx = 0
 					server.Publish(monitor.Event{
-						Type:   monitor.EventStepStart,
-						JobID:  "job-live-1",
-						StepID: "s-4",
-						Step:   &monitor.StepInfo{ID: "s-4", Name: "Generate SHA256 checksums", Status: monitor.StatusRunning, StartedAt: time.Now()},
+						Type:      monitor.EventStepStart,
+						JobID:     "job-live-1",
+						RepoAlias: "cxstatusline",
+						StepID:    "s-4",
+						Step:      &monitor.StepInfo{ID: "s-4", Name: "Generate SHA256 checksums", Status: monitor.StatusRunning, StartedAt: time.Now()},
 					})
 
 				case "s-4":
 					server.Publish(monitor.Event{
-						Type:   monitor.EventStepFinish,
-						JobID:  "job-live-1",
-						StepID: "s-4",
-						Step:   &monitor.StepInfo{ID: "s-4", Name: "Generate SHA256 checksums", Status: monitor.StatusSuccess, EndedAt: time.Now()},
+						Type:      monitor.EventStepFinish,
+						JobID:     "job-live-1",
+						RepoAlias: "cxstatusline",
+						StepID:    "s-4",
+						Step:      &monitor.StepInfo{ID: "s-4", Name: "Generate SHA256 checksums", Status: monitor.StatusSuccess, EndedAt: time.Now()},
 					})
 					// Note: s-5 was skipped, transition directly to s-6
 					activeStep = "s-6"
@@ -316,23 +337,34 @@ func runSimulation(ctx context.Context, server *monitor.Server) {
 					currentSeq = publishSequence
 					seqIdx = 0
 					server.Publish(monitor.Event{
-						Type:   monitor.EventStepStart,
-						JobID:  "job-live-1",
-						StepID: "s-6",
-						Step:   &monitor.StepInfo{ID: "s-6", Name: "Publish GitHub Release", Status: monitor.StatusRunning, StartedAt: time.Now()},
+						Type:      monitor.EventStepStart,
+						JobID:     "job-live-1",
+						RepoAlias: "cxstatusline",
+						StepID:    "s-6",
+						Step:      &monitor.StepInfo{ID: "s-6", Name: "Publish GitHub Release", Status: monitor.StatusRunning, StartedAt: time.Now()},
 					})
 
 				case "s-6":
 					server.Publish(monitor.Event{
-						Type:   monitor.EventStepFinish,
-						JobID:  "job-live-1",
-						StepID: "s-6",
-						Step:   &monitor.StepInfo{ID: "s-6", Name: "Publish GitHub Release", Status: monitor.StatusSuccess, EndedAt: time.Now()},
+						Type:      monitor.EventStepFinish,
+						JobID:     "job-live-1",
+						RepoAlias: "cxstatusline",
+						StepID:    "s-6",
+						Step:      &monitor.StepInfo{ID: "s-6", Name: "Publish GitHub Release", Status: monitor.StatusSuccess, EndedAt: time.Now()},
 					})
 					server.Publish(monitor.Event{
-						Type:  monitor.EventJobFinish,
-						JobID: "job-live-1",
-						Job:   &monitor.JobInfo{ID: "job-live-1", Name: "release-prebuilt", Status: monitor.StatusSuccess, EndedAt: time.Now()},
+						Type:      monitor.EventJobFinish,
+						JobID:     "job-live-1",
+						RepoAlias: "cxstatusline",
+						Job:       &monitor.JobInfo{ID: "job-live-1", Name: "release-prebuilt", Repo: "cxstatusline", RepoAlias: "cxstatusline", Status: monitor.StatusSuccess, EndedAt: time.Now()},
+					})
+					server.SetSupervisorStatus(&monitor.SupervisorStatus{
+						GlobalMaxJobs: 2,
+						GlobalActive:  0,
+						RepoSlots: []*monitor.RepoSlotInfo{
+							{Alias: "aim", MaxJobs: 1, ActiveJobs: 0, Driver: "host", Status: "idle"},
+							{Alias: "cxstatusline", MaxJobs: 1, ActiveJobs: 0, Driver: "host", Status: "idle"},
+						},
 					})
 
 					// Idle for a few cycles then cycle back or stream heartbeat
@@ -343,11 +375,43 @@ func runSimulation(ctx context.Context, server *monitor.Server) {
 					stepStartTime = time.Now()
 					currentSeq = compileSequence
 					seqIdx = 0
+					server.SetSupervisorStatus(&monitor.SupervisorStatus{
+						GlobalMaxJobs: 2,
+						GlobalActive:  1,
+						RepoSlots: []*monitor.RepoSlotInfo{
+							{Alias: "aim", MaxJobs: 1, ActiveJobs: 0, Driver: "host", Status: "idle"},
+							{Alias: "cxstatusline", MaxJobs: 1, ActiveJobs: 1, Driver: "host", Status: "busy"},
+						},
+					})
 					server.Publish(monitor.Event{
-						Type:   monitor.EventStepStart,
-						JobID:  "job-live-1",
-						StepID: "s-2",
-						Step:   &monitor.StepInfo{ID: "s-2", Name: "Compile binaries", Status: monitor.StatusRunning, StartedAt: time.Now()},
+						Type:      monitor.EventJobStart,
+						JobID:     "job-live-1",
+						RepoAlias: "cxstatusline",
+						Job: &monitor.JobInfo{
+							ID:        "job-live-1",
+							Name:      "release-prebuilt",
+							Workflow:  "Release (v0.1.2)",
+							Repo:      "cxstatusline",
+							RepoAlias: "cxstatusline",
+							Owner:     "adrijshikhar",
+							Status:    monitor.StatusRunning,
+							StartedAt: time.Now(),
+							Steps: []*monitor.StepInfo{
+								{ID: "s-1", Name: "Verify prerequisites", Status: monitor.StatusSuccess, StartedAt: time.Now().Add(-10 * time.Second), EndedAt: time.Now()},
+								{ID: "s-2", Name: "Compile binaries", Status: monitor.StatusRunning, StartedAt: time.Now()},
+								{ID: "s-3", Name: "Package distribution tarballs", Status: monitor.StatusQueued},
+								{ID: "s-4", Name: "Generate SHA256 checksums", Status: monitor.StatusQueued},
+								{ID: "s-5", Name: "Legacy artifact sign", Status: monitor.StatusSkipped},
+								{ID: "s-6", Name: "Publish GitHub Release", Status: monitor.StatusQueued},
+							},
+						},
+					})
+					server.Publish(monitor.Event{
+						Type:      monitor.EventStepStart,
+						JobID:     "job-live-1",
+						RepoAlias: "cxstatusline",
+						StepID:    "s-2",
+						Step:      &monitor.StepInfo{ID: "s-2", Name: "Compile binaries", Status: monitor.StatusRunning, StartedAt: time.Now()},
 					})
 				}
 			}

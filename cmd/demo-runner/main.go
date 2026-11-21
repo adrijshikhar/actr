@@ -21,6 +21,9 @@ func main() {
 
 func run() error {
 	sockPath := "/tmp/actr-demo.sock"
+	if env := os.Getenv("ACTR_DEMO_SOCK"); env != "" {
+		sockPath = env
+	}
 	if len(os.Args) > 1 {
 		sockPath = filepath.Clean(os.Args[1])
 	}

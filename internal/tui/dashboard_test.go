@@ -2696,3 +2696,135 @@ func TestDashboard_ViewportKeyboardNavigationAndAutoFollow(t *testing.T) {
 	assert.True(t, m.autoFollow, "reaching bottom via j must restore autoFollow")
 }
 
+func TestDashboard_StripMouseArtifacts(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"", ""},
+		{"build", "build"},
+		{"3M[<65;82;63M[<65;82;63M", ""},
+		{"prefix[<65;82;63Msuffix", "prefixsuffix"},
+		{"[<0;10;20M", ""},
+		{"[<35;10;20m", ""},
+		{"3M", ""},
+		{"job-test", "job-test"},
+	}
+	for _, tc := range tests {
+		assert.Equal(t, tc.expected, stripMouseArtifacts(tc.input), "stripMouseArtifacts(%q)", tc.input)
+	}
+}
+
+func TestDashboard_HistoricalRuns_DefaultCollapsed(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	snap := &monitor.Snapshot{
+		RunnerName: "test-runner",
+		RecentJobs: []*monitor.JobInfo{
+			{ID: "hist-1", Name: "Past Run 1", Status: monitor.StatusSuccess},
+			{ID: "hist-2", Name: "Past Run 2", Status: monitor.StatusFailed},
+		},
+	}
+	m.ApplySnapshot(snap)
+
+	hist := m.tree.FindNode("historical-runs")
+	require.NotNil(t, hist)
+	assert.False(t, hist.Expanded, "HISTORICAL RUNS branch must default to collapsed")
+}
+
+func TestDashboard_ResolveJobRepo_MultiRepoMatching(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	m.supervisorStatus = &monitor.SupervisorStatus{
+		RepoSlots: []*monitor.RepoSlotInfo{
+			{Alias: "aim", MaxJobs: 1, ActiveJobs: 0},
+			{Alias: "cxstatusline", MaxJobs: 1, ActiveJobs: 1},
+		},
+	}
+
+	// 1. Matches via RepoURL
+	job1 := &monitor.JobInfo{ID: "j1", RepoURL: "https://github.com/adrijshikhar/cxstatusline.git"}
+	assert.Equal(t, "cxstatusline", m.resolveJobRepo(job1))
+
+	// 2. Matches via Repo field
+	job2 := &monitor.JobInfo{ID: "j2", Repo: "adrijshikhar/aim"}
+	assert.Equal(t, "aim", m.resolveJobRepo(job2))
+
+	// 3. Matches via Workflow name containing alias
+	job3 := &monitor.JobInfo{ID: "j3", Workflow: "cxstatusline-release"}
+	assert.Equal(t, "cxstatusline", m.resolveJobRepo(job3))
+
+	// 4. Matches via single busy slot when repo info is missing
+	job4 := &monitor.JobInfo{ID: "j4", Name: "self-hosted_macOS_ARM64_m"}
+	assert.Equal(t, "cxstatusline", m.resolveJobRepo(job4))
+}
+
+func TestDashboard_View_ClampsToHeight(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	targetHeight := 24
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: targetHeight})
+
+	view := m.View()
+	lines := strings.Split(view, "\n")
+	assert.LessOrEqual(t, len(lines), targetHeight, "View output line count must not exceed terminal height")
+}
+
+func TestDashboard_FollowLogsFeedbackAndFooterClick(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	// Initial state: autoFollow is true
+	assert.True(t, m.autoFollow)
+	view := m.View()
+	assert.Contains(t, view, "follow:ON")
+
+	// Press 'f': toggles to false and returns a toast command
+	resModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	m = resModel.(*DashboardModel)
+	assert.False(t, m.autoFollow)
+	assert.NotNil(t, cmd, "toggling autoFollow must return toast timer command")
+	assert.Contains(t, m.toastMsg, "Auto-follow OFF")
+
+	// Click on footer line (Y=29): toggles back to true
+	resModel, cmd = m.Update(tea.MouseMsg{
+		X:      10,
+		Y:      29,
+		Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress,
+	})
+	m = resModel.(*DashboardModel)
+	assert.True(t, m.autoFollow)
+	assert.NotNil(t, cmd)
+	assert.Contains(t, m.toastMsg, "Auto-follow ON")
+}
+
+func TestDashboard_SyncHUD_CompletedLiveRunShowsPeakSummary(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	completedJob := &monitor.JobInfo{
+		ID:        "live-job-1",
+		Name:      "Build Task",
+		Status:    monitor.StatusSuccess,
+		StartedAt: time.Now().Add(-10 * time.Minute),
+		EndedAt:   time.Now(),
+	}
+	snap := &monitor.Snapshot{
+		RunnerName: "test-runner",
+		ActiveJobs: []*monitor.JobInfo{completedJob},
+	}
+	m.ApplySnapshot(snap)
+
+	// Select the completed live job
+	require.True(t, m.tree.SelectFirst(func(n *TreeNode) bool {
+		return n.ID == "live-job-1"
+	}))
+
+	// Sync HUD
+	m.syncHistoricalHUD()
+
+	// Telemetry widget should now be in historical (peak summary) mode
+	assert.True(t, m.telemetry.IsHistorical(), "completed live job must trigger peak summary mode in HUD")
+	view := m.telemetry.View(100)
+	assert.Contains(t, view, "PEAK SUMMARY")
+	assert.Contains(t, view, "Build Task")
+}
+

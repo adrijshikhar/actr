@@ -35,9 +35,17 @@ func TestStartServer_Smoke(t *testing.T) {
 		t.Fatalf("expected runner name 'm5-pro (macOS arm64)', got %q", snap.RunnerName)
 	}
 
+	require.NotNil(t, snap.SupervisorStatus)
+	assert.Equal(t, 2, snap.SupervisorStatus.GlobalMaxJobs)
+	assert.Equal(t, 1, snap.SupervisorStatus.GlobalActive)
+	require.Len(t, snap.SupervisorStatus.RepoSlots, 2)
+	assert.Equal(t, "aim", snap.SupervisorStatus.RepoSlots[0].Alias)
+	assert.Equal(t, "cxstatusline", snap.SupervisorStatus.RepoSlots[1].Alias)
+
 	if len(snap.ActiveJobs) == 0 {
 		t.Fatal("expected at least 1 active job in demo snapshot")
 	}
+	assert.Equal(t, "cxstatusline", snap.ActiveJobs[0].RepoAlias)
 
 	// Verify telemetry was populated
 	if snap.Telemetry == nil {
@@ -114,18 +122,21 @@ func TestSeedHistoryStore(t *testing.T) {
 	rel, ok := runMap["release-v0.1.0"]
 	require.True(t, ok, "missing release-v0.1.0")
 	assert.Equal(t, monitor.StatusSuccess, rel.Status)
+	assert.Equal(t, "actr", rel.RepoAlias)
 	assert.Equal(t, 3, rel.StepCount)
 
 	// Verify nightly-security-scan
 	sec, ok := runMap["nightly-security-scan"]
 	require.True(t, ok, "missing nightly-security-scan")
 	assert.Equal(t, monitor.StatusSuccess, sec.Status)
+	assert.Equal(t, "aim", sec.RepoAlias)
 	assert.Equal(t, 3, sec.StepCount)
 
 	// Verify flaky-integration-test
 	flk, ok := runMap["flaky-integration-test"]
 	require.True(t, ok, "missing flaky-integration-test")
 	assert.Equal(t, monitor.StatusFailed, flk.Status)
+	assert.Equal(t, "cxstatusline", flk.RepoAlias)
 	assert.Equal(t, 3, flk.StepCount)
 
 	// Verify logs for flaky step
