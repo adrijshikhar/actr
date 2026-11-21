@@ -483,7 +483,7 @@ func (tw *TelemetryWidget) renderExpandedCharts(width int) []string {
 	if peakCPU > 100.0 {
 		maxCPU = math.Ceil(peakCPU/50.0) * 50.0
 	}
-	cpuGraphStr := RenderBrailleLineGraph(cpuPoints, graphWidth, 4, maxCPU, lipgloss.Color("#38BDF8"))
+	cpuGraphStr := RenderBrailleAreaGraph(cpuPoints, graphWidth, 4, maxCPU, lipgloss.Color("#38BDF8"))
 	cpuGraphRows := strings.Split(cpuGraphStr, "\n")
 
 	maxRAM := float64(peakRAM) * 1.25
@@ -497,7 +497,7 @@ func (tw *TelemetryWidget) renderExpandedCharts(width int) []string {
 	if maxRAM <= 0 {
 		maxRAM = 128 * 1024 * 1024
 	}
-	ramGraphStr := RenderBrailleLineGraph(ramPoints, graphWidth, 4, maxRAM, lipgloss.Color("#10B981"))
+	ramGraphStr := RenderBrailleAreaGraph(ramPoints, graphWidth, 4, maxRAM, lipgloss.Color("#10B981"))
 	ramGraphRows := strings.Split(ramGraphStr, "\n")
 
 	cpuYLabels := [4]string{
@@ -514,8 +514,21 @@ func (tw *TelemetryWidget) renderExpandedCharts(width int) []string {
 	}
 
 	// Titles
-	cpuTitleText := fmt.Sprintf("CPU Usage  •  Peak: %.1f%%  •  Now: %.1f%%", peakCPU, curCPU)
-	ramTitleText := fmt.Sprintf("Memory (RSS)  •  Peak: %s  •  Now: %s", formatBytes(peakRAM), formatBytes(curRAM))
+	var cpuSub string
+	if tw.limits != nil && tw.limits.CPU > 0 {
+		cpuSub = fmt.Sprintf("Limit: %.1f CPUs", tw.limits.CPU)
+	} else {
+		cpuSub = fmt.Sprintf("Now: %.1f%%", curCPU)
+	}
+	cpuTitleText := fmt.Sprintf("CPU Usage  •  Peak: %.1f%%  •  %s", peakCPU, cpuSub)
+
+	var ramSub string
+	if tw.limits != nil && tw.limits.Memory > 0 {
+		ramSub = fmt.Sprintf("Limit: %s", formatBytes(uint64(tw.limits.Memory)))
+	} else {
+		ramSub = fmt.Sprintf("Now: %s", formatBytes(curRAM))
+	}
+	ramTitleText := fmt.Sprintf("Memory (RSS)  •  Peak: %s  •  %s", formatBytes(peakRAM), ramSub)
 
 	cpuTitle := radarTitleStyle.Render(cpuTitleText)
 	ramTitle := radarTitleStyle.Render(ramTitleText)
@@ -539,13 +552,15 @@ func (tw *TelemetryWidget) renderExpandedCharts(width int) []string {
 		out = append(out, leftCell+strings.Repeat(" ", pad)+rightCell)
 	}
 
-	// Axis footer line showing time window
-	timePad := graphWidth - 8
-	if timePad < 2 {
-		timePad = 2
+	// Axis footer line showing time window with strict right-edge alignment
+	timeStart := "-60s"
+	timeEnd := "Now"
+	timeGap := graphWidth - len(timeStart) - len(timeEnd)
+	if timeGap < 1 {
+		timeGap = 1
 	}
-	cpuTime := dimStyle.Render(fmt.Sprintf("       -60s%snow", strings.Repeat(" ", timePad)))
-	ramTime := dimStyle.Render(fmt.Sprintf("       -60s%snow", strings.Repeat(" ", timePad)))
+	cpuTime := dimStyle.Render(strings.Repeat(" ", labelWidth) + timeStart + strings.Repeat(" ", timeGap) + timeEnd)
+	ramTime := dimStyle.Render(strings.Repeat(" ", labelWidth) + timeStart + strings.Repeat(" ", timeGap) + timeEnd)
 	pad := halfWidth - lipgloss.Width(cpuTime)
 	if pad < 2 {
 		pad = 2
@@ -555,9 +570,19 @@ func (tw *TelemetryWidget) renderExpandedCharts(width int) []string {
 	return out
 }
 
+// RenderBrailleAreaGraph generates a high-resolution Unicode Braille continuous wave
+// area chart with solid fill under the curve (similar to btop / gotop).
+func RenderBrailleAreaGraph(points []float64, width, height int, maxValue float64, color lipgloss.Color) string {
+	return renderBrailleGraph(points, width, height, maxValue, color, true)
+}
+
 // RenderBrailleLineGraph generates a high-resolution Unicode Braille (2x4 dots per cell)
 // continuous wave line graph for a series of data points.
 func RenderBrailleLineGraph(points []float64, width, height int, maxValue float64, color lipgloss.Color) string {
+	return renderBrailleGraph(points, width, height, maxValue, color, false)
+}
+
+func renderBrailleGraph(points []float64, width, height int, maxValue float64, color lipgloss.Color, filled bool) string {
 	if width <= 0 {
 		width = 20
 	}
@@ -626,9 +651,15 @@ func RenderBrailleLineGraph(points []float64, width, height int, maxValue float6
 				y = canvasH - 1
 			}
 
-			if i == 0 {
-				setDot(x, y)
+			if filled {
+				for cy := y; cy < canvasH; cy++ {
+					setDot(x, cy)
+				}
 			} else {
+				setDot(x, y)
+			}
+
+			if i > 0 {
 				prevVal := pts[i-1]
 				if prevVal < 0 {
 					prevVal = 0
@@ -1046,7 +1077,7 @@ func (tw *TelemetryWidget) renderExpandedHistoricalCharts(width int, summary *Hi
 		maxCPU = math.Ceil(summary.PeakCPUPercent/50.0) * 50.0
 	}
 	cpuPoints := generateHistoricalProfile(summary.PeakCPUPercent, graphWidth*2, "cpu")
-	cpuGraphStr := RenderBrailleLineGraph(cpuPoints, graphWidth, 4, maxCPU, lipgloss.Color("#38BDF8"))
+	cpuGraphStr := RenderBrailleAreaGraph(cpuPoints, graphWidth, 4, maxCPU, lipgloss.Color("#38BDF8"))
 	cpuGraphRows := strings.Split(cpuGraphStr, "\n")
 
 	maxRAM := float64(summary.PeakRSSBytes) * 1.25
@@ -1061,7 +1092,7 @@ func (tw *TelemetryWidget) renderExpandedHistoricalCharts(width int, summary *Hi
 		maxRAM = 128 * 1024 * 1024
 	}
 	ramPoints := generateHistoricalProfile(float64(summary.PeakRSSBytes), graphWidth*2, "mem")
-	ramGraphStr := RenderBrailleLineGraph(ramPoints, graphWidth, 4, maxRAM, lipgloss.Color("#10B981"))
+	ramGraphStr := RenderBrailleAreaGraph(ramPoints, graphWidth, 4, maxRAM, lipgloss.Color("#10B981"))
 	ramGraphRows := strings.Split(ramGraphStr, "\n")
 
 	cpuYLabels := [4]string{
@@ -1077,12 +1108,25 @@ func (tw *TelemetryWidget) renderExpandedHistoricalCharts(width int, summary *Hi
 		"   0B ┤",
 	}
 
-	driver := summary.Driver
-	if driver == "" {
-		driver = "docker"
+	var cpuSub string
+	if summary.Limits != nil && summary.Limits.CPU > 0 {
+		cpuSub = fmt.Sprintf("Limit: %.1f CPUs", summary.Limits.CPU)
+	} else {
+		headroom := 100.0 - summary.PeakCPUPercent
+		if headroom < 0 {
+			headroom = 0
+		}
+		cpuSub = fmt.Sprintf("Headroom: %.0f%%", headroom)
 	}
-	cpuTitleText := fmt.Sprintf("CPU Profile  •  Peak: %.1f%%  •  %s", summary.PeakCPUPercent, driver)
-	ramTitleText := fmt.Sprintf("Memory Profile  •  Peak: %s  •  %s", formatBytes(summary.PeakRSSBytes), driver)
+	cpuTitleText := fmt.Sprintf("CPU Profile  •  Peak: %.1f%%  •  %s", summary.PeakCPUPercent, cpuSub)
+
+	var ramSub string
+	if summary.Limits != nil && summary.Limits.Memory > 0 {
+		ramSub = fmt.Sprintf("Limit: %s", formatBytes(uint64(summary.Limits.Memory)))
+	} else {
+		ramSub = "Working Set"
+	}
+	ramTitleText := fmt.Sprintf("Memory Profile  •  Peak: %s  •  %s", formatBytes(summary.PeakRSSBytes), ramSub)
 
 	cpuTitle := radarTitleStyle.Render(cpuTitleText)
 	ramTitle := radarTitleStyle.Render(ramTitleText)
@@ -1109,12 +1153,13 @@ func (tw *TelemetryWidget) renderExpandedHistoricalCharts(width int, summary *Hi
 	mins := summary.DurationSec / 60
 	secs := summary.DurationSec % 60
 	endStr := fmt.Sprintf("%02d:%02d", mins, secs)
-	timePad := graphWidth - 8 - len(endStr)
-	if timePad < 2 {
-		timePad = 2
+	timeStart := "00:00"
+	timeGap := graphWidth - len(timeStart) - len(endStr)
+	if timeGap < 1 {
+		timeGap = 1
 	}
-	cpuTime := dimStyle.Render(fmt.Sprintf("       00:00%s%s", strings.Repeat(" ", timePad), endStr))
-	ramTime := dimStyle.Render(fmt.Sprintf("       00:00%s%s", strings.Repeat(" ", timePad), endStr))
+	cpuTime := dimStyle.Render(strings.Repeat(" ", labelWidth) + timeStart + strings.Repeat(" ", timeGap) + endStr)
+	ramTime := dimStyle.Render(strings.Repeat(" ", labelWidth) + timeStart + strings.Repeat(" ", timeGap) + endStr)
 	pad := halfWidth - lipgloss.Width(cpuTime)
 	if pad < 2 {
 		pad = 2
@@ -1139,24 +1184,59 @@ func generateHistoricalProfile(peak float64, count int, profileType string) []fl
 		var factor float64
 		if profileType == "cpu" {
 			switch {
-			case progress < 0.15:
-				factor = 0.2 + 0.8*(progress/0.15)
-			case progress > 0.85:
-				factor = 1.0 - 0.7*((progress-0.85)/0.15)
+			case progress < 0.10:
+				// Phase 1: Runner setup / checkout (gentle warmup from 15% to 35%)
+				p := progress / 0.10
+				factor = 0.15 + 0.20*p + 0.05*math.Sin(p*math.Pi*2)
+			case progress < 0.45:
+				// Phase 2: Compilation & build spike (rises to 90-100% peak with compiler burst harmonics)
+				p := (progress - 0.10) / 0.35
+				burst := 0.18*math.Sin(p*math.Pi*5) + 0.08*math.Cos(p*math.Pi*3)
+				factor = 0.45 + 0.45*math.Sin(p*math.Pi*0.5) + burst
+			case progress < 0.55:
+				// Phase 3: Transition / test harness spawn (trough down to ~50-60%)
+				p := (progress - 0.45) / 0.10
+				factor = 0.70 - 0.20*math.Sin(p*math.Pi)
+			case progress < 0.85:
+				// Phase 4: Parallel test execution (sustained high activity with harmonic wave, reaches peak)
+				p := (progress - 0.55) / 0.30
+				osc := 0.14*math.Sin(p*math.Pi*6) + 0.06*math.Sin(p*math.Pi*11)
+				factor = 0.80 + 0.15*math.Sin(p*math.Pi) + osc
 			default:
-				wave := math.Sin(progress*math.Pi*4) * 0.12
-				factor = 0.88 + wave
-				if factor > 1.0 {
-					factor = 1.0
-				}
+				// Phase 5: Artifact packaging & teardown (cooldown down to 15%)
+				p := (progress - 0.85) / 0.15
+				factor = 0.65*(1.0-p) + 0.15
+			}
+			if factor > 1.0 {
+				factor = 1.0
+			}
+			if factor < 0.10 {
+				factor = 0.10
 			}
 		} else {
-			if progress < 0.35 {
-				factor = 0.25 + 0.75*(progress/0.35)
-			} else if progress < 0.8 {
-				factor = 0.95 + 0.05*math.Sin(progress*math.Pi*2)
-			} else {
-				factor = 0.98
+			switch {
+			case progress < 0.15:
+				// Phase 1: Runtime bootstrapping
+				p := progress / 0.15
+				factor = 0.20 + 0.15*p
+			case progress < 0.50:
+				// Phase 2: Build caching & memory growth step
+				p := (progress - 0.15) / 0.35
+				factor = 0.35 + 0.40*(1.0-math.Exp(-2.5*p)) + 0.03*math.Sin(p*math.Pi*3)
+			case progress < 0.85:
+				// Phase 3: Test fixtures & working set plateau
+				p := (progress - 0.50) / 0.35
+				factor = 0.75 + 0.23*(1.0-math.Exp(-3.0*p)) + 0.02*math.Sin(p*math.Pi*4)
+			default:
+				// Phase 4: Teardown & cleanup
+				p := (progress - 0.85) / 0.15
+				factor = 0.98 - 0.18*p
+			}
+			if factor > 1.0 {
+				factor = 1.0
+			}
+			if factor < 0.15 {
+				factor = 0.15
 			}
 		}
 		pts[i] = peak * factor

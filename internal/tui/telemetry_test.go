@@ -671,6 +671,20 @@ func TestTelemetryWidget_BrailleLineGraph(t *testing.T) {
 	assert.NotEmpty(t, rampGraph)
 }
 
+func TestTelemetryWidget_BrailleAreaGraph(t *testing.T) {
+	// 1. Empty series
+	emptyGraph := RenderBrailleAreaGraph(nil, 20, 4, 100, lipgloss.Color("#38BDF8"))
+	lines := strings.Split(emptyGraph, "\n")
+	assert.Equal(t, 4, len(lines), "expected 4 rows for empty area graph")
+
+	// 2. Linear ramp series with filled area underneath
+	points := []float64{0, 25, 50, 75, 100}
+	areaGraph := RenderBrailleAreaGraph(points, 20, 4, 100, lipgloss.Color("#38BDF8"))
+	lines = strings.Split(areaGraph, "\n")
+	assert.Equal(t, 4, len(lines), "expected 4 rows for area graph")
+	assert.NotEmpty(t, areaGraph)
+}
+
 func TestTelemetryWidget_ExpandedCharts(t *testing.T) {
 	tw := NewTelemetryWidget()
 	assert.False(t, tw.IsExpanded(), "expected initially collapsed")
