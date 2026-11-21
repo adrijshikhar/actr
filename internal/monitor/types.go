@@ -61,10 +61,13 @@ type RunnerMetrics struct {
 	PID            int32     `json:"pid"`
 	PGID           int32     `json:"pgid"`
 	ProcessCount   int       `json:"process_count"`
-	StepCPU        float64   `json:"step_cpu"`
-	StepRSSBytes   uint64    `json:"step_rss_bytes"`
-	StepElapsedSec int64     `json:"step_elapsed_sec"`
-	ActiveStepName string    `json:"active_step_name,omitempty"`
+	StepCPU             float64 `json:"step_cpu"`
+	StepRSSBytes        uint64  `json:"step_rss_bytes"`
+	StepWorkingSetBytes uint64  `json:"step_working_set_bytes,omitempty"` // Working Set Size (RSS + active memory cache, OOM risk metric)
+	StepElapsedSec      int64   `json:"step_elapsed_sec"`
+	ActiveStepName      string  `json:"active_step_name,omitempty"`
+	ThreadCount         int     `json:"thread_count,omitempty"`      // OS thread count
+	CPUThrottledSec     float64 `json:"cpu_throttled_sec,omitempty"` // CFS quota throttled time
 
 	// Storage
 	DiskUsedBytes    uint64  `json:"disk_used_bytes"`
@@ -72,6 +75,7 @@ type RunnerMetrics struct {
 	DiskTotalBytes   uint64  `json:"disk_total_bytes"`
 	DiskUsedRatio    float64 `json:"disk_used_ratio"`
 	DiskWriteRate    uint64  `json:"disk_write_rate"`
+	StepDiskReadRate uint64  `json:"step_disk_read_rate,omitempty"` // Disk read rate (bytes/sec)
 	DiskInodesFree   uint64  `json:"disk_inodes_free"`
 	DiskWrittenBytes uint64  `json:"disk_written_bytes,omitempty"`
 

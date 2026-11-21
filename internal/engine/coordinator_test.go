@@ -2919,3 +2919,37 @@ func TestShouldExecuteStep_BooleanLiterals(t *testing.T) {
 		t.Error("expected shouldExecuteStep('true') with jobFailed to be false")
 	}
 }
+
+func TestCoordinator_ExecuteStep_InjectsTraceparent(t *testing.T) {
+	d := &mockDriver{}
+	tmpWorkDir := t.TempDir()
+	c := NewCoordinator(d, nil, tmpWorkDir)
+
+	job := &protocol.JobSpecification{
+		JobID:   "trace-job",
+		JobName: "trace-job",
+		Steps: []protocol.JobStep{
+			{ID: "step-1", Name: "step 1", Script: "echo test"},
+		},
+	}
+
+	res, err := c.ExecuteJob(context.Background(), job, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error executing job: %v", err)
+	}
+	if res.Conclusion != "success" {
+		t.Fatalf("expected conclusion 'success', got %q", res.Conclusion)
+	}
+
+	if len(d.stepsRun) == 0 {
+		t.Fatal("expected stepsRun to not be empty")
+	}
+	firstStep := d.stepsRun[0]
+	if firstStep.Environment == nil {
+		t.Fatal("expected firstStep.Environment to not be nil")
+	}
+	traceparent, ok := firstStep.Environment["TRACEPARENT"]
+	if !ok || !strings.HasPrefix(traceparent, "00-") {
+		t.Fatalf("expected TRACEPARENT starting with '00-', got %q", traceparent)
+	}
+}
