@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 
 	"github.com/adrijshikhar/actr/internal/monitor"
@@ -375,6 +376,13 @@ func (m *Manager) RecordStepCompletion(ctx context.Context, stepID, stepName, st
 	}
 }
 
+func safeInt64(v uint64) int64 {
+	if v > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(v) // #nosec G115 -- value is bounded by math.MaxInt64
+}
+
 // RecordTelemetrySample records active step and host resource metrics as OpenTelemetry gauges.
 // This enables out-of-the-box telemetry streaming to InfluxDB, Prometheus, Datadog, or any OTLP backend.
 func (m *Manager) RecordTelemetrySample(ctx context.Context, jobID, repo string, sample *monitor.TelemetrySample) {
@@ -395,16 +403,16 @@ func (m *Manager) RecordTelemetrySample(ctx context.Context, jobID, repo string,
 		m.stepCPU.Record(ctx, sample.StepCPU, opt)
 	}
 	if m.stepRSS != nil {
-		m.stepRSS.Record(ctx, int64(sample.StepRSSBytes), opt)
+		m.stepRSS.Record(ctx, safeInt64(sample.StepRSSBytes), opt)
 	}
 	if m.stepNetRxRate != nil {
-		m.stepNetRxRate.Record(ctx, int64(sample.NetRxRate), opt)
+		m.stepNetRxRate.Record(ctx, safeInt64(sample.NetRxRate), opt)
 	}
 	if m.stepNetTxRate != nil {
-		m.stepNetTxRate.Record(ctx, int64(sample.NetTxRate), opt)
+		m.stepNetTxRate.Record(ctx, safeInt64(sample.NetTxRate), opt)
 	}
 	if m.stepDiskWriteRate != nil {
-		m.stepDiskWriteRate.Record(ctx, int64(sample.DiskWriteRate), opt)
+		m.stepDiskWriteRate.Record(ctx, safeInt64(sample.DiskWriteRate), opt)
 	}
 
 	// Host-level vitals
@@ -417,15 +425,15 @@ func (m *Manager) RecordTelemetrySample(ctx context.Context, jobID, repo string,
 		m.hostCPU.Record(ctx, sample.HostCPU, hostOpt)
 	}
 	if m.hostMemUsed != nil && sample.HostMemUsed > 0 {
-		m.hostMemUsed.Record(ctx, int64(sample.HostMemUsed), hostOpt)
+		m.hostMemUsed.Record(ctx, safeInt64(sample.HostMemUsed), hostOpt)
 	}
 	if m.hostMemTotal != nil && sample.HostMemTotal > 0 {
-		m.hostMemTotal.Record(ctx, int64(sample.HostMemTotal), hostOpt)
+		m.hostMemTotal.Record(ctx, safeInt64(sample.HostMemTotal), hostOpt)
 	}
 	if m.hostDiskUsed != nil && sample.DiskUsedBytes > 0 {
-		m.hostDiskUsed.Record(ctx, int64(sample.DiskUsedBytes), hostOpt)
+		m.hostDiskUsed.Record(ctx, safeInt64(sample.DiskUsedBytes), hostOpt)
 	}
 	if m.hostDiskTotal != nil && sample.DiskTotalBytes > 0 {
-		m.hostDiskTotal.Record(ctx, int64(sample.DiskTotalBytes), hostOpt)
+		m.hostDiskTotal.Record(ctx, safeInt64(sample.DiskTotalBytes), hostOpt)
 	}
 }

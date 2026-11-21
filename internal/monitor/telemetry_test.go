@@ -179,7 +179,7 @@ func TestGetAllDescendants_NilOrEmpty(t *testing.T) {
 
 func TestTelemetrySampler_EnrichedMetrics(t *testing.T) {
 	sampler := NewTelemetrySampler()
-	pid := int32(os.Getpid())
+	pid := int32(os.Getpid()) // #nosec G115 -- PID fits in int32
 	sampler.SetTargetPID(pid, pid)
 
 	sample := sampler.Sample()
