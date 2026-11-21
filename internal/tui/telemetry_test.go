@@ -656,3 +656,53 @@ func TestTelemetryWidget_SupervisorSlots(t *testing.T) {
 	activeView := tw.View(80)
 	assert.Contains(t, activeView, "ACTIVE: aim (1/1 slots), cxstatusline (0/1 slots)")
 }
+
+func TestTelemetryWidget_BrailleLineGraph(t *testing.T) {
+	// 1. Empty series
+	emptyGraph := RenderBrailleLineGraph(nil, 20, 4, 100, lipgloss.Color("#38BDF8"))
+	lines := strings.Split(emptyGraph, "\n")
+	assert.Equal(t, 4, len(lines), "expected 4 rows for empty graph")
+
+	// 2. Linear ramp series
+	points := []float64{0, 25, 50, 75, 100}
+	rampGraph := RenderBrailleLineGraph(points, 20, 4, 100, lipgloss.Color("#38BDF8"))
+	lines = strings.Split(rampGraph, "\n")
+	assert.Equal(t, 4, len(lines), "expected 4 rows for ramp graph")
+	assert.NotEmpty(t, rampGraph)
+}
+
+func TestTelemetryWidget_ExpandedCharts(t *testing.T) {
+	tw := NewTelemetryWidget()
+	assert.False(t, tw.IsExpanded(), "expected initially collapsed")
+
+	// Feed samples to populate history
+	for i := 0; i < 10; i++ {
+		tw.Update(&monitor.RunnerMetrics{
+			PID:            1234,
+			ActiveStepName: "Compile binaries",
+			StepCPU:        float64(20 + i*5),
+			StepRSSBytes:   uint64((100 + i*10) * 1024 * 1024),
+			StepElapsedSec: int64(i),
+		})
+	}
+
+	// Collapsed view should have expand cue
+	collapsedView := tw.View(100)
+	assert.Contains(t, collapsedView, "expand (e)")
+	assert.NotContains(t, collapsedView, "CPU Usage")
+
+	// Toggle expanded
+	tw.ToggleExpanded()
+	assert.True(t, tw.IsExpanded())
+
+	expandedView := tw.View(100)
+	assert.Contains(t, expandedView, "collapse (e)")
+	assert.Contains(t, expandedView, "CPU Usage")
+	assert.Contains(t, expandedView, "Memory")
+
+	// Toggle back to collapsed
+	tw.ToggleExpanded()
+	assert.False(t, tw.IsExpanded())
+	viewAgain := tw.View(100)
+	assert.Contains(t, viewAgain, "expand (e)")
+}

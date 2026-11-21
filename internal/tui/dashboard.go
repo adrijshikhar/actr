@@ -796,6 +796,13 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmd := m.treeSearchInput.Focus()
 				return m, cmd
 			}
+		case "e", "E":
+			if m.telemetry != nil {
+				m.telemetry.ToggleExpanded()
+				m.updateSizes()
+				return m, nil
+			}
+			return m, nil
 		case "m", "M":
 			m.mouseEnabled = !m.mouseEnabled
 			var cmd tea.Cmd
@@ -981,6 +988,8 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			telemOuterHeight := 6
 			if m.height < 18 {
 				telemOuterHeight = 4
+			} else if m.telemetry != nil && m.telemetry.IsExpanded() && m.height >= 26 {
+				telemOuterHeight = 12
 			}
 			viewportTop = telemOuterHeight + 1
 		}
@@ -1060,6 +1069,15 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					cmd = m.setToast("○ Auto-follow OFF (manual scrolling)")
 				}
 				return m, cmd
+			}
+
+			// Click in Telemetry HUD toggles expansion
+			if !m.isZoomed && msg.X >= sidebarWidth && msg.Y >= 0 && msg.Y < viewportTop {
+				if m.telemetry != nil {
+					m.telemetry.ToggleExpanded()
+					m.updateSizes()
+					return m, nil
+				}
 			}
 
 			if !m.isZoomed && msg.X < sidebarWidth {
@@ -1358,6 +1376,8 @@ func (m *DashboardModel) calcDimensions() (treeWidth, rightWidth, targetOuterHei
 	telemOuterHeight := 6
 	if m.height < 18 {
 		telemOuterHeight = 4
+	} else if m.telemetry != nil && m.telemetry.IsExpanded() && m.height >= 26 {
+		telemOuterHeight = 12
 	}
 
 	sysOuterHeight := 0

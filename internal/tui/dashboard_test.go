@@ -2856,3 +2856,34 @@ func TestDashboard_HostSystemBottomSection(t *testing.T) {
 	assert.Contains(t, view, "I/O :")
 }
 
+func TestDashboard_ToggleMetricsExpansion_KeyAndClick(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 35})
+
+	m.telemetry.Update(&monitor.RunnerMetrics{
+		PID:            1234,
+		ActiveStepName: "Compile binaries",
+		StepCPU:        45.0,
+		StepRSSBytes:   200 * 1024 * 1024,
+	})
+
+	assert.False(t, m.telemetry.IsExpanded())
+
+	// Press 'e' to toggle expanded
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	assert.True(t, m.telemetry.IsExpanded(), "expected expanded after pressing 'e'")
+
+	// Press 'e' to toggle collapsed
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	assert.False(t, m.telemetry.IsExpanded(), "expected collapsed after pressing 'e' again")
+
+	// Click in telemetry HUD (X=40, Y=2) to toggle expanded
+	_, _ = m.Update(tea.MouseMsg{
+		X:      40,
+		Y:      2,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	assert.True(t, m.telemetry.IsExpanded(), "expected expanded after clicking telemetry HUD")
+}
+

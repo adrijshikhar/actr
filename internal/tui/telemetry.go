@@ -56,6 +56,14 @@ type TelemetryWidget struct {
 	historical       *HistoricalRunSummary
 	offline          bool
 	supervisorStatus *monitor.SupervisorStatus
+	history          []MetricPoint
+	expanded         bool
+}
+
+// MetricPoint records a single time snapshot of step resource usage.
+type MetricPoint struct {
+	CPU      float64
+	RSSBytes uint64
 }
 
 // HistoricalRunSummary captures execution metadata and aggregate peak vitals for a historical run.
@@ -110,12 +118,46 @@ func (tw *TelemetryWidget) Limits() *config.LimitsConfig {
 	return tw.limits
 }
 
-// Update updates the active telemetry sample.
+// IsExpanded returns whether the metrics charts are currently expanded.
+func (tw *TelemetryWidget) IsExpanded() bool {
+	if tw == nil {
+		return false
+	}
+	return tw.expanded
+}
+
+// SetExpanded sets the expansion state of the metrics charts.
+func (tw *TelemetryWidget) SetExpanded(expanded bool) {
+	if tw == nil {
+		return
+	}
+	tw.expanded = expanded
+}
+
+// ToggleExpanded toggles the expansion state of the metrics charts and returns the new state.
+func (tw *TelemetryWidget) ToggleExpanded() bool {
+	if tw == nil {
+		return false
+	}
+	tw.expanded = !tw.expanded
+	return tw.expanded
+}
+
+// Update updates the active telemetry sample and records rolling history.
 func (tw *TelemetryWidget) Update(sample *monitor.TelemetrySample) {
 	if tw == nil {
 		return
 	}
 	tw.sample = sample
+	if sample != nil && sample.PID > 0 {
+		tw.history = append(tw.history, MetricPoint{
+			CPU:      sample.StepCPU,
+			RSSBytes: sample.StepRSSBytes,
+		})
+		if len(tw.history) > 120 {
+			tw.history = tw.history[len(tw.history)-120:]
+		}
+	}
 }
 
 // Sample returns the current telemetry sample, or nil if none has been received.
@@ -223,8 +265,15 @@ func (tw *TelemetryWidget) View(width int) string {
 		return tw.viewHistorical(width)
 	}
 
+	var toggleCue string
+	if tw != nil && tw.expanded {
+		toggleCue = dimStyle.Render(" [▼ collapse (e)]")
+	} else {
+		toggleCue = dimStyle.Render(" [▶ expand (e)]")
+	}
+
 	if tw == nil || tw.sample == nil {
-		header := radarTitleStyle.Render("∿ RUN VITALS & RADAR")
+		header := radarTitleStyle.Render("∿ RUN VITALS & RADAR") + toggleCue
 		var pill string
 		var stateLine string
 		if tw != nil && tw.offline {
@@ -255,7 +304,7 @@ func (tw *TelemetryWidget) View(width int) string {
 		return lipgloss.JoinVertical(lipgloss.Left, idleLines...)
 	}
 
-	header := radarTitleStyle.Render("∿ RUN VITALS & RADAR")
+	header := radarTitleStyle.Render("∿ RUN VITALS & RADAR") + toggleCue
 	pill := activePillStyle.Render("● ACTIVE")
 
 	gap := width - lipgloss.Width(header) - lipgloss.Width(pill)
@@ -378,7 +427,250 @@ func (tw *TelemetryWidget) View(width int) string {
 	}
 	lines = append(lines, cpuLine, memLine)
 
+	if tw.expanded {
+		chartLines := tw.renderExpandedCharts(width)
+		if len(chartLines) > 0 {
+			lines = append(lines, chartLines...)
+		}
+	}
+
 	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+func (tw *TelemetryWidget) renderExpandedCharts(width int) []string {
+	if tw == nil || len(tw.history) == 0 {
+		return nil
+	}
+
+	halfWidth := (width - 4) / 2
+	if halfWidth < 20 {
+		halfWidth = 20
+	}
+	labelWidth := 7
+	graphWidth := halfWidth - labelWidth
+	if graphWidth < 8 {
+		graphWidth = 8
+	}
+
+	cpuPoints := make([]float64, len(tw.history))
+	ramPoints := make([]float64, len(tw.history))
+	peakCPU := 0.0
+	var peakRAM uint64
+	for i, pt := range tw.history {
+		cpuPoints[i] = pt.CPU
+		ramPoints[i] = float64(pt.RSSBytes)
+		if pt.CPU > peakCPU {
+			peakCPU = pt.CPU
+		}
+		if pt.RSSBytes > peakRAM {
+			peakRAM = pt.RSSBytes
+		}
+	}
+	curCPU := 0.0
+	var curRAM uint64
+	if tw.sample != nil {
+		curCPU = tw.sample.StepCPU
+		curRAM = tw.sample.StepRSSBytes
+		if tw.sample.StepCPU > peakCPU {
+			peakCPU = tw.sample.StepCPU
+		}
+		if tw.sample.StepRSSBytes > peakRAM {
+			peakRAM = tw.sample.StepRSSBytes
+		}
+	}
+
+	maxCPU := 100.0
+	if peakCPU > 100.0 {
+		maxCPU = math.Ceil(peakCPU/50.0) * 50.0
+	}
+	cpuGraphStr := RenderBrailleLineGraph(cpuPoints, graphWidth, 4, maxCPU, lipgloss.Color("#38BDF8"))
+	cpuGraphRows := strings.Split(cpuGraphStr, "\n")
+
+	maxRAM := float64(peakRAM) * 1.25
+	if tw.limits != nil && tw.limits.Memory > 0 && float64(tw.limits.Memory) > maxRAM {
+		maxRAM = float64(tw.limits.Memory)
+	} else if tw.sample != nil && tw.sample.HostMemTotal > 0 && float64(tw.sample.HostMemTotal) > maxRAM {
+		if maxRAM < 128*1024*1024 {
+			maxRAM = 128 * 1024 * 1024
+		}
+	}
+	if maxRAM <= 0 {
+		maxRAM = 128 * 1024 * 1024
+	}
+	ramGraphStr := RenderBrailleLineGraph(ramPoints, graphWidth, 4, maxRAM, lipgloss.Color("#10B981"))
+	ramGraphRows := strings.Split(ramGraphStr, "\n")
+
+	cpuYLabels := [4]string{
+		fmt.Sprintf("%4.0f%% ┤", maxCPU),
+		fmt.Sprintf("%4.0f%% ┤", maxCPU*0.66),
+		fmt.Sprintf("%4.0f%% ┤", maxCPU*0.33),
+		"   0% ┤",
+	}
+	ramYLabels := [4]string{
+		fmt.Sprintf("%5s ┤", formatBytes(uint64(maxRAM))),
+		fmt.Sprintf("%5s ┤", formatBytes(uint64(maxRAM*0.66))),
+		fmt.Sprintf("%5s ┤", formatBytes(uint64(maxRAM*0.33))),
+		"   0B ┤",
+	}
+
+	// Titles
+	cpuTitleText := fmt.Sprintf("CPU Usage  •  Peak: %.1f%%  •  Now: %.1f%%", peakCPU, curCPU)
+	ramTitleText := fmt.Sprintf("Memory (RSS)  •  Peak: %s  •  Now: %s", formatBytes(peakRAM), formatBytes(curRAM))
+
+	cpuTitle := radarTitleStyle.Render(cpuTitleText)
+	ramTitle := radarTitleStyle.Render(ramTitleText)
+
+	cpuPad := halfWidth - lipgloss.Width(cpuTitle)
+	if cpuPad < 2 {
+		cpuPad = 2
+	}
+	titleLine := cpuTitle + strings.Repeat(" ", cpuPad) + ramTitle
+
+	var out []string
+	out = append(out, titleLine)
+
+	for r := 0; r < 4; r++ {
+		leftCell := statKeyStyle.Render(cpuYLabels[r]) + cpuGraphRows[r]
+		rightCell := statKeyStyle.Render(ramYLabels[r]) + ramGraphRows[r]
+		pad := halfWidth - lipgloss.Width(leftCell)
+		if pad < 2 {
+			pad = 2
+		}
+		out = append(out, leftCell+strings.Repeat(" ", pad)+rightCell)
+	}
+
+	// Axis footer line showing time window
+	timePad := graphWidth - 8
+	if timePad < 2 {
+		timePad = 2
+	}
+	cpuTime := dimStyle.Render(fmt.Sprintf("       -60s%snow", strings.Repeat(" ", timePad)))
+	ramTime := dimStyle.Render(fmt.Sprintf("       -60s%snow", strings.Repeat(" ", timePad)))
+	pad := halfWidth - lipgloss.Width(cpuTime)
+	if pad < 2 {
+		pad = 2
+	}
+	out = append(out, cpuTime+strings.Repeat(" ", pad)+ramTime)
+
+	return out
+}
+
+// RenderBrailleLineGraph generates a high-resolution Unicode Braille (2x4 dots per cell)
+// continuous wave line graph for a series of data points.
+func RenderBrailleLineGraph(points []float64, width, height int, maxValue float64, color lipgloss.Color) string {
+	if width <= 0 {
+		width = 20
+	}
+	if height <= 0 {
+		height = 4
+	}
+
+	if maxValue <= 0 {
+		for _, p := range points {
+			if p > maxValue {
+				maxValue = p
+			}
+		}
+		if maxValue <= 0 {
+			maxValue = 100.0
+		}
+	}
+
+	canvasW := width * 2
+	canvasH := height * 4
+
+	grid := make([][]rune, height)
+	for r := 0; r < height; r++ {
+		grid[r] = make([]rune, width)
+	}
+
+	lut := [2][4]rune{
+		{0x01, 0x02, 0x04, 0x40}, // subCol 0: dy 0, 1, 2, 3
+		{0x08, 0x10, 0x20, 0x80}, // subCol 1: dy 0, 1, 2, 3
+	}
+
+	setDot := func(px, py int) {
+		if px < 0 || px >= canvasW || py < 0 || py >= canvasH {
+			return
+		}
+		cellCol := px / 2
+		subCol := px % 2
+		cellRow := py / 4
+		subRow := py % 4
+		grid[cellRow][cellCol] |= lut[subCol][subRow]
+	}
+
+	if len(points) > 0 {
+		var pts []float64
+		if len(points) > canvasW {
+			pts = points[len(points)-canvasW:]
+		} else {
+			pts = points
+		}
+		offset := canvasW - len(pts)
+
+		for i, val := range pts {
+			x := offset + i
+			if val < 0 {
+				val = 0
+			}
+			if val > maxValue {
+				val = maxValue
+			}
+			ratio := val / maxValue
+			y := int(math.Round((1.0 - ratio) * float64(canvasH-1)))
+			if y < 0 {
+				y = 0
+			}
+			if y >= canvasH {
+				y = canvasH - 1
+			}
+
+			if i == 0 {
+				setDot(x, y)
+			} else {
+				prevVal := pts[i-1]
+				if prevVal < 0 {
+					prevVal = 0
+				}
+				if prevVal > maxValue {
+					prevVal = maxValue
+				}
+				prevRatio := prevVal / maxValue
+				prevY := int(math.Round((1.0 - prevRatio) * float64(canvasH-1)))
+				if prevY < 0 {
+					prevY = 0
+				}
+				if prevY >= canvasH {
+					prevY = canvasH - 1
+				}
+
+				minY, maxY := prevY, y
+				if minY > maxY {
+					minY, maxY = maxY, minY
+				}
+				for cy := minY; cy <= maxY; cy++ {
+					setDot(x, cy)
+				}
+			}
+		}
+	}
+
+	style := lipgloss.NewStyle().Foreground(color)
+	lines := make([]string, height)
+	for r := 0; r < height; r++ {
+		var sb strings.Builder
+		for c := 0; c < width; c++ {
+			dots := grid[r][c]
+			if dots == 0 {
+				sb.WriteRune(' ')
+			} else {
+				sb.WriteRune(rune(0x2800 | dots))
+			}
+		}
+		lines[r] = style.Render(sb.String())
+	}
+	return strings.Join(lines, "\n")
 }
 
 // HasSystemMetrics returns true if telemetry contains host disk or I/O metrics.
