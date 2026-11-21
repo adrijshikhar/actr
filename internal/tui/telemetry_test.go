@@ -21,8 +21,11 @@ func TestTelemetryWidget_RenderGauges(t *testing.T) {
 		StepCPU:      42.5,
 		StepRSSBytes: 256 * 1024 * 1024, // 256MB
 		HostCPU:      15.0,
-		HostMemUsed:  8 * 1024 * 1024 * 1024,
-		HostMemTotal: 16 * 1024 * 1024 * 1024,
+		HostMemUsed:   8 * 1024 * 1024 * 1024,
+		HostMemTotal:  16 * 1024 * 1024 * 1024,
+		DiskTotalBytes: 500 * 1024 * 1024 * 1024,
+		DiskUsedBytes:  100 * 1024 * 1024 * 1024,
+		DiskFreeBytes:  400 * 1024 * 1024 * 1024,
 	}
 
 	tw.Update(sample)
@@ -37,8 +40,9 @@ func TestTelemetryWidget_RenderGauges(t *testing.T) {
 	if !strings.Contains(view, "PID: 12345") {
 		t.Fatalf("expected view to contain header metadata, got:\n%s", view)
 	}
-	if !strings.Contains(view, "DISK:") {
-		t.Fatalf("expected view to contain DISK line, got:\n%s", view)
+	sysView := tw.ViewSystem(60)
+	if !strings.Contains(sysView, "DISK:") {
+		t.Fatalf("expected ViewSystem to contain DISK line, got:\n%s", sysView)
 	}
 }
 
@@ -194,10 +198,11 @@ func TestTelemetryWidget_StrictMonospaceAlignment(t *testing.T) {
 	})
 
 	view := tw.View(90)
+	sysView := tw.ViewSystem(90)
 
 	// Ensure progress bar tracks start on the EXACT same column
 	lines := strings.Split(view, "\n")
-	var cpuLine, ramLine, diskLine string
+	var cpuLine, ramLine string
 	for _, l := range lines {
 		if strings.Contains(l, "CPU :") {
 			cpuLine = l
@@ -205,13 +210,16 @@ func TestTelemetryWidget_StrictMonospaceAlignment(t *testing.T) {
 		if strings.Contains(l, "RAM :") {
 			ramLine = l
 		}
+	}
+	var diskLine string
+	for _, l := range strings.Split(sysView, "\n") {
 		if strings.Contains(l, "DISK:") {
 			diskLine = l
 		}
 	}
 
 	if cpuLine == "" || ramLine == "" || diskLine == "" {
-		t.Fatalf("expected view to have CPU, RAM, and DISK lines, got:\n%s", view)
+		t.Fatalf("expected view to have CPU, RAM, and DISK lines, got:\n%s\n%s", view, sysView)
 	}
 
 	// Bar opening bracket '[' must appear at identical column indices
@@ -267,6 +275,7 @@ func TestTelemetryWidget_IOLineAndProcessCount(t *testing.T) {
 			TraceID:        "abcd1234ef0123456789",
 		})
 		view := tw.View(80)
+		sysView := tw.ViewSystem(80)
 		if !strings.Contains(view, "PID: 4200 (5 procs)") {
 			t.Fatalf("expected process count in view, got:\n%s", view)
 		}
@@ -276,8 +285,8 @@ func TestTelemetryWidget_IOLineAndProcessCount(t *testing.T) {
 		if !strings.Contains(view, "TRACE: abcd1234...") {
 			t.Fatalf("expected truncated trace ID in view, got:\n%s", view)
 		}
-		if !strings.Contains(view, "I/O :         NET: 10 MB/s ↓  2 MB/s ↑  │  DISK WR: 20 MB/s") {
-			t.Fatalf("expected aligned I/O line in view, got:\n%s", view)
+		if !strings.Contains(sysView, "I/O :         NET: 10 MB/s ↓  2 MB/s ↑  │  DISK WR: 20 MB/s") {
+			t.Fatalf("expected aligned I/O line in sysView, got:\n%s", sysView)
 		}
 	})
 
@@ -293,8 +302,9 @@ func TestTelemetryWidget_IOLineAndProcessCount(t *testing.T) {
 			ActiveStepName: "Test",
 		})
 		view := tw.View(80)
-		if strings.Contains(view, "I/O :") {
-			t.Fatalf("expected no I/O line when rates are 0, got:\n%s", view)
+		sysView := tw.ViewSystem(80)
+		if strings.Contains(sysView, "I/O :") {
+			t.Fatalf("expected no I/O line when rates are 0, got:\n%s", sysView)
 		}
 		if !strings.Contains(view, "TRACE: Standby") {
 			t.Fatalf("expected standby trace when trace ID is empty, got:\n%s", view)
@@ -403,8 +413,9 @@ func TestTelemetryWidget_WithLimits_MonospaceAlignment(t *testing.T) {
 	})
 
 	view := tw.View(80)
+	sysView := tw.ViewSystem(80)
 	lines := strings.Split(view, "\n")
-	var cpuLine, ramLine, diskLine string
+	var cpuLine, ramLine string
 	for _, l := range lines {
 		if strings.Contains(l, "CPU :") {
 			cpuLine = l
@@ -412,6 +423,9 @@ func TestTelemetryWidget_WithLimits_MonospaceAlignment(t *testing.T) {
 		if strings.Contains(l, "RAM :") {
 			ramLine = l
 		}
+	}
+	var diskLine string
+	for _, l := range strings.Split(sysView, "\n") {
 		if strings.Contains(l, "DISK:") {
 			diskLine = l
 		}

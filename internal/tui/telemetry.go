@@ -369,6 +369,33 @@ func (tw *TelemetryWidget) View(width int) string {
 	}
 	memLine := fmt.Sprintf("%s[%s]%s", ramPrefix, tw.memProg.ViewAs(memRatio), ramSuffix)
 
+	lines := []string{
+		topLine,
+		metaLine,
+	}
+	if slotSummary := tw.formatSlotSummary(); slotSummary != "" {
+		lines = append(lines, slotSummary)
+	}
+	lines = append(lines, cpuLine, memLine)
+
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+// HasSystemMetrics returns true if telemetry contains host disk or I/O metrics.
+func (tw *TelemetryWidget) HasSystemMetrics() bool {
+	if tw == nil || tw.sample == nil {
+		return false
+	}
+	return tw.sample.DiskTotalBytes > 0 || tw.sample.DiskFreeBytes > 0 || tw.sample.NetRxRate > 0 || tw.sample.DiskWriteRate > 0
+}
+
+// ViewSystem renders the Host / System metrics (Disk usage bar & Network/Disk I/O)
+// for the bottom section of the dashboard.
+func (tw *TelemetryWidget) ViewSystem(width int) string {
+	if tw == nil || tw.sample == nil || !tw.HasSystemMetrics() {
+		return ""
+	}
+
 	diskRatio := tw.sample.DiskUsedRatio
 	if diskRatio == 0 && tw.sample.DiskTotalBytes > 0 {
 		diskRatio = float64(tw.sample.DiskUsedBytes) / float64(tw.sample.DiskTotalBytes)
@@ -379,6 +406,13 @@ func (tw *TelemetryWidget) View(width int) string {
 	if diskRatio < 0 {
 		diskRatio = 0
 	}
+
+	prefixLen := 14
+	barWidth := width - prefixLen - 26
+	if barWidth < 10 {
+		barWidth = 10
+	}
+	tw.diskProg.Width = barWidth
 
 	diskPrefix := fmt.Sprintf("DISK: %7s ", formatBytes(tw.sample.DiskUsedBytes))
 	if len(diskPrefix) != 14 {
@@ -401,25 +435,9 @@ func (tw *TelemetryWidget) View(width int) string {
 	diskSuffix := fmt.Sprintf("  %3.0f%% (%s free)", diskPct, formatBytes(freeBytes))
 	diskLine := fmt.Sprintf("%s[%s]%s", diskPrefix, tw.diskProg.ViewAs(diskRatio), diskSuffix)
 
-	lines := []string{
-		topLine,
-		metaLine,
-	}
-	if slotSummary := tw.formatSlotSummary(); slotSummary != "" {
-		lines = append(lines, slotSummary)
-	}
-	lines = append(lines, cpuLine, memLine)
-
-	// Distinct separation for Host / System resource metrics
-	if width >= 40 {
-		sysLabel := " HOST / SYSTEM "
-		pad := width - len(sysLabel) - 4
-		if pad < 2 {
-			pad = 2
-		}
-		sep := dimStyle.Render("──" + sysLabel + strings.Repeat("─", pad))
-		lines = append(lines, sep)
-	}
+	var lines []string
+	header := radarTitleStyle.Render("~ HOST / SYSTEM")
+	lines = append(lines, header)
 	lines = append(lines, diskLine)
 
 	if tw.sample.NetRxRate > 0 || tw.sample.NetTxRate > 0 || tw.sample.DiskWriteRate > 0 {
