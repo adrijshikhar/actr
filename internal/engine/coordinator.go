@@ -22,6 +22,7 @@ import (
 	"github.com/adrijshikhar/actr/internal/monitor"
 	"github.com/adrijshikhar/actr/internal/protocol"
 	"github.com/adrijshikhar/actr/internal/telemetry"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -385,6 +386,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		repo = c.repoAlias
 	}
 
+	jobStartTime := time.Now()
 	var jobSpan trace.Span
 	if c.tracer != nil {
 		ctx, jobSpan = c.tracer.StartJobSpan(ctx, jobID, workflowName, repo, owner)
@@ -431,6 +433,18 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 
 	conclusion := "success"
 	defer func() {
+		jobDuration := time.Since(jobStartTime)
+		if c.tracer != nil {
+			if jobSpan != nil {
+				if conclusion != "success" {
+					c.tracer.RecordSpanError(jobSpan, fmt.Errorf("job failed with status %s", conclusion))
+				} else {
+					jobSpan.SetStatus(codes.Ok, "")
+				}
+			}
+			c.tracer.RecordJobCompletion(ctx, jobID, workflowName, repo, owner, conclusion, jobDuration.Seconds())
+		}
+
 		c.mu.RLock()
 		s := c.monServer
 		c.mu.RUnlock()
@@ -1200,8 +1214,14 @@ func (c *Coordinator) executeStep(ctx context.Context, d driver.Driver, jobID st
 		}
 	}
 
-	return c.executeWithStreams(ctx, jobID, spec.ID, stepDisplayName, spec.Script, stepLogger, jobMasker, func(stdout, stderr io.Writer) (*driver.StepResult, error) {
-		return d.ExecuteStep(ctx, spec, stdout, stderr)
+	return c.executeWithStreams(ctx, jobID, spec.ID, stepDisplayName, spec.Script, stepLogger, jobMasker, func(stepCtx context.Context, stdout, stderr io.Writer) (*driver.StepResult, error) {
+		if c.tracer != nil && spec != nil {
+			if spec.Environment == nil {
+				spec.Environment = make(map[string]string)
+			}
+			c.tracer.InjectStepTraceContext(stepCtx, spec.Environment)
+		}
+		return d.ExecuteStep(stepCtx, spec, stdout, stderr)
 	})
 }
 
@@ -1211,7 +1231,7 @@ func (c *Coordinator) executeActionStep(ctx context.Context, jobID, stepID, step
 	if ref != nil {
 		scriptDesc = fmt.Sprintf("uses: %s@%s", ref.Name, ref.Version)
 	}
-	return c.executeWithStreams(ctx, jobID, stepID, stepDisplayName, scriptDesc, stepLogger, jobMasker, func(stdout, stderr io.Writer) (*driver.StepResult, error) {
+	return c.executeWithStreams(ctx, jobID, stepID, stepDisplayName, scriptDesc, stepLogger, jobMasker, func(stepCtx context.Context, stdout, stderr io.Writer) (*driver.StepResult, error) {
 		if actCtx == nil {
 			err := errors.New("action context is nil")
 			_, _ = fmt.Fprintf(stderr, "Error: %v\n", err)
@@ -1265,7 +1285,7 @@ func (c *Coordinator) executeActionStep(ctx context.Context, jobID, stepID, step
 		}
 		actCtx.Manifest = manifest
 
-		execErr := action.ExecuteNodeAction(ctx, nodePath, scriptPath, actCtx, stdout, stderr)
+		execErr := action.ExecuteNodeAction(stepCtx, nodePath, scriptPath, actCtx, stdout, stderr)
 		exitCode := 0
 		if execErr != nil {
 			exitCode = 1
@@ -1280,7 +1300,7 @@ func (c *Coordinator) executeActionStep(ctx context.Context, jobID, stepID, step
 }
 
 // executeWithStreams wraps common stream piping, logging, telemetry, and monitor notifications.
-func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, stepDisplayName, scriptDesc string, stepLogger *StepLogger, jobMasker *SecretMasker, runFn func(stdout, stderr io.Writer) (*driver.StepResult, error)) (*driver.StepResult, time.Duration, error) {
+func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, stepDisplayName, scriptDesc string, stepLogger *StepLogger, jobMasker *SecretMasker, runFn func(stepCtx context.Context, stdout, stderr io.Writer) (*driver.StepResult, error)) (*driver.StepResult, time.Duration, error) {
 	c.NotifyStepStart(jobID, stepID, stepDisplayName)
 
 	stdout := c.stdout
@@ -1394,7 +1414,7 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 	}()
 
 	startTime := time.Now()
-	res, stepErr := runFn(stepOut, stepErrStream)
+	res, stepErr := runFn(ctx, stepOut, stepErrStream)
 	if stepOutWriter != nil {
 		stepOutWriter.Flush()
 	}
@@ -1415,9 +1435,25 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 		exitCode = 1
 	}
 
+	durationSec := duration.Seconds()
 	if success {
+		if c.tracer != nil {
+			if stepSpan != nil {
+				c.tracer.FinishStepSpan(stepSpan, exitCode, "success")
+			}
+			c.tracer.RecordStepCompletion(ctx, stepID, stepDisplayName, "success", exitCode, durationSec)
+		}
 		c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusSuccess, exitCode)
 	} else {
+		if c.tracer != nil {
+			if stepSpan != nil {
+				if stepErr != nil {
+					c.tracer.RecordSpanError(stepSpan, stepErr)
+				}
+				c.tracer.FinishStepSpan(stepSpan, exitCode, "failed")
+			}
+			c.tracer.RecordStepCompletion(ctx, stepID, stepDisplayName, "failed", exitCode, durationSec)
+		}
 		c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusFailed, exitCode)
 	}
 

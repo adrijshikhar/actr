@@ -1360,7 +1360,15 @@ func (m *DashboardModel) calcDimensions() (treeWidth, rightWidth, targetOuterHei
 		telemOuterHeight = 4
 	}
 
-	logOuterHeight := targetOuterHeight - telemOuterHeight
+	sysOuterHeight := 0
+	if m.height >= 24 && m.telemetry != nil && m.telemetry.HasSystemMetrics() && !m.isOffline {
+		sysOuterHeight = 4
+		if s := m.telemetry.Sample(); s != nil && (s.NetRxRate > 0 || s.DiskWriteRate > 0) {
+			sysOuterHeight = 5
+		}
+	}
+
+	logOuterHeight := targetOuterHeight - telemOuterHeight - sysOuterHeight
 	logInnerHeight = logOuterHeight - 2
 	if logInnerHeight < 1 {
 		logInnerHeight = 1
@@ -2864,14 +2872,31 @@ func (m *DashboardModel) View() string {
 		telemBox := inactiveBorder.Width(rightWidth).Render(telemContent)
 		telemOuterHeight := lipgloss.Height(telemBox)
 
-		logOuterHeight := targetOuterHeight - telemOuterHeight
+		sysContent := ""
+		sysOuterHeight := 0
+		var sysBox string
+		if m.height >= 24 && m.telemetry != nil && m.telemetry.HasSystemMetrics() && !m.isOffline {
+			sysContent = m.telemetry.ViewSystem(rightWidth)
+			if sysContent != "" {
+				sysBox = inactiveBorder.Width(rightWidth).Render(sysContent)
+				sysOuterHeight = lipgloss.Height(sysBox)
+			}
+		}
+
+		logOuterHeight := targetOuterHeight - telemOuterHeight - sysOuterHeight
 		actualLogInnerHeight := logOuterHeight - 2
 		if actualLogInnerHeight < 1 {
 			actualLogInnerHeight = 1
 		}
 		logContent := m.renderLogViewport(rightWidth, actualLogInnerHeight)
 		logBox := logStyle.Width(rightWidth).Height(actualLogInnerHeight).Render(logContent)
-		rightPane := lipgloss.JoinVertical(lipgloss.Left, telemBox, logBox)
+
+		var rightPane string
+		if sysBox != "" {
+			rightPane = lipgloss.JoinVertical(lipgloss.Left, telemBox, logBox, sysBox)
+		} else {
+			rightPane = lipgloss.JoinVertical(lipgloss.Left, telemBox, logBox)
+		}
 		content = lipgloss.JoinHorizontal(lipgloss.Top, treeBox, rightPane)
 	}
 

@@ -2828,3 +2828,31 @@ func TestDashboard_SyncHUD_CompletedLiveRunShowsPeakSummary(t *testing.T) {
 	assert.Contains(t, view, "Build Task")
 }
 
+func TestDashboard_HostSystemBottomSection(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	sample := &monitor.RunnerMetrics{
+		PID:            5555,
+		StepCPU:        45.0,
+		StepRSSBytes:   200 * 1024 * 1024,
+		DiskTotalBytes: 500 * 1024 * 1024 * 1024,
+		DiskUsedBytes:  100 * 1024 * 1024 * 1024,
+		DiskFreeBytes:  400 * 1024 * 1024 * 1024,
+		NetRxRate:      5 * 1024 * 1024,
+		DiskWriteRate:  12 * 1024 * 1024,
+	}
+	m.telemetry.Update(sample)
+
+	view := m.View()
+	// Top HUD should contain RUN VITALS & RADAR, CPU, RAM
+	assert.Contains(t, view, "RUN VITALS & RADAR")
+	assert.Contains(t, view, "CPU :")
+	assert.Contains(t, view, "RAM :")
+
+	// Bottom section should contain HOST / SYSTEM with DISK and I/O
+	assert.Contains(t, view, "HOST / SYSTEM")
+	assert.Contains(t, view, "DISK:")
+	assert.Contains(t, view, "I/O :")
+}
+

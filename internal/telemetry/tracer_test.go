@@ -93,3 +93,50 @@ func TestTracer_ShutdownNilCleanFn(t *testing.T) {
 		t.Fatal("expected valid non-nil stepSpan from nil Manager.StartStepSpan")
 	}
 }
+
+func TestTracer_InjectStepTraceContext(t *testing.T) {
+	ctx := context.Background()
+	mgr, err := NewManager(ctx, "actr-test")
+	if err != nil {
+		t.Fatalf("unexpected error creating tracer manager: %v", err)
+	}
+	defer func() { _ = mgr.Shutdown(ctx) }()
+
+	jobCtx, jobSpan := mgr.StartJobSpan(ctx, "job-100", "CI", "repo", "owner")
+	defer jobSpan.End()
+
+	stepCtx, stepSpan := mgr.StartStepSpan(jobCtx, "step-100", "Compile")
+	defer stepSpan.End()
+
+	env := make(map[string]string)
+	mgr.InjectStepTraceContext(stepCtx, env)
+
+	traceparent, ok := env["TRACEPARENT"]
+	if !ok || traceparent == "" {
+		t.Fatalf("expected TRACEPARENT to be injected into env, got: %v", env)
+	}
+
+	sc := stepSpan.SpanContext()
+	expectedTraceparent := "00-" + sc.TraceID().String() + "-" + sc.SpanID().String() + "-" + sc.TraceFlags().String()
+	if traceparent != expectedTraceparent {
+		t.Fatalf("expected TRACEPARENT %q, got %q", expectedTraceparent, traceparent)
+	}
+}
+
+func TestTracer_MetricsRecording_ZeroConfigAndNil(t *testing.T) {
+	ctx := context.Background()
+	mgr, err := NewManager(ctx, "actr-test")
+	if err != nil {
+		t.Fatalf("unexpected error creating tracer manager: %v", err)
+	}
+	defer func() { _ = mgr.Shutdown(ctx) }()
+
+	// Calling on zero-config initialized manager should not panic
+	mgr.RecordJobCompletion(ctx, "job-1", "build", "repo", "owner", "success", 1.25)
+	mgr.RecordStepCompletion(ctx, "step-1", "run", "success", 0, 0.45)
+
+	// Calling on nil manager should not panic
+	var nilMgr *Manager
+	nilMgr.RecordJobCompletion(ctx, "job-1", "build", "repo", "owner", "success", 1.25)
+	nilMgr.RecordStepCompletion(ctx, "step-1", "run", "success", 0, 0.45)
+}

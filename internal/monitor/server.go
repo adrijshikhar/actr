@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -551,6 +552,12 @@ func (s *Server) Publish(ev Event) {
 			}
 			if ev.RepoAlias != "" {
 				job.RepoAlias = ev.RepoAlias
+			}
+			prefix := jobID + "/"
+			for k := range s.stepLogs {
+				if strings.HasPrefix(k, prefix) {
+					delete(s.stepLogs, k)
+				}
 			}
 			s.jobs[jobID] = job
 			found := false

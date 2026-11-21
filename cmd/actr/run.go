@@ -24,6 +24,7 @@ import (
 	"github.com/adrijshikhar/actr/internal/protocol"
 	"github.com/adrijshikhar/actr/internal/registration"
 	"github.com/adrijshikhar/actr/internal/supervisor"
+	"github.com/adrijshikhar/actr/internal/telemetry"
 	"github.com/spf13/cobra"
 )
 
@@ -259,6 +260,20 @@ func newRunCmd() *cobra.Command {
 				return err
 			}
 
+			// Initialize shared OpenTelemetry Manager (Traces & Metrics)
+			otelMgr, otelErr := telemetry.NewManager(ctx, "actr")
+			if otelErr != nil {
+				logger.Warn("Failed to initialize OpenTelemetry", "error", otelErr)
+			} else {
+				defer func() {
+					shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+					defer cancel()
+					if err := otelMgr.Shutdown(shutdownCtx); err != nil {
+						logger.Debug("OpenTelemetry shutdown error", "error", err)
+					}
+				}()
+			}
+
 			// Check for multi-repo supervisor configuration (e.g. config.yaml with version: "1" and repos:)
 			var multiRepoConfigPath string
 			for _, name := range []string{"config.yaml", "config.yml"} {
@@ -278,6 +293,9 @@ func newRunCmd() *cobra.Command {
 				sup, err := supervisor.NewSupervisor(supCfg, sockPath)
 				if err != nil {
 					return fmt.Errorf("initialize supervisor: %w", err)
+				}
+				if otelMgr != nil {
+					sup.WithTracer(otelMgr)
 				}
 
 				// Wire SQLite history store and retention to supervisor monitor server
@@ -479,6 +497,9 @@ func newRunCmd() *cobra.Command {
 				if limitsConfig != nil {
 					coordEngine = coordEngine.WithLimits(limitsConfig)
 				}
+				if otelMgr != nil {
+					coordEngine = coordEngine.WithTracer(otelMgr)
+				}
 				coord = coordEngine
 			} else {
 				if c, ok := coord.(*engine.Coordinator); ok {
@@ -487,6 +508,9 @@ func newRunCmd() *cobra.Command {
 					}
 					if limitsConfig != nil {
 						c.WithLimits(limitsConfig)
+					}
+					if otelMgr != nil {
+						c.WithTracer(otelMgr)
 					}
 				} else {
 					type limitsSetter interface {

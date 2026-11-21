@@ -9,6 +9,7 @@ import (
 	"github.com/adrijshikhar/actr/internal/config"
 	"github.com/adrijshikhar/actr/internal/logger"
 	"github.com/adrijshikhar/actr/internal/monitor"
+	"github.com/adrijshikhar/actr/internal/telemetry"
 )
 
 // Supervisor manages multi-tenant repository workers, global resource governance,
@@ -19,6 +20,7 @@ type Supervisor struct {
 	sockPath      string
 	resMgr        *ResourceManager
 	monServer     *monitor.Server
+	tracer        *telemetry.Manager
 	workers       map[string]*RepoWorker
 	pollingCtx    context.Context
 	pollingCancel context.CancelFunc
@@ -61,6 +63,17 @@ func NewSupervisor(cfg *config.SupervisorConfig, sockPath string) (*Supervisor, 
 	}
 	sup.updateMonitorStatus()
 	return sup, nil
+}
+
+// WithTracer attaches a shared OpenTelemetry Manager to the Supervisor and propagates it to all workers.
+func (s *Supervisor) WithTracer(tm *telemetry.Manager) *Supervisor {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tracer = tm
+	for _, w := range s.workers {
+		w.WithTracer(tm)
+	}
+	return s
 }
 
 // ResourceManager returns the global resource governance manager.
@@ -214,6 +227,9 @@ func (s *Supervisor) Reload(newCfg *config.SupervisorConfig) error {
 			if err != nil {
 				s.mu.Unlock()
 				return fmt.Errorf("create worker for added repo %q: %w", alias, err)
+			}
+			if s.tracer != nil {
+				w.WithTracer(s.tracer)
 			}
 			addedWorkers[alias] = w
 		}
