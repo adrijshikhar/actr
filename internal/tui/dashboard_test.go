@@ -2828,3 +2828,124 @@ func TestDashboard_SyncHUD_CompletedLiveRunShowsPeakSummary(t *testing.T) {
 	assert.Contains(t, view, "Build Task")
 }
 
+func TestDashboard_HostSystemBottomSection(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	sample := &monitor.RunnerMetrics{
+		PID:            5555,
+		StepCPU:        45.0,
+		StepRSSBytes:   200 * 1024 * 1024,
+		DiskTotalBytes: 500 * 1024 * 1024 * 1024,
+		DiskUsedBytes:  100 * 1024 * 1024 * 1024,
+		DiskFreeBytes:  400 * 1024 * 1024 * 1024,
+		NetRxRate:      5 * 1024 * 1024,
+		DiskWriteRate:  12 * 1024 * 1024,
+	}
+	m.telemetry.Update(sample)
+
+	view := m.View()
+	// Top HUD should contain RUN VITALS & RADAR, CPU, RAM
+	assert.Contains(t, view, "RUN VITALS & RADAR")
+	assert.Contains(t, view, "CPU :")
+	assert.Contains(t, view, "RAM :")
+
+	// Bottom section should contain HOST / SYSTEM with DISK and I/O
+	assert.Contains(t, view, "HOST / SYSTEM")
+	assert.Contains(t, view, "DISK:")
+	assert.Contains(t, view, "I/O :")
+}
+
+func TestDashboard_ToggleMetricsExpansion_KeyAndClick(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 35})
+
+	m.telemetry.Update(&monitor.RunnerMetrics{
+		PID:            1234,
+		ActiveStepName: "Compile binaries",
+		StepCPU:        45.0,
+		StepRSSBytes:   200 * 1024 * 1024,
+	})
+
+	assert.False(t, m.telemetry.IsExpanded())
+
+	// Press 'e' to toggle expanded
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	assert.True(t, m.telemetry.IsExpanded(), "expected expanded after pressing 'e'")
+
+	// Press 'e' to toggle collapsed
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	assert.False(t, m.telemetry.IsExpanded(), "expected collapsed after pressing 'e' again")
+
+	// Click in telemetry HUD (X=40, Y=2) to toggle expanded
+	_, _ = m.Update(tea.MouseMsg{
+		X:      40,
+		Y:      2,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	assert.True(t, m.telemetry.IsExpanded(), "expected expanded after clicking telemetry HUD")
+}
+
+func TestDashboard_HistoricalJobMetricsAndExpansion(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 35})
+
+	// Add recent historical job with metrics
+	snap := &monitor.Snapshot{
+		RecentJobs: []*monitor.JobInfo{
+			{
+				ID:        "job-linux-1",
+				Name:      "test-linux-amd64",
+				Repo:      "actr",
+				RepoAlias: "actr",
+				Status:    monitor.StatusSuccess,
+				Driver:    "docker",
+				MetricsSummary: &monitor.RunMetricsSummary{
+					PeakCPUPercent:        68.4,
+					PeakRSSBytes:          192 * 1024 * 1024,
+					TotalNetRxBytes:       18 * 1024 * 1024,
+					TotalNetTxBytes:       4 * 1024 * 1024,
+					TotalDiskWrittenBytes: 45 * 1024 * 1024,
+				},
+			},
+		},
+	}
+	_, _ = m.Update(SnapshotMsg(snap))
+
+	// Find and select the historical job node
+	hist := m.getHistoricalBranch()
+	require.NotNil(t, hist)
+	hist.Expanded = true
+	var jobNode *TreeNode
+	for _, repo := range hist.Children {
+		repo.Expanded = true
+		for _, j := range repo.Children {
+			if j.ID == "job-linux-1" {
+				jobNode = j
+				break
+			}
+		}
+	}
+	require.NotNil(t, jobNode)
+	m.tree.Rebuild()
+
+	// Select the job node
+	m.tree.SelectNode(jobNode)
+	m.syncHistoricalHUD()
+
+	require.True(t, m.telemetry.IsHistorical())
+	view := m.telemetry.View(100)
+	assert.Contains(t, view, "68.4%")
+	assert.Contains(t, view, "192 MB")
+	assert.Contains(t, view, "expand (e)")
+
+	// Press 'e' to toggle expanded
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	assert.True(t, m.telemetry.IsExpanded())
+	expandedView := m.telemetry.View(100)
+	assert.Contains(t, expandedView, "collapse (e)")
+	assert.Contains(t, expandedView, "CPU Profile")
+	assert.Contains(t, expandedView, "Memory Profile")
+}
+

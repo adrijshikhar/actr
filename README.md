@@ -36,7 +36,9 @@ actr doctor                # check prerequisites, git, node, and toolchain depen
 - **Single static binary** — 100% pure Go (`CGO_ENABLED=0`), zero CGO, zero external binary runtime dependencies.
 - **Bare-metal performance** — sub-25 MB idle RAM (vs 350+ MB for .NET CoreCLR); runs directly on native compilers without container overhead.
 - **Zero-click registration** — automatically detects repository URL from `git remote origin` and acquires runner tokens via `gh` CLI.
-- **Interactive TUI dashboard** — explorer tree (`Workflow` → `Job` → `Steps`), live CPU/RAM telemetry, streaming ANSI logs, and single-key zoom (`z`).
+- **Interactive TUI dashboard** — unified explorer tree (`Workflow` → `Job` → `Steps` + `Historical Runs`), live CPU/RAM/Net/Disk telemetry with expandable 4-graph Braille wave profiles (`e`), streaming ANSI logs, and single-key zoom (`z`).
+- **Real-time host vitals HUD** — persistent status bar monitoring host CPU, RAM, disk headroom, and dynamic I/O rates (`net rx/tx`, `disk write`).
+- **OpenTelemetry & metrics export** — stream live runner and host metrics directly to any OTLP collector (InfluxDB v3, Prometheus, Datadog, Grafana) via `--otel-endpoint`.
 - **Local run & log persistence** — automatically preserves past job metadata, duration, peak vitals (CPU/RSS), and full ANSI-colored step logs under `~/.actr/runs/`.
 - **Offline history browsing** — inspect historical runs anytime with `actr monitor` even when the daemon is stopped, with seamless background auto-reconnect when the runner starts.
 - **Decoupled daemon architecture** — background daemon runs headlessly; terminal monitor attaches/detaches over a Unix socket (`~/.actr/daemon.sock`) without interrupting jobs.
@@ -120,8 +122,13 @@ actr monitor --demo           # launch simulation showcasing live and historical
 |---|---|
 | `↑` / `k`, `↓` / `j` | Navigate items in the Explorer Tree |
 | `Enter` / `Space` | Expand or collapse tree node |
+| `e` | Expand / collapse 4-graph telemetry HUD (CPU, RAM, Net I/O, Disk Write) |
+| `s` | Filter & search Explorer Tree |
+| `Ctrl+F` / `/` | Search within active step logs |
+| `c` | Copy highlighted / active step logs to system clipboard |
 | `z` | Toggle 100% full-screen log zoom |
 | `f` | Toggle auto-follow (tail) active step logs |
+| `Tab` | Switch focus between Tree and Log Viewport |
 | `q` / `Ctrl+C` | Detach monitor (daemon keeps running) |
 
 ---
@@ -149,10 +156,15 @@ You can inspect past workflow runs and step logs even when the runner daemon is 
 actr monitor
 ```
 When `daemon.sock` is unreachable, `actr monitor` automatically launches in **Offline Mode** (`◉ OFFLINE (HISTORY)`):
-- Displays completed runs under `HISTORICAL RUNS` in the Explorer Tree.
-- Inspect peak vitals (peak CPU %, peak RSS RAM, network I/O, disk writes) and duration in the HUD.
+- Displays completed runs grouped by repository under `HISTORICAL RUNS` in the unified Explorer Tree.
+- Inspect peak vitals (peak CPU %, peak RSS RAM, total network I/O, disk writes) and duration in the HUD.
+- Press `e` to expand multi-phase historical Braille execution profiles (CPU, Memory, Network, Disk).
 - Step logs are retrieved directly from disk, preserving ANSI styling.
 - Seamless auto-reconnect: if the daemon starts in the background, the monitor connects automatically and transitions to live streaming.
+
+<p align="center">
+  <img src="docs/images/actr-monitor-historical.png" alt="actr Offline History & Past Run Profiles" width="850" />
+</p>
 
 To browse runs from a custom runs directory:
 ```bash
@@ -174,6 +186,32 @@ When either limit is exceeded after a job finishes, `actr` safely deletes the ol
 ### Crash Recovery
 
 If the daemon is killed (`SIGKILL`, reboot, power loss) mid-run, any job left in `running` status is automatically recovered and marked as `interrupted` upon the next daemon start or monitor boot.
+
+---
+
+## 📡 OpenTelemetry & Metrics Export
+
+Stream live runner execution and host vitals directly to any OpenTelemetry collector (InfluxDB v3, Prometheus, Datadog, Grafana Mimir, Jaeger):
+
+```bash
+# Push metrics via OTLP/HTTP to InfluxDB or local collector
+actr run --otel-endpoint http://localhost:4318
+
+# Push via gRPC with custom auth headers
+actr run --otel-endpoint localhost:4317 --otel-protocol grpc --otel-headers "Authorization=Bearer <token>"
+```
+
+### Exported Gauges
+| Metric | Description |
+|---|---|
+| `actr.step.cpu_percent` | Instantaneous CPU % consumed by the active step process group |
+| `actr.step.memory_rss_bytes` | Resident Set Size (RSS) memory consumption |
+| `actr.step.net_rx_rate_bytes_per_second` | Network receive throughput |
+| `actr.step.net_tx_rate_bytes_per_second` | Network transmit throughput |
+| `actr.step.disk_write_rate_bytes_per_second` | Step disk write I/O rate |
+| `actr.host.cpu_percent` | Total host machine CPU utilization |
+| `actr.host.memory_used_bytes` / `actr.host.memory_total_bytes` | Host RAM consumption & total capacity |
+| `actr.host.disk_used_bytes` / `actr.host.disk_total_bytes` | Host storage utilization & capacity |
 
 ---
 

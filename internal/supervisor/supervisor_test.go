@@ -10,6 +10,7 @@ import (
 
 	"github.com/adrijshikhar/actr/internal/config"
 	"github.com/adrijshikhar/actr/internal/protocol"
+	"github.com/adrijshikhar/actr/internal/telemetry"
 )
 
 // testSocketPath returns a unix socket path suitable for testing on Darwin/Linux.
@@ -413,5 +414,36 @@ func TestSupervisor_ReloadAtomicValidationFailure(t *testing.T) {
 	// Invariant: resMgr must NOT have resized to 10 if validation failed
 	if s.ResourceManager().MaxConcurrentJobs() != 2 {
 		t.Errorf("expected MaxConcurrentJobs to remain 2 after failed reload, got %d", s.ResourceManager().MaxConcurrentJobs())
+	}
+}
+
+func TestSupervisor_WithTracer(t *testing.T) {
+	cfg := &config.SupervisorConfig{
+		Version: "1",
+		Global: config.GlobalConfig{
+			MaxConcurrentJobs: 2,
+		},
+		Repos: map[string]config.RepoConfig{
+			"repo-a": {URL: "https://github.com/owner/repo-a"},
+		},
+	}
+	s, err := NewSupervisor(cfg, "")
+	if err != nil {
+		t.Fatalf("NewSupervisor failed: %v", err)
+	}
+
+	tm, err := telemetry.NewManager(context.Background(), "supervisor-test")
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	defer func() { _ = tm.Shutdown(context.Background()) }()
+
+	s.WithTracer(tm)
+	if s.tracer != tm {
+		t.Errorf("expected supervisor tracer to be set")
+	}
+	worker := s.workers["repo-a"]
+	if worker == nil || worker.tracer != tm {
+		t.Errorf("expected worker tracer to be set via WithTracer")
 	}
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/adrijshikhar/actr/internal/logger"
 	"github.com/adrijshikhar/actr/internal/monitor"
 	"github.com/adrijshikhar/actr/internal/protocol"
+	"github.com/adrijshikhar/actr/internal/telemetry"
 )
 
 // JobRequestReference holds metadata describing a dispatched job message.
@@ -57,6 +58,7 @@ type RepoWorker struct {
 	brokerClient     BrokerClientInterface
 	runServiceClient RunServiceClientInterface
 	coordinator      JobExecutor
+	tracer           *telemetry.Manager
 	repoSem          chan struct{}
 	executingJobs    atomic.Int32
 	workFolder       string
@@ -150,6 +152,9 @@ func NewRepoWorker(alias string, repoCfg config.RepoConfig, resMgr *ResourceMana
 		if limits, err := repoCfg.ParseLimits(); err == nil && limits != nil {
 			coord.WithLimits(limits)
 		}
+		if w.tracer != nil {
+			coord.WithTracer(w.tracer)
+		}
 		w.coordinator = coord
 	}
 
@@ -161,6 +166,17 @@ func (w *RepoWorker) SetBrokerClient(b BrokerClientInterface) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.brokerClient = b
+}
+
+// WithTracer sets the OpenTelemetry Manager on the worker and its coordinator.
+func (w *RepoWorker) WithTracer(tm *telemetry.Manager) *RepoWorker {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.tracer = tm
+	if c, ok := w.coordinator.(*engine.Coordinator); ok && tm != nil {
+		c.WithTracer(tm)
+	}
+	return w
 }
 
 // SetRunServiceClient overrides the RunServiceClient (useful for testing and mocking).

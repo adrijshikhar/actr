@@ -796,6 +796,13 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmd := m.treeSearchInput.Focus()
 				return m, cmd
 			}
+		case "e", "E":
+			if m.telemetry != nil {
+				m.telemetry.ToggleExpanded()
+				m.updateSizes()
+				return m, nil
+			}
+			return m, nil
 		case "m", "M":
 			m.mouseEnabled = !m.mouseEnabled
 			var cmd tea.Cmd
@@ -979,8 +986,26 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		viewportTop := 1
 		if !m.isZoomed {
 			telemOuterHeight := 6
+			isHist := m.telemetry != nil && m.telemetry.IsHistorical()
+			if isHist {
+				telemOuterHeight = 8
+			}
 			if m.height < 18 {
 				telemOuterHeight = 4
+			} else if m.telemetry != nil && m.telemetry.IsExpanded() {
+				if m.height >= 34 {
+					if isHist {
+						telemOuterHeight = 20
+					} else {
+						telemOuterHeight = 18
+					}
+				} else if m.height >= 26 {
+					if isHist {
+						telemOuterHeight = 16
+					} else {
+						telemOuterHeight = 14
+					}
+				}
 			}
 			viewportTop = telemOuterHeight + 1
 		}
@@ -1060,6 +1085,15 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					cmd = m.setToast("○ Auto-follow OFF (manual scrolling)")
 				}
 				return m, cmd
+			}
+
+			// Click in Telemetry HUD toggles expansion
+			if !m.isZoomed && msg.X >= sidebarWidth && msg.Y >= 0 && msg.Y < viewportTop {
+				if m.telemetry != nil {
+					m.telemetry.ToggleExpanded()
+					m.updateSizes()
+					return m, nil
+				}
 			}
 
 			if !m.isZoomed && msg.X < sidebarWidth {
@@ -1356,11 +1390,37 @@ func (m *DashboardModel) calcDimensions() (treeWidth, rightWidth, targetOuterHei
 	}
 
 	telemOuterHeight := 6
+	isHist := m.telemetry != nil && m.telemetry.IsHistorical()
+	if isHist {
+		telemOuterHeight = 8
+	}
 	if m.height < 18 {
 		telemOuterHeight = 4
+	} else if m.telemetry != nil && m.telemetry.IsExpanded() {
+		if m.height >= 34 {
+			if isHist {
+				telemOuterHeight = 20
+			} else {
+				telemOuterHeight = 18
+			}
+		} else if m.height >= 26 {
+			if isHist {
+				telemOuterHeight = 16
+			} else {
+				telemOuterHeight = 14
+			}
+		}
 	}
 
-	logOuterHeight := targetOuterHeight - telemOuterHeight
+	sysOuterHeight := 0
+	if m.height >= 24 && m.telemetry != nil && m.telemetry.HasSystemMetrics() && !m.isOffline {
+		sysOuterHeight = 4
+		if s := m.telemetry.Sample(); s != nil && (s.NetRxRate > 0 || s.DiskWriteRate > 0) {
+			sysOuterHeight = 5
+		}
+	}
+
+	logOuterHeight := targetOuterHeight - telemOuterHeight - sysOuterHeight
 	logInnerHeight = logOuterHeight - 2
 	if logInnerHeight < 1 {
 		logInnerHeight = 1
@@ -1678,11 +1738,20 @@ func (m *DashboardModel) extractHistoricalSummary(jobNode *TreeNode) *Historical
 			if !d.EndedAt.IsZero() && !d.StartedAt.IsZero() {
 				dur = int64(d.EndedAt.Sub(d.StartedAt).Seconds())
 			}
-			return &HistoricalRunSummary{
+			summary := &HistoricalRunSummary{
 				JobName:     d.Name,
 				Status:      d.Status,
 				DurationSec: dur,
+				Driver:      d.Driver,
 			}
+			if d.MetricsSummary != nil {
+				summary.PeakCPUPercent = d.MetricsSummary.PeakCPUPercent
+				summary.PeakRSSBytes = d.MetricsSummary.PeakRSSBytes
+				summary.TotalNetRx = d.MetricsSummary.TotalNetRxBytes
+				summary.TotalNetTx = d.MetricsSummary.TotalNetTxBytes
+				summary.TotalDiskWrite = d.MetricsSummary.TotalDiskWrittenBytes
+			}
+			return summary
 		}
 	}
 
@@ -2864,14 +2933,31 @@ func (m *DashboardModel) View() string {
 		telemBox := inactiveBorder.Width(rightWidth).Render(telemContent)
 		telemOuterHeight := lipgloss.Height(telemBox)
 
-		logOuterHeight := targetOuterHeight - telemOuterHeight
+		sysContent := ""
+		sysOuterHeight := 0
+		var sysBox string
+		if m.height >= 24 && m.telemetry != nil && m.telemetry.HasSystemMetrics() && !m.isOffline {
+			sysContent = m.telemetry.ViewSystem(rightWidth)
+			if sysContent != "" {
+				sysBox = inactiveBorder.Width(rightWidth).Render(sysContent)
+				sysOuterHeight = lipgloss.Height(sysBox)
+			}
+		}
+
+		logOuterHeight := targetOuterHeight - telemOuterHeight - sysOuterHeight
 		actualLogInnerHeight := logOuterHeight - 2
 		if actualLogInnerHeight < 1 {
 			actualLogInnerHeight = 1
 		}
 		logContent := m.renderLogViewport(rightWidth, actualLogInnerHeight)
 		logBox := logStyle.Width(rightWidth).Height(actualLogInnerHeight).Render(logContent)
-		rightPane := lipgloss.JoinVertical(lipgloss.Left, telemBox, logBox)
+
+		var rightPane string
+		if sysBox != "" {
+			rightPane = lipgloss.JoinVertical(lipgloss.Left, telemBox, logBox, sysBox)
+		} else {
+			rightPane = lipgloss.JoinVertical(lipgloss.Left, telemBox, logBox)
+		}
 		content = lipgloss.JoinHorizontal(lipgloss.Top, treeBox, rightPane)
 	}
 

@@ -289,6 +289,24 @@ func (s *TelemetrySampler) Sample() (sample *RunnerMetrics) {
 		}
 	}
 
+	if sample.PID > 0 {
+		if p, err := process.NewProcess(sample.PID); err == nil {
+			if numThreads, err := p.NumThreads(); err == nil && numThreads > 0 {
+				sample.ThreadCount = int(numThreads)
+			}
+		}
+	}
+	if sample.ThreadCount <= 0 {
+		if sample.ProcessCount > 0 {
+			sample.ThreadCount = sample.ProcessCount
+		} else if sample.PID > 0 {
+			sample.ThreadCount = 1
+		}
+	}
+	if sample.StepWorkingSetBytes == 0 && sample.StepRSSBytes > 0 {
+		sample.StepWorkingSetBytes = sample.StepRSSBytes
+	}
+
 	// Workspace Ephemeral Storage
 	targetDir := workspaceDir
 	if targetDir == "" {

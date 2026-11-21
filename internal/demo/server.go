@@ -61,9 +61,17 @@ func seedInitialState(server *monitor.Server) {
 		RepoAlias: "actr",
 		RepoURL:   "https://github.com/adrijshikhar/actr",
 		Owner:     "adrijshikhar",
+		Driver:    "docker",
 		Status:    monitor.StatusSuccess,
 		StartedAt: now.Add(-5 * time.Minute),
 		EndedAt:   now.Add(-3 * time.Minute),
+		MetricsSummary: &monitor.RunMetricsSummary{
+			PeakCPUPercent:        68.4,
+			PeakRSSBytes:          192 * 1024 * 1024,
+			TotalNetRxBytes:       18 * 1024 * 1024,
+			TotalNetTxBytes:       4 * 1024 * 1024,
+			TotalDiskWrittenBytes: 45 * 1024 * 1024,
+		},
 		Steps: []*monitor.StepInfo{
 			{ID: "l-1", Name: "Setup runner", Status: monitor.StatusSuccess, StartedAt: now.Add(-5 * time.Minute), EndedAt: now.Add(-4*time.Minute - 50*time.Second)},
 			{ID: "l-2", Name: "Checkout code", Status: monitor.StatusSuccess, StartedAt: now.Add(-4*time.Minute - 50*time.Second), EndedAt: now.Add(-4*time.Minute - 35*time.Second)},
@@ -89,9 +97,17 @@ func seedInitialState(server *monitor.Server) {
 		RepoAlias: "aim",
 		RepoURL:   "https://github.com/adrijshikhar/aim",
 		Owner:     "adrijshikhar",
+		Driver:    "host",
 		Status:    monitor.StatusSuccess,
 		StartedAt: now.Add(-3 * time.Minute),
 		EndedAt:   now.Add(-1 * time.Minute),
+		MetricsSummary: &monitor.RunMetricsSummary{
+			PeakCPUPercent:        54.0,
+			PeakRSSBytes:          210 * 1024 * 1024,
+			TotalNetRxBytes:       12 * 1024 * 1024,
+			TotalNetTxBytes:       2 * 1024 * 1024,
+			TotalDiskWrittenBytes: 30 * 1024 * 1024,
+		},
 		Steps: []*monitor.StepInfo{
 			{ID: "m-1", Name: "Setup runner", Status: monitor.StatusSuccess, StartedAt: now.Add(-3 * time.Minute), EndedAt: now.Add(-2*time.Minute - 50*time.Second)},
 			{ID: "m-2", Name: "Checkout code", Status: monitor.StatusSuccess, StartedAt: now.Add(-2*time.Minute - 50*time.Second), EndedAt: now.Add(-2*time.Minute - 40*time.Second)},
@@ -152,9 +168,11 @@ func seedInitialState(server *monitor.Server) {
 		PID:            currPID,
 		PGID:           currPID,
 		HostCPU:        15.4,
-		StepCPU:        48.2,
-		StepRSSBytes:   184 * 1024 * 1024,
-		HostMemUsed:    16 * 1024 * 1024 * 1024,
+		StepCPU:             48.2,
+		StepRSSBytes:        184 * 1024 * 1024,
+		StepWorkingSetBytes: 210 * 1024 * 1024,
+		ThreadCount:         18,
+		HostMemUsed:         16 * 1024 * 1024 * 1024,
 		HostMemTotal:   36 * 1024 * 1024 * 1024,
 		TraceID:        "4bf92f3577b34da6a3ce929d0e0e4736",
 		DiskTotalBytes: 250 * 1024 * 1024 * 1024,
@@ -255,9 +273,11 @@ func runSimulation(ctx context.Context, server *monitor.Server) {
 				PID:            currPID,
 				PGID:           currPID,
 				HostCPU:        14.0 + float64(idx%6)*0.7,
-				StepCPU:        cpuJitter[idx%len(cpuJitter)],
-				StepRSSBytes:   memJitterMB[idx%len(memJitterMB)] * 1024 * 1024,
-				HostMemUsed:    16 * 1024 * 1024 * 1024,
+				StepCPU:             cpuJitter[idx%len(cpuJitter)],
+				StepRSSBytes:        memJitterMB[idx%len(memJitterMB)] * 1024 * 1024,
+				StepWorkingSetBytes: (memJitterMB[idx%len(memJitterMB)] + 25) * 1024 * 1024,
+				ThreadCount:         16 + (idx % 4),
+				HostMemUsed:         16 * 1024 * 1024 * 1024,
 				HostMemTotal:   36 * 1024 * 1024 * 1024,
 				TraceID:        "4bf92f3577b34da6a3ce929d0e0e4736",
 				DiskTotalBytes: 250 * 1024 * 1024 * 1024,
@@ -413,6 +433,10 @@ func runSimulation(ctx context.Context, server *monitor.Server) {
 						StepID:    "s-2",
 						Step:      &monitor.StepInfo{ID: "s-2", Name: "Compile binaries", Status: monitor.StatusRunning, StartedAt: time.Now()},
 					})
+					server.AppendJobStepLog("job-live-1", "s-1", "\x1b[38;5;244m2026-11-16T14:34:00Z\x1b[0m \x1b[1;34m##[group]Check environment\x1b[0m")
+					server.AppendJobStepLog("job-live-1", "s-1", "\x1b[38;5;244m2026-11-16T14:34:01Z\x1b[0m Verified Go version: 1.27.4 darwin/arm64")
+					server.AppendJobStepLog("job-live-1", "s-1", "\x1b[38;5;244m2026-11-16T14:34:05Z\x1b[0m \x1b[1;32m✓\x1b[0m Toolchain dependencies verified")
+					server.AppendJobStepLog("job-live-1", "s-1", "\x1b[38;5;244m2026-11-16T14:34:10Z\x1b[0m \x1b[1;34m##[endgroup]\x1b[0m")
 				}
 			}
 

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -552,6 +553,12 @@ func (s *Server) Publish(ev Event) {
 			if ev.RepoAlias != "" {
 				job.RepoAlias = ev.RepoAlias
 			}
+			prefix := jobID + "/"
+			for k := range s.stepLogs {
+				if strings.HasPrefix(k, prefix) {
+					delete(s.stepLogs, k)
+				}
+			}
 			s.jobs[jobID] = job
 			found := false
 			for i, j := range s.activeJobs {
@@ -644,6 +651,9 @@ func (s *Server) Publish(ev Event) {
 		if metrics, ok := s.peakMetrics[jobID]; ok {
 			peakMetrics = metrics
 			delete(s.peakMetrics, jobID)
+		}
+		if jobToSave != nil && peakMetrics != nil {
+			jobToSave.MetricsSummary = peakMetrics
 		}
 		delete(s.lastTelemetryTime, jobID)
 

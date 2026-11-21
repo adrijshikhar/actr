@@ -21,8 +21,11 @@ func TestTelemetryWidget_RenderGauges(t *testing.T) {
 		StepCPU:      42.5,
 		StepRSSBytes: 256 * 1024 * 1024, // 256MB
 		HostCPU:      15.0,
-		HostMemUsed:  8 * 1024 * 1024 * 1024,
-		HostMemTotal: 16 * 1024 * 1024 * 1024,
+		HostMemUsed:   8 * 1024 * 1024 * 1024,
+		HostMemTotal:  16 * 1024 * 1024 * 1024,
+		DiskTotalBytes: 500 * 1024 * 1024 * 1024,
+		DiskUsedBytes:  100 * 1024 * 1024 * 1024,
+		DiskFreeBytes:  400 * 1024 * 1024 * 1024,
 	}
 
 	tw.Update(sample)
@@ -37,8 +40,9 @@ func TestTelemetryWidget_RenderGauges(t *testing.T) {
 	if !strings.Contains(view, "PID: 12345") {
 		t.Fatalf("expected view to contain header metadata, got:\n%s", view)
 	}
-	if !strings.Contains(view, "DISK:") {
-		t.Fatalf("expected view to contain DISK line, got:\n%s", view)
+	sysView := tw.ViewSystem(60)
+	if !strings.Contains(sysView, "DISK:") {
+		t.Fatalf("expected ViewSystem to contain DISK line, got:\n%s", sysView)
 	}
 }
 
@@ -194,10 +198,11 @@ func TestTelemetryWidget_StrictMonospaceAlignment(t *testing.T) {
 	})
 
 	view := tw.View(90)
+	sysView := tw.ViewSystem(90)
 
 	// Ensure progress bar tracks start on the EXACT same column
 	lines := strings.Split(view, "\n")
-	var cpuLine, ramLine, diskLine string
+	var cpuLine, ramLine string
 	for _, l := range lines {
 		if strings.Contains(l, "CPU :") {
 			cpuLine = l
@@ -205,13 +210,16 @@ func TestTelemetryWidget_StrictMonospaceAlignment(t *testing.T) {
 		if strings.Contains(l, "RAM :") {
 			ramLine = l
 		}
+	}
+	var diskLine string
+	for _, l := range strings.Split(sysView, "\n") {
 		if strings.Contains(l, "DISK:") {
 			diskLine = l
 		}
 	}
 
 	if cpuLine == "" || ramLine == "" || diskLine == "" {
-		t.Fatalf("expected view to have CPU, RAM, and DISK lines, got:\n%s", view)
+		t.Fatalf("expected view to have CPU, RAM, and DISK lines, got:\n%s\n%s", view, sysView)
 	}
 
 	// Bar opening bracket '[' must appear at identical column indices
@@ -267,6 +275,7 @@ func TestTelemetryWidget_IOLineAndProcessCount(t *testing.T) {
 			TraceID:        "abcd1234ef0123456789",
 		})
 		view := tw.View(80)
+		sysView := tw.ViewSystem(80)
 		if !strings.Contains(view, "PID: 4200 (5 procs)") {
 			t.Fatalf("expected process count in view, got:\n%s", view)
 		}
@@ -276,8 +285,8 @@ func TestTelemetryWidget_IOLineAndProcessCount(t *testing.T) {
 		if !strings.Contains(view, "TRACE: abcd1234...") {
 			t.Fatalf("expected truncated trace ID in view, got:\n%s", view)
 		}
-		if !strings.Contains(view, "I/O :         NET: 10 MB/s ↓  2 MB/s ↑  │  DISK WR: 20 MB/s") {
-			t.Fatalf("expected aligned I/O line in view, got:\n%s", view)
+		if !strings.Contains(sysView, "I/O :         NET: 10 MB/s ↓  2 MB/s ↑  │  DISK WR: 20 MB/s") {
+			t.Fatalf("expected aligned I/O line in sysView, got:\n%s", sysView)
 		}
 	})
 
@@ -293,8 +302,9 @@ func TestTelemetryWidget_IOLineAndProcessCount(t *testing.T) {
 			ActiveStepName: "Test",
 		})
 		view := tw.View(80)
-		if strings.Contains(view, "I/O :") {
-			t.Fatalf("expected no I/O line when rates are 0, got:\n%s", view)
+		sysView := tw.ViewSystem(80)
+		if strings.Contains(sysView, "I/O :") {
+			t.Fatalf("expected no I/O line when rates are 0, got:\n%s", sysView)
 		}
 		if !strings.Contains(view, "TRACE: Standby") {
 			t.Fatalf("expected standby trace when trace ID is empty, got:\n%s", view)
@@ -403,8 +413,9 @@ func TestTelemetryWidget_WithLimits_MonospaceAlignment(t *testing.T) {
 	})
 
 	view := tw.View(80)
+	sysView := tw.ViewSystem(80)
 	lines := strings.Split(view, "\n")
-	var cpuLine, ramLine, diskLine string
+	var cpuLine, ramLine string
 	for _, l := range lines {
 		if strings.Contains(l, "CPU :") {
 			cpuLine = l
@@ -412,6 +423,9 @@ func TestTelemetryWidget_WithLimits_MonospaceAlignment(t *testing.T) {
 		if strings.Contains(l, "RAM :") {
 			ramLine = l
 		}
+	}
+	var diskLine string
+	for _, l := range strings.Split(sysView, "\n") {
 		if strings.Contains(l, "DISK:") {
 			diskLine = l
 		}
@@ -641,4 +655,123 @@ func TestTelemetryWidget_SupervisorSlots(t *testing.T) {
 	})
 	activeView := tw.View(80)
 	assert.Contains(t, activeView, "ACTIVE: aim (1/1 slots), cxstatusline (0/1 slots)")
+}
+
+func TestTelemetryWidget_BrailleLineGraph(t *testing.T) {
+	// 1. Empty series
+	emptyGraph := RenderBrailleLineGraph(nil, 20, 4, 100, lipgloss.Color("#38BDF8"))
+	lines := strings.Split(emptyGraph, "\n")
+	assert.Equal(t, 4, len(lines), "expected 4 rows for empty graph")
+
+	// 2. Linear ramp series
+	points := []float64{0, 25, 50, 75, 100}
+	rampGraph := RenderBrailleLineGraph(points, 20, 4, 100, lipgloss.Color("#38BDF8"))
+	lines = strings.Split(rampGraph, "\n")
+	assert.Equal(t, 4, len(lines), "expected 4 rows for ramp graph")
+	assert.NotEmpty(t, rampGraph)
+}
+
+func TestTelemetryWidget_BrailleAreaGraph(t *testing.T) {
+	// 1. Empty series
+	emptyGraph := RenderBrailleAreaGraph(nil, 20, 4, 100, lipgloss.Color("#38BDF8"))
+	lines := strings.Split(emptyGraph, "\n")
+	assert.Equal(t, 4, len(lines), "expected 4 rows for empty area graph")
+
+	// 2. Linear ramp series with filled area underneath
+	points := []float64{0, 25, 50, 75, 100}
+	areaGraph := RenderBrailleAreaGraph(points, 20, 4, 100, lipgloss.Color("#38BDF8"))
+	lines = strings.Split(areaGraph, "\n")
+	assert.Equal(t, 4, len(lines), "expected 4 rows for area graph")
+	assert.NotEmpty(t, areaGraph)
+}
+
+func TestTelemetryWidget_ExpandedCharts(t *testing.T) {
+	tw := NewTelemetryWidget()
+	assert.False(t, tw.IsExpanded(), "expected initially collapsed")
+
+	// Feed samples to populate history
+	for i := 0; i < 10; i++ {
+		tw.Update(&monitor.RunnerMetrics{
+			PID:            1234,
+			ActiveStepName: "Compile binaries",
+			StepCPU:        float64(20 + i*5),
+			StepRSSBytes:   uint64((100 + i*10) * 1024 * 1024),
+			StepElapsedSec: int64(i),
+		})
+	}
+
+	// Collapsed view should have expand cue
+	collapsedView := tw.View(100)
+	assert.Contains(t, collapsedView, "expand (e)")
+	assert.NotContains(t, collapsedView, "CPU Usage")
+
+	// Toggle expanded
+	tw.ToggleExpanded()
+	assert.True(t, tw.IsExpanded())
+
+	expandedView := tw.View(100)
+	assert.Contains(t, expandedView, "collapse (e)")
+	assert.Contains(t, expandedView, "CPU Usage")
+	assert.Contains(t, expandedView, "Memory")
+	assert.Contains(t, expandedView, "Network I/O")
+	assert.Contains(t, expandedView, "Disk Write")
+
+	// Toggle back to collapsed
+	tw.ToggleExpanded()
+	assert.False(t, tw.IsExpanded())
+	viewAgain := tw.View(100)
+	assert.Contains(t, viewAgain, "expand (e)")
+}
+
+func TestTelemetryWidget_HistoricalExpandedCharts(t *testing.T) {
+	tw := NewTelemetryWidget()
+	summary := &HistoricalRunSummary{
+		JobName:        "test-linux-amd64",
+		Status:         monitor.StatusSuccess,
+		DurationSec:    120,
+		Driver:         "docker",
+		PeakCPUPercent: 68.4,
+		PeakRSSBytes:   192 * 1024 * 1024,
+		TotalNetRx:     18 * 1024 * 1024,
+		TotalNetTx:     4 * 1024 * 1024,
+		TotalDiskWrite: 45 * 1024 * 1024,
+	}
+	tw.SetHistoricalRun(summary)
+
+	// Collapsed: has expand cue, no charts
+	collapsed := tw.View(100)
+	assert.Contains(t, collapsed, "expand (e)")
+	assert.NotContains(t, collapsed, "CPU Profile")
+
+	// Toggle expanded
+	tw.ToggleExpanded()
+	assert.True(t, tw.IsExpanded())
+
+	expanded := tw.View(100)
+	assert.Contains(t, expanded, "collapse (e)")
+	assert.Contains(t, expanded, "CPU Profile")
+	assert.Contains(t, expanded, "Memory Profile")
+	assert.Contains(t, expanded, "Network Profile")
+	assert.Contains(t, expanded, "Disk Profile")
+
+	// Toggle back
+	tw.ToggleExpanded()
+	assert.False(t, tw.IsExpanded())
+	viewAgain := tw.View(100)
+	assert.Contains(t, viewAgain, "expand (e)")
+}
+
+func TestTelemetryWidget_TotalCapacityInBrackets(t *testing.T) {
+	tw := NewTelemetryWidget()
+	tw.Update(&monitor.TelemetrySample{
+		PID:          1234,
+		StepCPU:      44.0,
+		StepRSSBytes: 245 * 1024 * 1024,
+		HostMemTotal: 16 * 1024 * 1024 * 1024,
+	})
+
+	view := tw.View(100)
+	assert.Contains(t, view, "total:")
+	assert.Contains(t, view, "16 GB")
+	assert.Contains(t, view, "CPUs")
 }

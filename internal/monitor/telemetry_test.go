@@ -176,3 +176,22 @@ func TestSampleProcessGroup_CurrentProcess(t *testing.T) {
 func TestGetAllDescendants_NilOrEmpty(t *testing.T) {
 	assert.Nil(t, getAllDescendants(nil))
 }
+
+func TestTelemetrySampler_EnrichedMetrics(t *testing.T) {
+	sampler := NewTelemetrySampler()
+	pid := int32(os.Getpid()) // #nosec G115 -- PID fits in int32
+	sampler.SetTargetPID(pid, pid)
+
+	sample := sampler.Sample()
+	require.NotNil(t, sample)
+
+	// Thread count must be at least 1 for the running test process
+	assert.GreaterOrEqual(t, sample.ThreadCount, 1, "expected ThreadCount >= 1")
+
+	// StepWorkingSetBytes must be at least StepRSSBytes (WSS >= RSS)
+	assert.GreaterOrEqual(t, sample.StepWorkingSetBytes, sample.StepRSSBytes, "expected WorkingSet >= RSS")
+
+	// Read and Write rates should be valid uint64 fields
+	assert.GreaterOrEqual(t, sample.StepDiskReadRate, uint64(0))
+	assert.GreaterOrEqual(t, sample.DiskWriteRate, uint64(0))
+}
