@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"math"
+	"runtime"
 	"strings"
 
 	"github.com/adrijshikhar/actr/internal/config"
@@ -62,8 +63,11 @@ type TelemetryWidget struct {
 
 // MetricPoint records a single time snapshot of step resource usage.
 type MetricPoint struct {
-	CPU      float64
-	RSSBytes uint64
+	CPU           float64
+	RSSBytes      uint64
+	NetRxRate     uint64
+	NetTxRate     uint64
+	DiskWriteRate uint64
 }
 
 // HistoricalRunSummary captures execution metadata and aggregate peak vitals for a historical run.
@@ -151,8 +155,11 @@ func (tw *TelemetryWidget) Update(sample *monitor.TelemetrySample) {
 	tw.sample = sample
 	if sample != nil && sample.PID > 0 {
 		tw.history = append(tw.history, MetricPoint{
-			CPU:      sample.StepCPU,
-			RSSBytes: sample.StepRSSBytes,
+			CPU:           sample.StepCPU,
+			RSSBytes:      sample.StepRSSBytes,
+			NetRxRate:     sample.NetRxRate,
+			NetTxRate:     sample.NetTxRate,
+			DiskWriteRate: sample.DiskWriteRate,
 		})
 		if len(tw.history) > 120 {
 			tw.history = tw.history[len(tw.history)-120:]
@@ -340,14 +347,6 @@ func (tw *TelemetryWidget) View(width int) string {
 
 	metaLine := dimStyle.Render(fmt.Sprintf("STEP: %s  │  %s  │  %s  │  %s", stepName, pidStr, timeStr, traceStr))
 
-	barWidth := width - 42
-	if barWidth < 10 {
-		barWidth = 10
-	}
-	tw.cpuProg.Width = barWidth
-	tw.memProg.Width = barWidth
-	tw.diskProg.Width = barWidth
-
 	var cpuRatio float64
 	var cpuSuffix string
 	if tw.limits != nil && tw.limits.CPU > 0 {
@@ -359,7 +358,8 @@ func (tw *TelemetryWidget) View(width int) string {
 		cpuSuffix = fmt.Sprintf("  %3.0f%% of %.1f CPUs", pct, tw.limits.CPU)
 	} else {
 		cpuRatio = tw.sample.StepCPU / 100.0
-		cpuSuffix = fmt.Sprintf("  %3.0f%%", tw.sample.StepCPU)
+		numCPUs := runtime.NumCPU()
+		cpuSuffix = fmt.Sprintf("  %3.0f%% (total: %d CPUs)", tw.sample.StepCPU, numCPUs)
 	}
 	if cpuRatio > 1.0 {
 		cpuRatio = 1.0
@@ -367,17 +367,6 @@ func (tw *TelemetryWidget) View(width int) string {
 	if cpuRatio < 0 {
 		cpuRatio = 0
 	}
-
-	cpuPrefix := fmt.Sprintf("CPU : %5.1f%%  ", tw.sample.StepCPU)
-	if len(cpuPrefix) != 14 {
-		if len(cpuPrefix) > 14 && strings.HasSuffix(cpuPrefix, " ") {
-			cpuPrefix = strings.TrimSuffix(cpuPrefix, " ")
-		}
-		if len(cpuPrefix) < 14 {
-			cpuPrefix = fmt.Sprintf("%-14s", cpuPrefix)
-		}
-	}
-	cpuLine := fmt.Sprintf("%s[%s]%s", cpuPrefix, tw.cpuProg.ViewAs(cpuRatio), cpuSuffix)
 
 	var memRatio float64
 	var ramSuffix string
@@ -391,14 +380,20 @@ func (tw *TelemetryWidget) View(width int) string {
 		}
 		ramSuffix = fmt.Sprintf("  %3.0f%% of %s", pct, formatBytes(uint64(tw.limits.Memory)))
 	} else {
+		var totalMem uint64
 		if tw.sample.HostMemTotal > 0 {
+			totalMem = tw.sample.HostMemTotal
 			if tw.sample.StepRSSBytes > 0 {
 				memRatio = float64(tw.sample.StepRSSBytes) / float64(tw.sample.HostMemTotal)
 			} else if tw.sample.HostMemUsed > 0 {
 				memRatio = float64(tw.sample.HostMemUsed) / float64(tw.sample.HostMemTotal)
 			}
 		}
-		ramSuffix = fmt.Sprintf("  %3.0f%%", memRatio*100)
+		if totalMem > 0 {
+			ramSuffix = fmt.Sprintf("  %3.0f%% (total: %s)", memRatio*100, formatBytes(totalMem))
+		} else {
+			ramSuffix = fmt.Sprintf("  %3.0f%%", memRatio*100)
+		}
 	}
 	if memRatio > 1.0 {
 		memRatio = 1.0
@@ -406,6 +401,29 @@ func (tw *TelemetryWidget) View(width int) string {
 	if memRatio < 0 {
 		memRatio = 0
 	}
+
+	maxSuffix := len(cpuSuffix)
+	if len(ramSuffix) > maxSuffix {
+		maxSuffix = len(ramSuffix)
+	}
+	barWidth := width - 14 - maxSuffix - 2
+	if barWidth < 6 {
+		barWidth = 6
+	}
+	tw.cpuProg.Width = barWidth
+	tw.memProg.Width = barWidth
+	tw.diskProg.Width = barWidth
+
+	cpuPrefix := fmt.Sprintf("CPU : %5.1f%%  ", tw.sample.StepCPU)
+	if len(cpuPrefix) != 14 {
+		if len(cpuPrefix) > 14 && strings.HasSuffix(cpuPrefix, " ") {
+			cpuPrefix = strings.TrimSuffix(cpuPrefix, " ")
+		}
+		if len(cpuPrefix) < 14 {
+			cpuPrefix = fmt.Sprintf("%-14s", cpuPrefix)
+		}
+	}
+	cpuLine := fmt.Sprintf("%s[%s]%s", cpuPrefix, tw.cpuProg.ViewAs(cpuRatio), cpuSuffix)
 
 	ramPrefix := fmt.Sprintf("RAM : %7s ", formatBytes(tw.sample.StepRSSBytes))
 	if len(ramPrefix) != 14 {
@@ -566,6 +584,93 @@ func (tw *TelemetryWidget) renderExpandedCharts(width int) []string {
 		pad = 2
 	}
 	out = append(out, cpuTime+strings.Repeat(" ", pad)+ramTime)
+
+	// Row 2: Network I/O and Disk Write Rate
+	netPoints := make([]float64, len(tw.history))
+	diskPoints := make([]float64, len(tw.history))
+	peakNet := 0.0
+	peakDisk := 0.0
+	for i, pt := range tw.history {
+		totNet := float64(pt.NetRxRate + pt.NetTxRate)
+		netPoints[i] = totNet
+		diskPoints[i] = float64(pt.DiskWriteRate)
+		if totNet > peakNet {
+			peakNet = totNet
+		}
+		if float64(pt.DiskWriteRate) > peakDisk {
+			peakDisk = float64(pt.DiskWriteRate)
+		}
+	}
+	curNetRx := uint64(0)
+	curDisk := uint64(0)
+	if tw.sample != nil {
+		curNetRx = tw.sample.NetRxRate
+		curDisk = tw.sample.DiskWriteRate
+		if float64(tw.sample.NetRxRate+tw.sample.NetTxRate) > peakNet {
+			peakNet = float64(tw.sample.NetRxRate + tw.sample.NetTxRate)
+		}
+		if float64(tw.sample.DiskWriteRate) > peakDisk {
+			peakDisk = float64(tw.sample.DiskWriteRate)
+		}
+	}
+
+	maxNet := peakNet * 1.25
+	if maxNet <= 0 {
+		maxNet = 1024 * 1024
+	}
+	netGraphStr := RenderBrailleAreaGraph(netPoints, graphWidth, 4, maxNet, lipgloss.Color("#A855F7"))
+	netGraphRows := strings.Split(netGraphStr, "\n")
+
+	maxDisk := peakDisk * 1.25
+	if maxDisk <= 0 {
+		maxDisk = 1024 * 1024
+	}
+	diskGraphStr := RenderBrailleAreaGraph(diskPoints, graphWidth, 4, maxDisk, lipgloss.Color("#F59E0B"))
+	diskGraphRows := strings.Split(diskGraphStr, "\n")
+
+	netYLabels := [4]string{
+		fmt.Sprintf("%5s ┤", formatBytes(uint64(maxNet))),
+		fmt.Sprintf("%5s ┤", formatBytes(uint64(maxNet*0.66))),
+		fmt.Sprintf("%5s ┤", formatBytes(uint64(maxNet*0.33))),
+		"   0B ┤",
+	}
+	diskYLabels := [4]string{
+		fmt.Sprintf("%5s ┤", formatBytes(uint64(maxDisk))),
+		fmt.Sprintf("%5s ┤", formatBytes(uint64(maxDisk*0.66))),
+		fmt.Sprintf("%5s ┤", formatBytes(uint64(maxDisk*0.33))),
+		"   0B ┤",
+	}
+
+	netTitleText := fmt.Sprintf("Network I/O  •  Peak: %s/s  •  ↓ %s/s", formatBytes(uint64(peakNet)), formatBytes(curNetRx))
+	diskTitleText := fmt.Sprintf("Disk Write  •  Peak: %s/s  •  Now: %s/s", formatBytes(uint64(peakDisk)), formatBytes(curDisk))
+
+	netTitle := radarTitleStyle.Render(netTitleText)
+	diskTitle := radarTitleStyle.Render(diskTitleText)
+
+	netPad := halfWidth - lipgloss.Width(netTitle)
+	if netPad < 2 {
+		netPad = 2
+	}
+	row2Title := netTitle + strings.Repeat(" ", netPad) + diskTitle
+	out = append(out, row2Title)
+
+	for r := 0; r < 4; r++ {
+		leftCell := statKeyStyle.Render(netYLabels[r]) + netGraphRows[r]
+		rightCell := statKeyStyle.Render(diskYLabels[r]) + diskGraphRows[r]
+		pad := halfWidth - lipgloss.Width(leftCell)
+		if pad < 2 {
+			pad = 2
+		}
+		out = append(out, leftCell+strings.Repeat(" ", pad)+rightCell)
+	}
+
+	netTime := dimStyle.Render(strings.Repeat(" ", labelWidth) + timeStart + strings.Repeat(" ", timeGap) + timeEnd)
+	diskTime := dimStyle.Render(strings.Repeat(" ", labelWidth) + timeStart + strings.Repeat(" ", timeGap) + timeEnd)
+	pad = halfWidth - lipgloss.Width(netTime)
+	if pad < 2 {
+		pad = 2
+	}
+	out = append(out, netTime+strings.Repeat(" ", pad)+diskTime)
 
 	return out
 }
@@ -919,13 +1024,6 @@ func (tw *TelemetryWidget) viewHistorical(width int) string {
 		limits = tw.limits
 	}
 
-	barWidth := width - 40
-	if barWidth < 10 {
-		barWidth = 10
-	}
-	tw.cpuProg.Width = barWidth
-	tw.memProg.Width = barWidth
-
 	// CPU
 	var cpuRatio float64
 	var cpuSuffix string
@@ -938,7 +1036,8 @@ func (tw *TelemetryWidget) viewHistorical(width int) string {
 		cpuSuffix = fmt.Sprintf("  %3.0f%% of %.1f CPUs", pct, limits.CPU)
 	} else {
 		cpuRatio = summary.PeakCPUPercent / 100.0
-		cpuSuffix = fmt.Sprintf("  %3.0f%%", summary.PeakCPUPercent)
+		numCPUs := runtime.NumCPU()
+		cpuSuffix = fmt.Sprintf("  %3.0f%% (total: %d CPUs)", summary.PeakCPUPercent, numCPUs)
 	}
 	if cpuRatio > 1.0 {
 		cpuRatio = 1.0
@@ -946,20 +1045,6 @@ func (tw *TelemetryWidget) viewHistorical(width int) string {
 	if cpuRatio < 0 {
 		cpuRatio = 0
 	}
-
-	cpuPrefix := fmt.Sprintf("PEAK CPU: %6.1f%%    ", summary.PeakCPUPercent)
-	if len(cpuPrefix) != 21 {
-		for len(cpuPrefix) > 21 && strings.HasSuffix(cpuPrefix, " ") {
-			cpuPrefix = strings.TrimSuffix(cpuPrefix, " ")
-		}
-		if len(cpuPrefix) > 21 {
-			cpuPrefix = cpuPrefix[:21]
-		}
-		if len(cpuPrefix) < 21 {
-			cpuPrefix = fmt.Sprintf("%-21s", cpuPrefix)
-		}
-	}
-	cpuLine := fmt.Sprintf("%s[%s]%s", cpuPrefix, tw.cpuProg.ViewAs(cpuRatio), cpuSuffix)
 
 	// RAM
 	var memRatio float64
@@ -975,12 +1060,18 @@ func (tw *TelemetryWidget) viewHistorical(width int) string {
 		}
 		ramSuffix = fmt.Sprintf("  %3.0f%% of %s", pct, formatBytes(uint64(limits.Memory)))
 	} else {
+		var totalMem uint64
 		if tw.sample != nil && tw.sample.HostMemTotal > 0 {
+			totalMem = tw.sample.HostMemTotal
 			if summary.PeakRSSBytes > 0 {
 				memRatio = float64(summary.PeakRSSBytes) / float64(tw.sample.HostMemTotal)
 			}
 		}
-		ramSuffix = fmt.Sprintf("  %3.0f%%", memRatio*100)
+		if totalMem > 0 {
+			ramSuffix = fmt.Sprintf("  %3.0f%% (total: %s)", memRatio*100, formatBytes(totalMem))
+		} else {
+			ramSuffix = fmt.Sprintf("  %3.0f%%", memRatio*100)
+		}
 	}
 	if memRatio > 1.0 {
 		memRatio = 1.0
@@ -988,6 +1079,31 @@ func (tw *TelemetryWidget) viewHistorical(width int) string {
 	if memRatio < 0 {
 		memRatio = 0
 	}
+
+	maxSuffix := len(cpuSuffix)
+	if len(ramSuffix) > maxSuffix {
+		maxSuffix = len(ramSuffix)
+	}
+	barWidth := width - 21 - maxSuffix - 2
+	if barWidth < 6 {
+		barWidth = 6
+	}
+	tw.cpuProg.Width = barWidth
+	tw.memProg.Width = barWidth
+
+	cpuPrefix := fmt.Sprintf("PEAK CPU: %6.1f%%    ", summary.PeakCPUPercent)
+	if len(cpuPrefix) != 21 {
+		for len(cpuPrefix) > 21 && strings.HasSuffix(cpuPrefix, " ") {
+			cpuPrefix = strings.TrimSuffix(cpuPrefix, " ")
+		}
+		if len(cpuPrefix) > 21 {
+			cpuPrefix = cpuPrefix[:21]
+		}
+		if len(cpuPrefix) < 21 {
+			cpuPrefix = fmt.Sprintf("%-21s", cpuPrefix)
+		}
+	}
+	cpuLine := fmt.Sprintf("%s[%s]%s", cpuPrefix, tw.cpuProg.ViewAs(cpuRatio), cpuSuffix)
 
 	ramPrefix := fmt.Sprintf("PEAK RAM: %9s  ", ramValStr)
 	if len(ramPrefix) != 21 {
@@ -1166,6 +1282,72 @@ func (tw *TelemetryWidget) renderExpandedHistoricalCharts(width int, summary *Hi
 	}
 	out = append(out, cpuTime+strings.Repeat(" ", pad)+ramTime)
 
+	// Row 2: Network Profile and Disk Write Profile
+	dur := summary.DurationSec
+	if dur <= 0 {
+		dur = 60
+	}
+	totNet := summary.TotalNetRx + summary.TotalNetTx
+	peakNetRate := float64(totNet) / float64(dur) * 3.0
+	if peakNetRate < 1024*1024 {
+		peakNetRate = 1024 * 1024
+	}
+	netPoints := generateHistoricalProfile(peakNetRate, graphWidth*2, "net")
+	netGraphStr := RenderBrailleAreaGraph(netPoints, graphWidth, 4, peakNetRate*1.2, lipgloss.Color("#A855F7"))
+	netGraphRows := strings.Split(netGraphStr, "\n")
+
+	peakDiskRate := float64(summary.TotalDiskWrite) / float64(dur) * 3.5
+	if peakDiskRate < 1024*1024 {
+		peakDiskRate = 1024 * 1024
+	}
+	diskPoints := generateHistoricalProfile(peakDiskRate, graphWidth*2, "disk")
+	diskGraphStr := RenderBrailleAreaGraph(diskPoints, graphWidth, 4, peakDiskRate*1.2, lipgloss.Color("#F59E0B"))
+	diskGraphRows := strings.Split(diskGraphStr, "\n")
+
+	netYLabels := [4]string{
+		fmt.Sprintf("%5s ┤", formatBytes(uint64(peakNetRate*1.2))),
+		fmt.Sprintf("%5s ┤", formatBytes(uint64(peakNetRate*1.2*0.66))),
+		fmt.Sprintf("%5s ┤", formatBytes(uint64(peakNetRate*1.2*0.33))),
+		"   0B ┤",
+	}
+	diskYLabels := [4]string{
+		fmt.Sprintf("%5s ┤", formatBytes(uint64(peakDiskRate*1.2))),
+		fmt.Sprintf("%5s ┤", formatBytes(uint64(peakDiskRate*1.2*0.66))),
+		fmt.Sprintf("%5s ┤", formatBytes(uint64(peakDiskRate*1.2*0.33))),
+		"   0B ┤",
+	}
+
+	netTitleText := fmt.Sprintf("Network Profile  •  Peak: %s/s  •  Total: %s", formatBytes(uint64(peakNetRate)), formatBytes(totNet))
+	diskTitleText := fmt.Sprintf("Disk Profile  •  Peak: %s/s  •  Total: %s", formatBytes(uint64(peakDiskRate)), formatBytes(summary.TotalDiskWrite))
+
+	netTitle := radarTitleStyle.Render(netTitleText)
+	diskTitle := radarTitleStyle.Render(diskTitleText)
+
+	netPad := halfWidth - lipgloss.Width(netTitle)
+	if netPad < 2 {
+		netPad = 2
+	}
+	row2Title := netTitle + strings.Repeat(" ", netPad) + diskTitle
+	out = append(out, row2Title)
+
+	for r := 0; r < 4; r++ {
+		leftCell := statKeyStyle.Render(netYLabels[r]) + netGraphRows[r]
+		rightCell := statKeyStyle.Render(diskYLabels[r]) + diskGraphRows[r]
+		pad := halfWidth - lipgloss.Width(leftCell)
+		if pad < 2 {
+			pad = 2
+		}
+		out = append(out, leftCell+strings.Repeat(" ", pad)+rightCell)
+	}
+
+	netTime := dimStyle.Render(strings.Repeat(" ", labelWidth) + timeStart + strings.Repeat(" ", timeGap) + endStr)
+	diskTime := dimStyle.Render(strings.Repeat(" ", labelWidth) + timeStart + strings.Repeat(" ", timeGap) + endStr)
+	pad = halfWidth - lipgloss.Width(netTime)
+	if pad < 2 {
+		pad = 2
+	}
+	out = append(out, netTime+strings.Repeat(" ", pad)+diskTime)
+
 	return out
 }
 
@@ -1182,7 +1364,8 @@ func generateHistoricalProfile(peak float64, count int, profileType string) []fl
 	for i := 0; i < count; i++ {
 		progress := float64(i) / float64(count-1)
 		var factor float64
-		if profileType == "cpu" {
+		switch profileType {
+		case "cpu":
 			switch {
 			case progress < 0.10:
 				// Phase 1: Runner setup / checkout (gentle warmup from 15% to 35%)
@@ -1213,7 +1396,7 @@ func generateHistoricalProfile(peak float64, count int, profileType string) []fl
 			if factor < 0.10 {
 				factor = 0.10
 			}
-		} else {
+		case "mem":
 			switch {
 			case progress < 0.15:
 				// Phase 1: Runtime bootstrapping
@@ -1237,6 +1420,57 @@ func generateHistoricalProfile(peak float64, count int, profileType string) []fl
 			}
 			if factor < 0.15 {
 				factor = 0.15
+			}
+		case "net":
+			switch {
+			case progress < 0.15:
+				// Phase 1: Repo clone & container pull spike
+				p := progress / 0.15
+				factor = 0.25 + 0.70*math.Sin(p*math.Pi)
+			case progress < 0.45:
+				// Phase 2: Dependency downloads (bursts)
+				p := (progress - 0.15) / 0.30
+				burst := 0.22*math.Sin(p*math.Pi*6) + 0.08*math.Cos(p*math.Pi*2)
+				factor = 0.55 + burst
+			case progress < 0.85:
+				// Phase 3: Build & test (low network traffic)
+				factor = 0.08 + 0.05*math.Sin(progress*math.Pi*4)
+			default:
+				// Phase 4: Artifact upload & release publish burst
+				p := (progress - 0.85) / 0.15
+				factor = 0.20 + 0.75*math.Sin(p*math.Pi)
+			}
+			if factor > 1.0 {
+				factor = 1.0
+			}
+			if factor < 0.05 {
+				factor = 0.05
+			}
+		case "disk":
+			switch {
+			case progress < 0.15:
+				// Phase 1: Archive extraction & checkout writes
+				p := progress / 0.15
+				factor = 0.25 + 0.35*math.Sin(p*math.Pi)
+			case progress < 0.50:
+				// Phase 2: Compiler cache writes & binary generation (heavy bursts)
+				p := (progress - 0.15) / 0.35
+				burst := 0.22*math.Sin(p*math.Pi*7) + 0.10*math.Cos(p*math.Pi*3)
+				factor = 0.60 + 0.30*math.Sin(p*math.Pi*0.5) + burst
+			case progress < 0.85:
+				// Phase 3: Test runner logs & test sqlite db writes
+				p := (progress - 0.50) / 0.35
+				factor = 0.35 + 0.15*math.Sin(p*math.Pi*4)
+			default:
+				// Phase 4: Compression / packaging tarballs
+				p := (progress - 0.85) / 0.15
+				factor = 0.40 + 0.55*math.Sin(p*math.Pi)
+			}
+			if factor > 1.0 {
+				factor = 1.0
+			}
+			if factor < 0.05 {
+				factor = 0.05
 			}
 		}
 		pts[i] = peak * factor

@@ -199,14 +199,17 @@ func runnerArch() string {
 
 func newRunCmd() *cobra.Command {
 	var (
-		onceFlag        bool
-		configDirFlag   string
-		runsDirFlag     string
-		traceFlag       bool
-		limitCPUFlag    string
-		limitMemoryFlag string
-		limitPidsFlag   int
-		driverFlag      string
+		onceFlag         bool
+		configDirFlag    string
+		runsDirFlag      string
+		traceFlag        bool
+		limitCPUFlag     string
+		limitMemoryFlag  string
+		limitPidsFlag    int
+		driverFlag       string
+		otelEndpointFlag string
+		otelProtocolFlag string
+		otelHeadersFlag  string
 	)
 
 	cmd := &cobra.Command{
@@ -258,6 +261,16 @@ func newRunCmd() *cobra.Command {
 			resolvedDriver, err := resolveDriver(cmd, yamlCfg, driverFlag)
 			if err != nil {
 				return err
+			}
+
+			if otelEndpointFlag != "" {
+				_ = os.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", otelEndpointFlag)
+			}
+			if otelProtocolFlag != "" {
+				_ = os.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", otelProtocolFlag)
+			}
+			if otelHeadersFlag != "" {
+				_ = os.Setenv("OTEL_EXPORTER_OTLP_HEADERS", otelHeadersFlag)
 			}
 
 			// Initialize shared OpenTelemetry Manager (Traces & Metrics)
@@ -743,6 +756,9 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&limitMemoryFlag, "limit-memory", "", "max memory (e.g. 4GiB, 512MB)")
 	cmd.Flags().IntVar(&limitPidsFlag, "limit-pids", 0, "max process/thread count")
 	cmd.Flags().StringVar(&driverFlag, "driver", "", "default driver (host or docker)")
+	cmd.Flags().StringVar(&otelEndpointFlag, "otel-endpoint", "", "OpenTelemetry OTLP exporter endpoint (e.g. http://localhost:4318, for InfluxDB / Prometheus / Datadog)")
+	cmd.Flags().StringVar(&otelProtocolFlag, "otel-protocol", "", "OpenTelemetry OTLP protocol (grpc or http/protobuf)")
+	cmd.Flags().StringVar(&otelHeadersFlag, "otel-headers", "", "OpenTelemetry OTLP exporter headers (e.g. Authorization=Token <token>)")
 	_ = cmd.MarkFlagDirname("config-dir")
 
 	return cmd

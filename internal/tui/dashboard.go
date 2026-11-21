@@ -992,11 +992,19 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.height < 18 {
 				telemOuterHeight = 4
-			} else if m.telemetry != nil && m.telemetry.IsExpanded() && m.height >= 26 {
-				if isHist {
-					telemOuterHeight = 14
-				} else {
-					telemOuterHeight = 12
+			} else if m.telemetry != nil && m.telemetry.IsExpanded() {
+				if m.height >= 34 {
+					if isHist {
+						telemOuterHeight = 20
+					} else {
+						telemOuterHeight = 18
+					}
+				} else if m.height >= 26 {
+					if isHist {
+						telemOuterHeight = 16
+					} else {
+						telemOuterHeight = 14
+					}
 				}
 			}
 			viewportTop = telemOuterHeight + 1
@@ -1388,11 +1396,19 @@ func (m *DashboardModel) calcDimensions() (treeWidth, rightWidth, targetOuterHei
 	}
 	if m.height < 18 {
 		telemOuterHeight = 4
-	} else if m.telemetry != nil && m.telemetry.IsExpanded() && m.height >= 26 {
-		if isHist {
-			telemOuterHeight = 14
-		} else {
-			telemOuterHeight = 12
+	} else if m.telemetry != nil && m.telemetry.IsExpanded() {
+		if m.height >= 34 {
+			if isHist {
+				telemOuterHeight = 20
+			} else {
+				telemOuterHeight = 18
+			}
+		} else if m.height >= 26 {
+			if isHist {
+				telemOuterHeight = 16
+			} else {
+				telemOuterHeight = 14
+			}
 		}
 	}
 

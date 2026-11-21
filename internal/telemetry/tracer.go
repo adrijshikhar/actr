@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/adrijshikhar/actr/internal/monitor"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -34,6 +35,18 @@ type Manager struct {
 	jobDuration    metric.Float64Histogram
 	jobsCompleted  metric.Int64Counter
 	stepsCompleted metric.Int64Counter
+
+	// Resource Telemetry Gauges (exposing full system/runner vitals to OTel / Influx / Prometheus)
+	stepCPU           metric.Float64Gauge
+	stepRSS           metric.Int64Gauge
+	stepNetRxRate     metric.Int64Gauge
+	stepNetTxRate     metric.Int64Gauge
+	stepDiskWriteRate metric.Int64Gauge
+	hostCPU           metric.Float64Gauge
+	hostMemUsed       metric.Int64Gauge
+	hostMemTotal      metric.Int64Gauge
+	hostDiskUsed      metric.Int64Gauge
+	hostDiskTotal     metric.Int64Gauge
 }
 
 func (m *Manager) initInstruments() error {
@@ -73,7 +86,62 @@ func (m *Manager) initInstruments() error {
 		metric.WithDescription("Total number of completed steps"),
 		metric.WithUnit("1"),
 	)
-	return err
+	if err != nil {
+		return err
+	}
+
+	m.stepCPU, _ = m.meter.Float64Gauge(
+		"actr.step.cpu_percent",
+		metric.WithDescription("Step CPU utilization percentage"),
+		metric.WithUnit("%"),
+	)
+	m.stepRSS, _ = m.meter.Int64Gauge(
+		"actr.step.memory_rss_bytes",
+		metric.WithDescription("Step resident memory size in bytes"),
+		metric.WithUnit("By"),
+	)
+	m.stepNetRxRate, _ = m.meter.Int64Gauge(
+		"actr.step.net_rx_rate_bytes_per_second",
+		metric.WithDescription("Step network receive rate in bytes per second"),
+		metric.WithUnit("By/s"),
+	)
+	m.stepNetTxRate, _ = m.meter.Int64Gauge(
+		"actr.step.net_tx_rate_bytes_per_second",
+		metric.WithDescription("Step network transmit rate in bytes per second"),
+		metric.WithUnit("By/s"),
+	)
+	m.stepDiskWriteRate, _ = m.meter.Int64Gauge(
+		"actr.step.disk_write_rate_bytes_per_second",
+		metric.WithDescription("Step disk write throughput in bytes per second"),
+		metric.WithUnit("By/s"),
+	)
+	m.hostCPU, _ = m.meter.Float64Gauge(
+		"actr.host.cpu_percent",
+		metric.WithDescription("Host system CPU utilization percentage"),
+		metric.WithUnit("%"),
+	)
+	m.hostMemUsed, _ = m.meter.Int64Gauge(
+		"actr.host.memory_used_bytes",
+		metric.WithDescription("Host system memory used in bytes"),
+		metric.WithUnit("By"),
+	)
+	m.hostMemTotal, _ = m.meter.Int64Gauge(
+		"actr.host.memory_total_bytes",
+		metric.WithDescription("Host system total memory capacity in bytes"),
+		metric.WithUnit("By"),
+	)
+	m.hostDiskUsed, _ = m.meter.Int64Gauge(
+		"actr.host.disk_used_bytes",
+		metric.WithDescription("Host system disk space used in bytes"),
+		metric.WithUnit("By"),
+	)
+	m.hostDiskTotal, _ = m.meter.Int64Gauge(
+		"actr.host.disk_total_bytes",
+		metric.WithDescription("Host system disk total capacity in bytes"),
+		metric.WithUnit("By"),
+	)
+
+	return nil
 }
 
 func NewManager(ctx context.Context, serviceName string) (*Manager, error) {
@@ -304,5 +372,60 @@ func (m *Manager) RecordStepCompletion(ctx context.Context, stepID, stepName, st
 	}
 	if m.stepsCompleted != nil {
 		m.stepsCompleted.Add(ctx, 1, metric.WithAttributes(attrs...))
+	}
+}
+
+// RecordTelemetrySample records active step and host resource metrics as OpenTelemetry gauges.
+// This enables out-of-the-box telemetry streaming to InfluxDB, Prometheus, Datadog, or any OTLP backend.
+func (m *Manager) RecordTelemetrySample(ctx context.Context, jobID, repo string, sample *monitor.TelemetrySample) {
+	if m == nil || m.meter == nil || sample == nil {
+		return
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String("actr.job_id", jobID),
+		attribute.String("actr.repo", repo),
+	}
+	if sample.ActiveStepName != "" {
+		attrs = append(attrs, attribute.String("actr.step_name", sample.ActiveStepName))
+	}
+
+	opt := metric.WithAttributes(attrs...)
+
+	if m.stepCPU != nil {
+		m.stepCPU.Record(ctx, sample.StepCPU, opt)
+	}
+	if m.stepRSS != nil {
+		m.stepRSS.Record(ctx, int64(sample.StepRSSBytes), opt)
+	}
+	if m.stepNetRxRate != nil {
+		m.stepNetRxRate.Record(ctx, int64(sample.NetRxRate), opt)
+	}
+	if m.stepNetTxRate != nil {
+		m.stepNetTxRate.Record(ctx, int64(sample.NetTxRate), opt)
+	}
+	if m.stepDiskWriteRate != nil {
+		m.stepDiskWriteRate.Record(ctx, int64(sample.DiskWriteRate), opt)
+	}
+
+	// Host-level vitals
+	hostAttrs := []attribute.KeyValue{
+		attribute.String("actr.repo", repo),
+	}
+	hostOpt := metric.WithAttributes(hostAttrs...)
+
+	if m.hostCPU != nil && sample.HostCPU > 0 {
+		m.hostCPU.Record(ctx, sample.HostCPU, hostOpt)
+	}
+	if m.hostMemUsed != nil && sample.HostMemUsed > 0 {
+		m.hostMemUsed.Record(ctx, int64(sample.HostMemUsed), hostOpt)
+	}
+	if m.hostMemTotal != nil && sample.HostMemTotal > 0 {
+		m.hostMemTotal.Record(ctx, int64(sample.HostMemTotal), hostOpt)
+	}
+	if m.hostDiskUsed != nil && sample.DiskUsedBytes > 0 {
+		m.hostDiskUsed.Record(ctx, int64(sample.DiskUsedBytes), hostOpt)
+	}
+	if m.hostDiskTotal != nil && sample.DiskTotalBytes > 0 {
+		m.hostDiskTotal.Record(ctx, int64(sample.DiskTotalBytes), hostOpt)
 	}
 }

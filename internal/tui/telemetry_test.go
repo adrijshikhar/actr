@@ -713,6 +713,8 @@ func TestTelemetryWidget_ExpandedCharts(t *testing.T) {
 	assert.Contains(t, expandedView, "collapse (e)")
 	assert.Contains(t, expandedView, "CPU Usage")
 	assert.Contains(t, expandedView, "Memory")
+	assert.Contains(t, expandedView, "Network I/O")
+	assert.Contains(t, expandedView, "Disk Write")
 
 	// Toggle back to collapsed
 	tw.ToggleExpanded()
@@ -749,10 +751,27 @@ func TestTelemetryWidget_HistoricalExpandedCharts(t *testing.T) {
 	assert.Contains(t, expanded, "collapse (e)")
 	assert.Contains(t, expanded, "CPU Profile")
 	assert.Contains(t, expanded, "Memory Profile")
+	assert.Contains(t, expanded, "Network Profile")
+	assert.Contains(t, expanded, "Disk Profile")
 
 	// Toggle back
 	tw.ToggleExpanded()
 	assert.False(t, tw.IsExpanded())
 	viewAgain := tw.View(100)
 	assert.Contains(t, viewAgain, "expand (e)")
+}
+
+func TestTelemetryWidget_TotalCapacityInBrackets(t *testing.T) {
+	tw := NewTelemetryWidget()
+	tw.Update(&monitor.TelemetrySample{
+		PID:          1234,
+		StepCPU:      44.0,
+		StepRSSBytes: 245 * 1024 * 1024,
+		HostMemTotal: 16 * 1024 * 1024 * 1024,
+	})
+
+	view := tw.View(100)
+	assert.Contains(t, view, "total:")
+	assert.Contains(t, view, "16 GB")
+	assert.Contains(t, view, "CPUs")
 }

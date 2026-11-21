@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/adrijshikhar/actr/internal/monitor"
 )
 
 func TestTracer_NoOpWhenUnset(t *testing.T) {
@@ -139,4 +141,35 @@ func TestTracer_MetricsRecording_ZeroConfigAndNil(t *testing.T) {
 	var nilMgr *Manager
 	nilMgr.RecordJobCompletion(ctx, "job-1", "build", "repo", "owner", "success", 1.25)
 	nilMgr.RecordStepCompletion(ctx, "step-1", "run", "success", 0, 0.45)
+}
+
+func TestTracer_RecordTelemetrySample(t *testing.T) {
+	ctx := context.Background()
+	mgr, err := NewManager(ctx, "actr-test")
+	if err != nil {
+		t.Fatalf("unexpected error creating tracer manager: %v", err)
+	}
+	defer func() { _ = mgr.Shutdown(ctx) }()
+
+	sample := &monitor.TelemetrySample{
+		StepCPU:        55.5,
+		StepRSSBytes:   256 * 1024 * 1024,
+		NetRxRate:      1024 * 1024,
+		NetTxRate:      512 * 1024,
+		DiskWriteRate:  4 * 1024 * 1024,
+		HostCPU:        12.5,
+		HostMemUsed:    8 * 1024 * 1024 * 1024,
+		HostMemTotal:   16 * 1024 * 1024 * 1024,
+		DiskUsedBytes:  50 * 1024 * 1024 * 1024,
+		DiskTotalBytes: 250 * 1024 * 1024 * 1024,
+		ActiveStepName: "Compile binaries",
+	}
+
+	// Should not panic on zero-config manager
+	mgr.RecordTelemetrySample(ctx, "job-1", "my-repo", sample)
+
+	// Should not panic on nil manager or nil sample
+	var nilMgr *Manager
+	nilMgr.RecordTelemetrySample(ctx, "job-1", "my-repo", sample)
+	mgr.RecordTelemetrySample(ctx, "job-1", "my-repo", nil)
 }

@@ -1387,6 +1387,9 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 
 			if sample := sampler.Sample(); sample != nil {
 				monSrv.SetJobTelemetry(jobID, c.repoAlias, sample)
+				if c.tracer != nil && c.tracer.Enabled() {
+					c.tracer.RecordTelemetrySample(ctx, jobID, c.repoAlias, sample)
+				}
 			}
 
 			for {
@@ -1396,6 +1399,9 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 				case <-ticker.C:
 					if sample := sampler.Sample(); sample != nil {
 						monSrv.SetJobTelemetry(jobID, c.repoAlias, sample)
+						if c.tracer != nil && c.tracer.Enabled() {
+							c.tracer.RecordTelemetrySample(ctx, jobID, c.repoAlias, sample)
+						}
 					}
 				}
 			}
