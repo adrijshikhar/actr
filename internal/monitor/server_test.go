@@ -634,3 +634,39 @@ func TestServer_SetJobTelemetry(t *testing.T) {
 		t.Fatalf("expected job RepoAlias 'aim', got %v", job)
 	}
 }
+
+func TestServer_EventJobStart_ClearsPriorStepLogs(t *testing.T) {
+	s := NewServer("", "test-runner")
+	s.AppendJobStepLog("job-1", "step-1", "old log line 1")
+	s.AppendJobStepLog("job-1", "step-2", "old log line 2")
+	s.AppendJobStepLog("job-2", "step-1", "unrelated job log")
+
+	s.mu.RLock()
+	rb1 := s.stepLogs["job-1/step-1"]
+	s.mu.RUnlock()
+	if rb1 == nil || len(rb1.Lines()) == 0 {
+		t.Fatal("expected logs for job-1/step-1 before restart")
+	}
+
+	// Re-start job-1
+	s.Publish(Event{
+		Type:  EventJobStart,
+		JobID: "job-1",
+		Job: &JobInfo{
+			ID:   "job-1",
+			Name: "job-1",
+		},
+	})
+
+	s.mu.RLock()
+	rb1After := s.stepLogs["job-1/step-1"]
+	rb2 := s.stepLogs["job-2/step-1"]
+	s.mu.RUnlock()
+
+	if rb1After != nil && len(rb1After.Lines()) != 0 {
+		t.Fatalf("expected logs for job-1/step-1 to be cleared, got %v", rb1After.Lines())
+	}
+	if rb2 == nil || len(rb2.Lines()) == 0 {
+		t.Fatal("expected logs for job-2/step-1 to remain intact")
+	}
+}

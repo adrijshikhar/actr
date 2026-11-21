@@ -417,6 +417,10 @@ func runSimulation(ctx context.Context, server *monitor.Server) {
 						StepID:    "s-2",
 						Step:      &monitor.StepInfo{ID: "s-2", Name: "Compile binaries", Status: monitor.StatusRunning, StartedAt: time.Now()},
 					})
+					server.AppendJobStepLog("job-live-1", "s-1", "\x1b[38;5;244m2026-11-16T14:34:00Z\x1b[0m \x1b[1;34m##[group]Check environment\x1b[0m")
+					server.AppendJobStepLog("job-live-1", "s-1", "\x1b[38;5;244m2026-11-16T14:34:01Z\x1b[0m Verified Go version: 1.27.4 darwin/arm64")
+					server.AppendJobStepLog("job-live-1", "s-1", "\x1b[38;5;244m2026-11-16T14:34:05Z\x1b[0m \x1b[1;32m✓\x1b[0m Toolchain dependencies verified")
+					server.AppendJobStepLog("job-live-1", "s-1", "\x1b[38;5;244m2026-11-16T14:34:10Z\x1b[0m \x1b[1;34m##[endgroup]\x1b[0m")
 				}
 			}
 
