@@ -652,6 +652,9 @@ func (s *Server) Publish(ev Event) {
 			peakMetrics = metrics
 			delete(s.peakMetrics, jobID)
 		}
+		if jobToSave != nil && peakMetrics != nil {
+			jobToSave.MetricsSummary = peakMetrics
+		}
 		delete(s.lastTelemetryTime, jobID)
 
 		if store != nil && jobID != "" {

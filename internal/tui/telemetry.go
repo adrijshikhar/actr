@@ -825,7 +825,13 @@ func (tw *TelemetryWidget) ViewCompact(width int) string {
 
 func (tw *TelemetryWidget) viewHistorical(width int) string {
 	summary := tw.historical
-	header := radarTitleStyle.Render("∿ RUN VITALS (PEAK SUMMARY)")
+	var toggleCue string
+	if tw != nil && tw.expanded {
+		toggleCue = dimStyle.Render(" [▼ collapse (e)]")
+	} else {
+		toggleCue = dimStyle.Render(" [▶ expand (e)]")
+	}
+	header := radarTitleStyle.Render("∿ RUN VITALS (PEAK SUMMARY)") + toggleCue
 
 	var pill string
 	switch summary.Status {
@@ -1008,11 +1014,154 @@ func (tw *TelemetryWidget) viewHistorical(width int) string {
 		metaLine,
 		cpuLine,
 		memLine,
-		ioLine,
-		statusLine,
 	}
+	if tw != nil && tw.expanded {
+		chartLines := tw.renderExpandedHistoricalCharts(width, summary)
+		if len(chartLines) > 0 {
+			lines = append(lines, chartLines...)
+		}
+	}
+	lines = append(lines, ioLine, statusLine)
 
 	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+func (tw *TelemetryWidget) renderExpandedHistoricalCharts(width int, summary *HistoricalRunSummary) []string {
+	if tw == nil || summary == nil {
+		return nil
+	}
+
+	halfWidth := (width - 4) / 2
+	if halfWidth < 20 {
+		halfWidth = 20
+	}
+	labelWidth := 7
+	graphWidth := halfWidth - labelWidth
+	if graphWidth < 8 {
+		graphWidth = 8
+	}
+
+	maxCPU := 100.0
+	if summary.PeakCPUPercent > 100.0 {
+		maxCPU = math.Ceil(summary.PeakCPUPercent/50.0) * 50.0
+	}
+	cpuPoints := generateHistoricalProfile(summary.PeakCPUPercent, graphWidth*2, "cpu")
+	cpuGraphStr := RenderBrailleLineGraph(cpuPoints, graphWidth, 4, maxCPU, lipgloss.Color("#38BDF8"))
+	cpuGraphRows := strings.Split(cpuGraphStr, "\n")
+
+	maxRAM := float64(summary.PeakRSSBytes) * 1.25
+	if summary.Limits != nil && summary.Limits.Memory > 0 && float64(summary.Limits.Memory) > maxRAM {
+		maxRAM = float64(summary.Limits.Memory)
+	} else if tw.sample != nil && tw.sample.HostMemTotal > 0 && float64(tw.sample.HostMemTotal) > maxRAM {
+		if maxRAM < 128*1024*1024 {
+			maxRAM = 128 * 1024 * 1024
+		}
+	}
+	if maxRAM <= 0 {
+		maxRAM = 128 * 1024 * 1024
+	}
+	ramPoints := generateHistoricalProfile(float64(summary.PeakRSSBytes), graphWidth*2, "mem")
+	ramGraphStr := RenderBrailleLineGraph(ramPoints, graphWidth, 4, maxRAM, lipgloss.Color("#10B981"))
+	ramGraphRows := strings.Split(ramGraphStr, "\n")
+
+	cpuYLabels := [4]string{
+		fmt.Sprintf("%4.0f%% ┤", maxCPU),
+		fmt.Sprintf("%4.0f%% ┤", maxCPU*0.66),
+		fmt.Sprintf("%4.0f%% ┤", maxCPU*0.33),
+		"   0% ┤",
+	}
+	ramYLabels := [4]string{
+		fmt.Sprintf("%5s ┤", formatBytes(uint64(maxRAM))),
+		fmt.Sprintf("%5s ┤", formatBytes(uint64(maxRAM*0.66))),
+		fmt.Sprintf("%5s ┤", formatBytes(uint64(maxRAM*0.33))),
+		"   0B ┤",
+	}
+
+	driver := summary.Driver
+	if driver == "" {
+		driver = "docker"
+	}
+	cpuTitleText := fmt.Sprintf("CPU Profile  •  Peak: %.1f%%  •  %s", summary.PeakCPUPercent, driver)
+	ramTitleText := fmt.Sprintf("Memory Profile  •  Peak: %s  •  %s", formatBytes(summary.PeakRSSBytes), driver)
+
+	cpuTitle := radarTitleStyle.Render(cpuTitleText)
+	ramTitle := radarTitleStyle.Render(ramTitleText)
+
+	cpuPad := halfWidth - lipgloss.Width(cpuTitle)
+	if cpuPad < 2 {
+		cpuPad = 2
+	}
+	titleLine := cpuTitle + strings.Repeat(" ", cpuPad) + ramTitle
+
+	var out []string
+	out = append(out, titleLine)
+
+	for r := 0; r < 4; r++ {
+		leftCell := statKeyStyle.Render(cpuYLabels[r]) + cpuGraphRows[r]
+		rightCell := statKeyStyle.Render(ramYLabels[r]) + ramGraphRows[r]
+		pad := halfWidth - lipgloss.Width(leftCell)
+		if pad < 2 {
+			pad = 2
+		}
+		out = append(out, leftCell+strings.Repeat(" ", pad)+rightCell)
+	}
+
+	mins := summary.DurationSec / 60
+	secs := summary.DurationSec % 60
+	endStr := fmt.Sprintf("%02d:%02d", mins, secs)
+	timePad := graphWidth - 8 - len(endStr)
+	if timePad < 2 {
+		timePad = 2
+	}
+	cpuTime := dimStyle.Render(fmt.Sprintf("       00:00%s%s", strings.Repeat(" ", timePad), endStr))
+	ramTime := dimStyle.Render(fmt.Sprintf("       00:00%s%s", strings.Repeat(" ", timePad), endStr))
+	pad := halfWidth - lipgloss.Width(cpuTime)
+	if pad < 2 {
+		pad = 2
+	}
+	out = append(out, cpuTime+strings.Repeat(" ", pad)+ramTime)
+
+	return out
+}
+
+// generateHistoricalProfile synthesizes a smooth representative continuous metric profile
+// from aggregate peak metrics over a normalized sample count.
+func generateHistoricalProfile(peak float64, count int, profileType string) []float64 {
+	if count <= 0 {
+		count = 30
+	}
+	if peak <= 0 {
+		return make([]float64, count)
+	}
+	pts := make([]float64, count)
+	for i := 0; i < count; i++ {
+		progress := float64(i) / float64(count-1)
+		var factor float64
+		if profileType == "cpu" {
+			switch {
+			case progress < 0.15:
+				factor = 0.2 + 0.8*(progress/0.15)
+			case progress > 0.85:
+				factor = 1.0 - 0.7*((progress-0.85)/0.15)
+			default:
+				wave := math.Sin(progress*math.Pi*4) * 0.12
+				factor = 0.88 + wave
+				if factor > 1.0 {
+					factor = 1.0
+				}
+			}
+		} else {
+			if progress < 0.35 {
+				factor = 0.25 + 0.75*(progress/0.35)
+			} else if progress < 0.8 {
+				factor = 0.95 + 0.05*math.Sin(progress*math.Pi*2)
+			} else {
+				factor = 0.98
+			}
+		}
+		pts[i] = peak * factor
+	}
+	return pts
 }
 
 func (tw *TelemetryWidget) viewHistoricalCompact(width int) string {

@@ -986,10 +986,18 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		viewportTop := 1
 		if !m.isZoomed {
 			telemOuterHeight := 6
+			isHist := m.telemetry != nil && m.telemetry.IsHistorical()
+			if isHist {
+				telemOuterHeight = 8
+			}
 			if m.height < 18 {
 				telemOuterHeight = 4
 			} else if m.telemetry != nil && m.telemetry.IsExpanded() && m.height >= 26 {
-				telemOuterHeight = 12
+				if isHist {
+					telemOuterHeight = 14
+				} else {
+					telemOuterHeight = 12
+				}
 			}
 			viewportTop = telemOuterHeight + 1
 		}
@@ -1374,10 +1382,18 @@ func (m *DashboardModel) calcDimensions() (treeWidth, rightWidth, targetOuterHei
 	}
 
 	telemOuterHeight := 6
+	isHist := m.telemetry != nil && m.telemetry.IsHistorical()
+	if isHist {
+		telemOuterHeight = 8
+	}
 	if m.height < 18 {
 		telemOuterHeight = 4
 	} else if m.telemetry != nil && m.telemetry.IsExpanded() && m.height >= 26 {
-		telemOuterHeight = 12
+		if isHist {
+			telemOuterHeight = 14
+		} else {
+			telemOuterHeight = 12
+		}
 	}
 
 	sysOuterHeight := 0
@@ -1706,11 +1722,20 @@ func (m *DashboardModel) extractHistoricalSummary(jobNode *TreeNode) *Historical
 			if !d.EndedAt.IsZero() && !d.StartedAt.IsZero() {
 				dur = int64(d.EndedAt.Sub(d.StartedAt).Seconds())
 			}
-			return &HistoricalRunSummary{
+			summary := &HistoricalRunSummary{
 				JobName:     d.Name,
 				Status:      d.Status,
 				DurationSec: dur,
+				Driver:      d.Driver,
 			}
+			if d.MetricsSummary != nil {
+				summary.PeakCPUPercent = d.MetricsSummary.PeakCPUPercent
+				summary.PeakRSSBytes = d.MetricsSummary.PeakRSSBytes
+				summary.TotalNetRx = d.MetricsSummary.TotalNetRxBytes
+				summary.TotalNetTx = d.MetricsSummary.TotalNetTxBytes
+				summary.TotalDiskWrite = d.MetricsSummary.TotalDiskWrittenBytes
+			}
+			return summary
 		}
 	}
 

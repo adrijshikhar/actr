@@ -2887,3 +2887,65 @@ func TestDashboard_ToggleMetricsExpansion_KeyAndClick(t *testing.T) {
 	assert.True(t, m.telemetry.IsExpanded(), "expected expanded after clicking telemetry HUD")
 }
 
+func TestDashboard_HistoricalJobMetricsAndExpansion(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 35})
+
+	// Add recent historical job with metrics
+	snap := &monitor.Snapshot{
+		RecentJobs: []*monitor.JobInfo{
+			{
+				ID:        "job-linux-1",
+				Name:      "test-linux-amd64",
+				Repo:      "actr",
+				RepoAlias: "actr",
+				Status:    monitor.StatusSuccess,
+				Driver:    "docker",
+				MetricsSummary: &monitor.RunMetricsSummary{
+					PeakCPUPercent:        68.4,
+					PeakRSSBytes:          192 * 1024 * 1024,
+					TotalNetRxBytes:       18 * 1024 * 1024,
+					TotalNetTxBytes:       4 * 1024 * 1024,
+					TotalDiskWrittenBytes: 45 * 1024 * 1024,
+				},
+			},
+		},
+	}
+	_, _ = m.Update(SnapshotMsg(snap))
+
+	// Find and select the historical job node
+	hist := m.getHistoricalBranch()
+	require.NotNil(t, hist)
+	hist.Expanded = true
+	var jobNode *TreeNode
+	for _, repo := range hist.Children {
+		repo.Expanded = true
+		for _, j := range repo.Children {
+			if j.ID == "job-linux-1" {
+				jobNode = j
+				break
+			}
+		}
+	}
+	require.NotNil(t, jobNode)
+	m.tree.Rebuild()
+
+	// Select the job node
+	m.tree.SelectNode(jobNode)
+	m.syncHistoricalHUD()
+
+	require.True(t, m.telemetry.IsHistorical())
+	view := m.telemetry.View(100)
+	assert.Contains(t, view, "68.4%")
+	assert.Contains(t, view, "192 MB")
+	assert.Contains(t, view, "expand (e)")
+
+	// Press 'e' to toggle expanded
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	assert.True(t, m.telemetry.IsExpanded())
+	expandedView := m.telemetry.View(100)
+	assert.Contains(t, expandedView, "collapse (e)")
+	assert.Contains(t, expandedView, "CPU Profile")
+	assert.Contains(t, expandedView, "Memory Profile")
+}
+

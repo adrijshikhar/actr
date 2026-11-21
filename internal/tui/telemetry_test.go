@@ -706,3 +706,39 @@ func TestTelemetryWidget_ExpandedCharts(t *testing.T) {
 	viewAgain := tw.View(100)
 	assert.Contains(t, viewAgain, "expand (e)")
 }
+
+func TestTelemetryWidget_HistoricalExpandedCharts(t *testing.T) {
+	tw := NewTelemetryWidget()
+	summary := &HistoricalRunSummary{
+		JobName:        "test-linux-amd64",
+		Status:         monitor.StatusSuccess,
+		DurationSec:    120,
+		Driver:         "docker",
+		PeakCPUPercent: 68.4,
+		PeakRSSBytes:   192 * 1024 * 1024,
+		TotalNetRx:     18 * 1024 * 1024,
+		TotalNetTx:     4 * 1024 * 1024,
+		TotalDiskWrite: 45 * 1024 * 1024,
+	}
+	tw.SetHistoricalRun(summary)
+
+	// Collapsed: has expand cue, no charts
+	collapsed := tw.View(100)
+	assert.Contains(t, collapsed, "expand (e)")
+	assert.NotContains(t, collapsed, "CPU Profile")
+
+	// Toggle expanded
+	tw.ToggleExpanded()
+	assert.True(t, tw.IsExpanded())
+
+	expanded := tw.View(100)
+	assert.Contains(t, expanded, "collapse (e)")
+	assert.Contains(t, expanded, "CPU Profile")
+	assert.Contains(t, expanded, "Memory Profile")
+
+	// Toggle back
+	tw.ToggleExpanded()
+	assert.False(t, tw.IsExpanded())
+	viewAgain := tw.View(100)
+	assert.Contains(t, viewAgain, "expand (e)")
+}

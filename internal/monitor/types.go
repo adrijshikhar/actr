@@ -40,17 +40,19 @@ type StepInfo struct {
 }
 
 type JobInfo struct {
-	ID        string      `json:"id"`
-	Name      string      `json:"name"`
-	Workflow  string      `json:"workflow"`
-	Repo      string      `json:"repo"`
-	RepoAlias string      `json:"repo_alias,omitempty"`
-	RepoURL   string      `json:"repo_url,omitempty"`
-	Owner     string      `json:"owner"`
-	Status    StepStatus  `json:"status"`
-	Steps     []*StepInfo `json:"steps"`
-	StartedAt time.Time   `json:"started_at"`
-	EndedAt   time.Time   `json:"ended_at"`
+	ID             string             `json:"id"`
+	Name           string             `json:"name"`
+	Workflow       string             `json:"workflow"`
+	Repo           string             `json:"repo"`
+	RepoAlias      string             `json:"repo_alias,omitempty"`
+	RepoURL        string             `json:"repo_url,omitempty"`
+	Owner          string             `json:"owner"`
+	Driver         string             `json:"driver,omitempty"`
+	Status         StepStatus         `json:"status"`
+	MetricsSummary *RunMetricsSummary `json:"metrics_summary,omitempty"`
+	Steps          []*StepInfo        `json:"steps"`
+	StartedAt      time.Time          `json:"started_at"`
+	EndedAt        time.Time          `json:"ended_at"`
 }
 
 // RunInfo is an alias for JobInfo for backwards compatibility with runner terminology.
