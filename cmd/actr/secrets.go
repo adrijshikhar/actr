@@ -61,7 +61,7 @@ func newSecretsCommand() *cobra.Command {
 						fd = int(f.Fd())
 					}
 					pass, err := readPasswordFunc(fd)
-					fmt.Fprintln(cmd.OutOrStdout())
+					_, _ = fmt.Fprintln(cmd.OutOrStdout())
 					if err != nil {
 						return fmt.Errorf("read secret value: %w", err)
 					}
@@ -103,8 +103,8 @@ func newSecretsCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Fprintln(cmd.OutOrStdout(), val)
-			return nil
+			_, err = fmt.Fprintln(cmd.OutOrStdout(), val)
+			return err
 		},
 	}
 
@@ -122,9 +122,9 @@ func newSecretsCommand() *cobra.Command {
 				return err
 			}
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 3, ' ', 0)
-			fmt.Fprintln(w, "KEY\tPROVIDER\tUPDATED")
+			_, _ = fmt.Fprintln(w, "KEY\tPROVIDER\tUPDATED")
 			for _, m := range list {
-				fmt.Fprintf(w, "%s\t%s\t%s\n", m.Key, m.Provider, m.UpdatedAt)
+				_, _ = fmt.Fprintf(w, "%s\t%s\t%s\n", m.Key, m.Provider, m.UpdatedAt)
 			}
 			return w.Flush()
 		},
@@ -143,7 +143,7 @@ func newSecretsCommand() *cobra.Command {
 			if err := v.Delete(cmd.Context(), key); err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "✓ Deleted %s\n", key)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "✓ Deleted %s\n", key)
 			return nil
 		},
 	}

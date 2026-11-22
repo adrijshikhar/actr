@@ -30,6 +30,7 @@ func (k *DarwinKeychainProvider) Get(ctx context.Context, key string) (string, e
 		return "", err
 	}
 
+	// #nosec G204 -- /usr/bin/security is hardcoded and arguments are passed as discrete parameters without shell evaluation
 	cmd := exec.CommandContext(ctx, "/usr/bin/security", "find-generic-password", "-s", k.service, "-a", key, "-w")
 	out, err := cmd.Output()
 	if err != nil {
@@ -46,6 +47,7 @@ func (k *DarwinKeychainProvider) Set(ctx context.Context, key, value string) err
 		return err
 	}
 
+	// #nosec G204 -- /usr/bin/security is hardcoded and arguments are passed as discrete parameters without shell evaluation
 	cmd := exec.CommandContext(ctx, "/usr/bin/security", "add-generic-password", "-U", "-s", k.service, "-a", key, "-w", value)
 	var errBuf bytes.Buffer
 	cmd.Stderr = &errBuf
@@ -63,6 +65,7 @@ func (k *DarwinKeychainProvider) Delete(ctx context.Context, key string) error {
 		return err
 	}
 
+	// #nosec G204 -- /usr/bin/security is hardcoded and arguments are passed as discrete parameters without shell evaluation
 	cmd := exec.CommandContext(ctx, "/usr/bin/security", "delete-generic-password", "-s", k.service, "-a", key)
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
