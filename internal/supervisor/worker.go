@@ -20,6 +20,7 @@ import (
 	"github.com/adrijshikhar/actr/internal/monitor"
 	"github.com/adrijshikhar/actr/internal/protocol"
 	"github.com/adrijshikhar/actr/internal/telemetry"
+	"github.com/adrijshikhar/actr/internal/vault"
 )
 
 // JobRequestReference holds metadata describing a dispatched job message.
@@ -154,6 +155,9 @@ func NewRepoWorker(alias string, repoCfg config.RepoConfig, resMgr *ResourceMana
 		}
 		if w.tracer != nil {
 			coord.WithTracer(w.tracer)
+		}
+		if vaultProv, err := vault.NewProviderFromConfig(&repoCfg.Vault, repoCfg.ConfigDir); err == nil && vaultProv != nil {
+			coord.WithVault(vaultProv)
 		}
 		w.coordinator = coord
 	}

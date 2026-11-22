@@ -23,6 +23,7 @@ type RepoConfig struct {
 	MaxConcurrentJobs int              `json:"max_concurrent_jobs,omitempty" yaml:"max_concurrent_jobs,omitempty"`
 	Driver            string           `json:"driver,omitempty" yaml:"driver,omitempty"`
 	Limits            LimitsYAMLConfig `json:"limits" yaml:"limits"`
+	Vault             VaultYAMLConfig  `json:"vault,omitempty" yaml:"vault,omitempty"`
 }
 
 func (r *RepoConfig) ParseLimits() (*LimitsConfig, error) {
