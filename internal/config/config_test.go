@@ -289,6 +289,63 @@ retention:
 	assert.Equal(t, 30*time.Minute, limits.Timeout)
 }
 
+func TestLoadYAMLConfig_WithVault(t *testing.T) {
+	tmpDir := t.TempDir()
+	yamlPath := filepath.Join(tmpDir, "config_with_vault.yaml")
+
+	yamlContent := `
+runner:
+  name: "vault-runner"
+  work_folder: "_work"
+
+vault:
+  enabled: true
+  trusted_only: true
+  providers:
+    - type: "keychain"
+      label: "com.github.actr.custom"
+    - type: "encrypted-file"
+      path: "/tmp/custom-vault.enc"
+      auth:
+        passphrase: "secret-passphrase"
+    - type: "hashicorp-vault"
+      address: "https://vault.example.com:8200"
+      path: "secret/data/actr"
+      auth:
+        token: "s.sampletoken"
+    - type: "aws-secrets-manager"
+      region: "us-east-1"
+      prefix: "actr/"
+`
+	err := os.WriteFile(yamlPath, []byte(yamlContent), 0644)
+	require.NoError(t, err)
+
+	cfg, err := LoadYAMLConfig(yamlPath)
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+
+	assert.Equal(t, "vault-runner", cfg.Runner.Name)
+	assert.True(t, cfg.Vault.Enabled)
+	assert.True(t, cfg.Vault.TrustedOnly)
+	require.Len(t, cfg.Vault.Providers, 4)
+
+	assert.Equal(t, "keychain", cfg.Vault.Providers[0].Type)
+	assert.Equal(t, "com.github.actr.custom", cfg.Vault.Providers[0].Label)
+
+	assert.Equal(t, "encrypted-file", cfg.Vault.Providers[1].Type)
+	assert.Equal(t, "/tmp/custom-vault.enc", cfg.Vault.Providers[1].Path)
+	assert.Equal(t, "secret-passphrase", cfg.Vault.Providers[1].Auth["passphrase"])
+
+	assert.Equal(t, "hashicorp-vault", cfg.Vault.Providers[2].Type)
+	assert.Equal(t, "https://vault.example.com:8200", cfg.Vault.Providers[2].Address)
+	assert.Equal(t, "secret/data/actr", cfg.Vault.Providers[2].Path)
+	assert.Equal(t, "s.sampletoken", cfg.Vault.Providers[2].Auth["token"])
+
+	assert.Equal(t, "aws-secrets-manager", cfg.Vault.Providers[3].Type)
+	assert.Equal(t, "us-east-1", cfg.Vault.Providers[3].Region)
+	assert.Equal(t, "actr/", cfg.Vault.Providers[3].Prefix)
+}
+
 func TestLoadYAMLConfig_Errors(t *testing.T) {
 	tmpDir := t.TempDir()
 
