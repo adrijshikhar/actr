@@ -136,4 +136,51 @@ func TestAim_TinkerVaultIntegration(t *testing.T) {
 		assert.Contains(t, output, "FORK_KEY_VAL=''")
 		assert.Contains(t, output, "Vault secret resolution blocked for untrusted fork PR: TINKER_API_KEY")
 	})
+
+	// Test 3: Aim Web Workspace Step Execution
+	t.Run("AimWebWorkspace_SecretFulfillment", func(t *testing.T) {
+		aimWebDir := "/Users/nemesis/Projects/my-projects/aim/web"
+		if _, err := os.Stat(aimWebDir); os.IsNotExist(err) {
+			t.Skip("aim/web directory not present; skipping workspace execution")
+		}
+
+		logCapture.Reset()
+		job := &protocol.JobSpecification{
+			ID:        "job-aim-web-1",
+			JobID:     "job-aim-web-1",
+			JobName:   "Aim Web E2E Step Execution",
+			EventName: "push",
+			Variables: map[string]string{
+				"GITHUB_REPOSITORY": "adrijshikhar/aim",
+			},
+			Steps: []protocol.Step{
+				{
+					ID:               "step-node-env",
+					Name:             "Verify Node process.env in aim/web",
+					Type:             "script",
+					WorkingDirectory: aimWebDir,
+					Environment: map[string]string{
+						"TINKER_API_KEY":      "",
+						"TINKER_API_BASE_URL": "",
+					},
+					Script: `
+						node -e '
+							const isLive = Boolean(process.env.TINKER_API_KEY);
+							const hasBase = Boolean(process.env.TINKER_API_BASE_URL);
+							console.log("AIM_WEB_TINKER_CONFIGURED:", isLive && hasBase);
+						'
+					`,
+				},
+			},
+		}
+
+		resp, err := coord.ExecuteJob(ctx, job, "", "")
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		assert.Equal(t, "success", resp.Conclusion)
+
+		output := logCapture.String()
+		assert.Contains(t, output, "AIM_WEB_TINKER_CONFIGURED: true")
+		assert.NotContains(t, output, tinkerKey)
+	})
 }
