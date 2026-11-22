@@ -85,9 +85,13 @@ func (m *MockProvider) Delete(_ context.Context, key string) error {
 func (m *MockProvider) List(_ context.Context) ([]SecretMetadata, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	name := m.name
+	if name == "" {
+		name = "mock"
+	}
 	res := make([]SecretMetadata, 0, len(m.store))
 	for k := range m.store {
-		res = append(res, SecretMetadata{Key: k, Provider: m.Name()})
+		res = append(res, SecretMetadata{Key: k, Provider: name})
 	}
 	return res, nil
 }
