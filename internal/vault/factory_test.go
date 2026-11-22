@@ -185,3 +185,18 @@ func TestFactory_EncryptedFile_Corrupted(t *testing.T) {
 	assert.Error(t, err)
 	assert.Nil(t, p)
 }
+
+func TestFactory_UnsupportedProviderType(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.VaultYAMLConfig{
+		Enabled: true,
+		Providers: []config.VaultProviderYAMLConfig{
+			{Type: "invalid-type"},
+		},
+	}
+
+	p, err := NewProviderFromConfig(cfg, tmpDir)
+	assert.Error(t, err)
+	assert.Nil(t, p)
+	assert.Contains(t, err.Error(), `unsupported vault provider type: "invalid-type"`)
+}

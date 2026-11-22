@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"fmt"
 	"path/filepath"
 	"runtime"
 
@@ -17,7 +18,11 @@ func NewProviderFromConfig(cfg *config.VaultYAMLConfig, defaultDir string) (Prov
 			return NewKeychainProvider("com.github.actr.secrets"), nil
 		}
 		vaultPath := filepath.Join(defaultDir, "vault.enc")
-		return NewFileProvider(vaultPath, []byte("default-actr-key"))
+		fp, err := NewFileProvider(vaultPath, []byte("default-actr-key"))
+		if err != nil {
+			return nil, err
+		}
+		return fp, nil
 	}
 
 	var providers []Provider
@@ -55,6 +60,8 @@ func NewProviderFromConfig(cfg *config.VaultYAMLConfig, defaultDir string) (Prov
 			providers = append(providers, NewHashiCorpVaultProvider(pcfg.Address, token, "secret", pcfg.Path))
 		case "aws-secrets-manager":
 			providers = append(providers, NewAWSSecretsManagerProvider(pcfg.Region, pcfg.Prefix))
+		default:
+			return nil, fmt.Errorf("unsupported vault provider type: %q", pcfg.Type)
 		}
 	}
 
