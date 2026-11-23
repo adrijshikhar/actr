@@ -11,7 +11,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"path/filepath"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -68,6 +68,8 @@ type Server struct {
 	listener   net.Listener
 	startTime  time.Time
 	mu         sync.Mutex
+	stopCh     chan struct{}
+	stopOnce   sync.Once
 	closed     bool
 }
 
@@ -84,6 +86,7 @@ func NewServer(cfg ServerConfig) *Server {
 		cfg:       cfg,
 		mux:       http.NewServeMux(),
 		startTime: time.Now(),
+		stopCh:    make(chan struct{}),
 	}
 
 	s.routes()
@@ -148,7 +151,7 @@ func (s *Server) routes() {
 			return
 		}
 
-		cleanPath := strings.TrimPrefix(filepath.Clean(r.URL.Path), "/")
+		cleanPath := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
 		if cleanPath == "" || cleanPath == "." || cleanPath == "index.html" {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusOK)
@@ -179,6 +182,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // Start binds to the configured host:port and begins serving HTTP requests.
 func (s *Server) Start(ctx context.Context) error {
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return errors.New("server is stopped")
+	}
 	if s.httpServer != nil {
 		s.mu.Unlock()
 		return errors.New("server already started")
@@ -201,8 +208,11 @@ func (s *Server) Start(ctx context.Context) error {
 
 	if ctx != nil {
 		go func() {
-			<-ctx.Done()
-			_ = s.Stop()
+			select {
+			case <-ctx.Done():
+				_ = s.Stop()
+			case <-s.stopCh:
+			}
 		}()
 	}
 
@@ -218,17 +228,21 @@ func (s *Server) Start(ctx context.Context) error {
 // Stop gracefully shuts down the HTTP server.
 func (s *Server) Stop() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.closed {
+		s.mu.Unlock()
 		return nil
 	}
 	s.closed = true
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+	})
+	httpServer := s.httpServer
+	s.mu.Unlock()
 
-	if s.httpServer != nil {
+	if httpServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		return s.httpServer.Shutdown(ctx)
+		return httpServer.Shutdown(ctx)
 	}
 	return nil
 }

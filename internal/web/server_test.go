@@ -176,3 +176,37 @@ func TestServer_StartStopLifecycle(t *testing.T) {
 		t.Fatalf("second stop should succeed: %v", err)
 	}
 }
+
+func TestServer_StartStopLifecycle_BackgroundContext(t *testing.T) {
+	// Tests that when context.Background() is used (never cancelled),
+	// Stop() cleanly terminates the monitoring goroutine via stopCh without leaks.
+	srv := NewServer(ServerConfig{
+		Version: "v0.2.0",
+		Port:    0,
+		Host:    "127.0.0.1",
+	})
+
+	if err := srv.Start(context.Background()); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+
+	addr := srv.Addr()
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + addr + "/api/status")
+	if err != nil {
+		t.Fatalf("failed to query running server: %v", err)
+	}
+	resp.Body.Close()
+
+	if err := srv.Stop(); err != nil {
+		t.Fatalf("failed to stop server: %v", err)
+	}
+
+	// Verify server channel is closed
+	select {
+	case <-srv.stopCh:
+		// success: stopCh was closed on Stop()
+	case <-time.After(1 * time.Second):
+		t.Fatalf("expected srv.stopCh to be closed upon Stop()")
+	}
+}
