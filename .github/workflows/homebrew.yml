@@ -175,6 +175,7 @@ jobs:
           HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           brew tap adrijshikhar/tap "$PWD/tap" --force 2>/dev/null || true
+          brew trust adrijshikhar/tap 2>/dev/null || brew trust --cask adrijshikhar/tap/actr 2>/dev/null || true
           brew audit --cask --strict --online adrijshikhar/tap/actr
           brew developer off 2>/dev/null || true
 
@@ -182,12 +183,14 @@ jobs:
         env:
           HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          brew trust adrijshikhar/tap 2>/dev/null || brew trust --cask adrijshikhar/tap/actr 2>/dev/null || true
           brew install --cask --force adrijshikhar/tap/actr
           actr -v
 
       - name: Commit and Push to Tap
         env:
           VERSION: ${{ steps.meta.outputs.version }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN || secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
         run: |
           cd tap
           git config user.name "github-actions[bot]"
@@ -197,5 +200,6 @@ jobs:
             echo "No changes detected in tap definition, skipping push."
           else
             git commit -m "feat(actr): update to ${VERSION} (verified & audited)"
+            git remote set-url origin "https://x-access-token:${TAP_TOKEN}@github.com/adrijshikhar/homebrew-tap.git"
             git push origin main
           fi
