@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -240,11 +241,16 @@ func newWebStatusCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfgDir := resolveConfigDir(configDirFlag, cmd.Flags().Changed("config-dir"))
 			info, err := readWebPID(cfgDir)
-			if err == nil && isProcessAlive(info.PID) && checkServerHealth(info.Port) {
-				fmt.Fprintf(cmd.OutOrStdout(), "● actr web dashboard is running at http://127.0.0.1:%d (PID %d)\n", info.Port, info.PID)
-				return nil
-			}
-			if info != nil {
+			if err == nil {
+				if isProcessAlive(info.PID) {
+					if checkServerHealth(info.Port) {
+						fmt.Fprintf(cmd.OutOrStdout(), "● actr web dashboard is running at http://127.0.0.1:%d (PID %d)\n", info.Port, info.PID)
+						return nil
+					}
+					fmt.Fprintf(cmd.OutOrStdout(), "▲ actr web dashboard process is running (PID %d) but unresponsive at http://127.0.0.1:%d\n", info.PID, info.Port)
+					return nil
+				}
+				// Stale PID file: process is dead
 				_ = removeWebPID(cfgDir)
 			}
 			fmt.Fprintln(cmd.OutOrStdout(), "○ actr web dashboard is stopped.")
@@ -258,17 +264,20 @@ func newWebStatusCmd() *cobra.Command {
 }
 
 func startWebBackground(cmd *cobra.Command, port int, devMode, noOpen bool, cfgDir, sockPath string) error {
-	// 1. Check if already running and responsive
+	// 1. Check if already running
 	if info, err := readWebPID(cfgDir); err == nil {
-		if isProcessAlive(info.PID) && checkServerHealth(info.Port) {
-			serverURL := fmt.Sprintf("http://127.0.0.1:%d", info.Port)
-			fmt.Fprintf(cmd.OutOrStdout(), "🚀 actr web dashboard is already running at %s (PID %d)\n", serverURL, info.PID)
-			if !noOpen {
-				_ = openBrowserFunc(serverURL)
+		if isProcessAlive(info.PID) {
+			if checkServerHealth(info.Port) {
+				serverURL := fmt.Sprintf("http://127.0.0.1:%d", info.Port)
+				fmt.Fprintf(cmd.OutOrStdout(), "🚀 actr web dashboard is already running at %s (PID %d)\n", serverURL, info.PID)
+				if !noOpen {
+					_ = openBrowserFunc(serverURL)
+				}
+				return nil
 			}
-			return nil
+			return fmt.Errorf("actr web dashboard process is already running (PID %d) but unresponsive at port %d; stop it first with 'actr web stop'", info.PID, info.Port)
 		}
-		// Stale PID file
+		// Stale PID file: process is dead
 		_ = removeWebPID(cfgDir)
 	}
 
@@ -375,7 +384,7 @@ func runWebForeground(cmd *cobra.Command, port int, devMode, noOpen bool, cfgDir
 	dbPath := filepath.Join(cfgDir, "history.db")
 	if store, err := history.NewSQLiteStore(dbPath); err == nil && store != nil {
 		defer func() { _ = store.Close() }()
-		serverCfg.RunStore = &historyRunStoreAdapter{store: store}
+		serverCfg.RunStore = newHistoryRunStoreAdapter(store)
 	}
 
 	// 2. SecretManager
@@ -383,13 +392,16 @@ func runWebForeground(cmd *cobra.Command, port int, devMode, noOpen bool, cfgDir
 		serverCfg.SecretManager = &vaultSecretManagerAdapter{provider: vProvider}
 	}
 
-	// 3. Monitor Client / EventSubscriber
+	// 3. Monitor Client (EventSubscriber & MetricsProvider)
+	// Always initialize when sockPath is available because monitor.Client dials lazily on HTTP request
 	if sockPath == "" {
 		sockPath = filepath.Join(cfgDir, "daemon.sock")
 	}
-	if _, err := os.Stat(sockPath); err == nil {
+	if sockPath != "" {
 		mClient := monitor.NewClient(sockPath)
-		serverCfg.EventSubscriber = &monitorEventSubscriberAdapter{client: mClient}
+		mAdapter := &monitorClientAdapter{client: mClient}
+		serverCfg.EventSubscriber = mAdapter
+		serverCfg.MetricsProvider = mAdapter
 	}
 
 	// 4. DaemonController
@@ -464,10 +476,25 @@ func resolveVaultForDir(cfgDir string) (vault.Provider, error) {
 
 // historyRunStoreAdapter adapts *history.SQLiteStore to satisfy web.RunStore.
 type historyRunStoreAdapter struct {
-	store *history.SQLiteStore
+	store      *history.SQLiteStore
+	mu         sync.RWMutex
+	stepRunMap map[string]string
 }
 
 var _ web.RunStore = (*historyRunStoreAdapter)(nil)
+
+func newHistoryRunStoreAdapter(store *history.SQLiteStore) *historyRunStoreAdapter {
+	return &historyRunStoreAdapter{
+		store:      store,
+		stepRunMap: make(map[string]string),
+	}
+}
+
+func (a *historyRunStoreAdapter) ensureMapLocked() {
+	if a.stepRunMap == nil {
+		a.stepRunMap = make(map[string]string)
+	}
+}
 
 func (a *historyRunStoreAdapter) GetRuns(ctx context.Context, limit, offset int, repo, status, q string) ([]*history.RunRecord, int, error) {
 	summaries, err := a.store.ListRuns(0)
@@ -514,13 +541,35 @@ func (a *historyRunStoreAdapter) GetRuns(ctx context.Context, limit, offset int,
 			}
 		} else {
 			records[i] = rec
+			a.mu.Lock()
+			a.ensureMapLocked()
+			for _, st := range rec.Steps {
+				if st != nil {
+					a.stepRunMap[st.ID] = rec.ID
+				}
+			}
+			a.mu.Unlock()
 		}
 	}
 	return records, total, nil
 }
 
 func (a *historyRunStoreAdapter) GetRun(ctx context.Context, id string) (*history.RunRecord, error) {
-	return a.store.GetRun(id)
+	rec, err := a.store.GetRun(id)
+	if err != nil {
+		return nil, err
+	}
+	if rec != nil {
+		a.mu.Lock()
+		a.ensureMapLocked()
+		for _, st := range rec.Steps {
+			if st != nil {
+				a.stepRunMap[st.ID] = rec.ID
+			}
+		}
+		a.mu.Unlock()
+	}
+	return rec, nil
 }
 
 func (a *historyRunStoreAdapter) GetRunSteps(ctx context.Context, runID string) ([]*history.StepRecord, error) {
@@ -528,17 +577,48 @@ func (a *historyRunStoreAdapter) GetRunSteps(ctx context.Context, runID string) 
 	if err != nil {
 		return nil, err
 	}
-	return run.Steps, nil
+	if run != nil {
+		a.mu.Lock()
+		a.ensureMapLocked()
+		for _, st := range run.Steps {
+			if st != nil {
+				a.stepRunMap[st.ID] = runID
+			}
+		}
+		a.mu.Unlock()
+		return run.Steps, nil
+	}
+	return nil, nil
 }
 
 func (a *historyRunStoreAdapter) GetStepLogs(ctx context.Context, stepID string) ([]string, error) {
-	summaries, err := a.store.ListRuns(50)
+	a.mu.RLock()
+	var runID string
+	var cached bool
+	if a.stepRunMap != nil {
+		runID, cached = a.stepRunMap[stepID]
+	}
+	a.mu.RUnlock()
+	if cached {
+		return a.store.GetStepLogs(runID, stepID)
+	}
+
+	summaries, err := a.store.ListRuns(0)
 	if err == nil {
 		for _, s := range summaries {
 			run, err := a.store.GetRun(s.ID)
 			if err != nil {
 				continue
 			}
+			a.mu.Lock()
+			a.ensureMapLocked()
+			for _, st := range run.Steps {
+				if st != nil {
+					a.stepRunMap[st.ID] = run.ID
+				}
+			}
+			a.mu.Unlock()
+
 			for _, st := range run.Steps {
 				if st != nil && st.ID == stepID {
 					return a.store.GetStepLogs(run.ID, stepID)
@@ -572,17 +652,29 @@ func (a *vaultSecretManagerAdapter) DeleteSecret(ctx context.Context, key string
 	return a.provider.Delete(ctx, key)
 }
 
-// monitorEventSubscriberAdapter adapts *monitor.Client to satisfy web.EventSubscriber.
-type monitorEventSubscriberAdapter struct {
+// monitorClientAdapter adapts *monitor.Client to satisfy web.EventSubscriber and web.MetricsProvider.
+type monitorClientAdapter struct {
 	client *monitor.Client
 }
 
-var _ web.EventSubscriber = (*monitorEventSubscriberAdapter)(nil)
+var _ web.EventSubscriber = (*monitorClientAdapter)(nil)
+var _ web.MetricsProvider = (*monitorClientAdapter)(nil)
 
-func (a *monitorEventSubscriberAdapter) SubscribeEvents(ctx context.Context) (<-chan monitor.Event, func(), error) {
+func (a *monitorClientAdapter) SubscribeEvents(ctx context.Context) (<-chan monitor.Event, func(), error) {
 	subCtx, cancel := context.WithCancel(ctx)
 	events, _ := a.client.StreamEvents(subCtx)
 	return events, cancel, nil
+}
+
+func (a *monitorClientAdapter) GetCurrentMetrics(ctx context.Context) (*monitor.RunnerMetrics, error) {
+	snap, err := a.client.GetSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if snap != nil && snap.Telemetry != nil {
+		return snap.Telemetry, nil
+	}
+	return nil, nil
 }
 
 // serviceDaemonController adapts internal/service to satisfy web.DaemonController.

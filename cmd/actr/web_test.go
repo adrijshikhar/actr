@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -493,14 +494,17 @@ func TestWebCmd_Adapters(t *testing.T) {
 	err = vAdapter.DeleteSecret(ctx, "TEST_KEY")
 	require.NoError(t, err)
 
-	// 8. Monitor Event Subscriber Adapter
+	// 8. Monitor Client Adapter (EventSubscriber & MetricsProvider)
 	mClient := monitor.NewClient(filepath.Join(tmpDir, "nonexistent.sock"))
-	subAdapter := &monitorEventSubscriberAdapter{client: mClient}
+	subAdapter := &monitorClientAdapter{client: mClient}
 	evCh, cancelSub, err := subAdapter.SubscribeEvents(ctx)
 	require.NoError(t, err)
 	require.NotNil(t, evCh)
 	require.NotNil(t, cancelSub)
 	cancelSub()
+
+	// Metrics query returns error on unreachable unix socket
+	_, _ = subAdapter.GetCurrentMetrics(ctx)
 }
 
 func TestWebCmd_ResolveVaultForDir(t *testing.T) {
@@ -525,4 +529,87 @@ vault:
 	p, err = resolveVaultForDir(tmpDir)
 	require.NoError(t, err)
 	assert.NotNil(t, p)
+}
+
+func TestWebCmd_Status_LiveUnresponsiveDoesNotRemovePID(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Write PID of current process (alive) on a closed/unresponsive port
+	err := writeWebPID(tmpDir, os.Getpid(), 1)
+	require.NoError(t, err)
+
+	cmdStatus := newWebStatusCmd()
+	buf := new(bytes.Buffer)
+	cmdStatus.SetOut(buf)
+	cmdStatus.SetArgs([]string{"--config-dir", tmpDir})
+
+	err = cmdStatus.Execute()
+	require.NoError(t, err)
+
+	out := buf.String()
+	assert.Contains(t, out, "unresponsive")
+	// PID file MUST NOT be removed!
+	assert.FileExists(t, filepath.Join(tmpDir, "web.pid"))
+}
+
+func TestWebCmd_Background_LiveUnresponsiveReturnsErrorWithoutRemovingPID(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Write PID of current process (alive) on a closed/unresponsive port
+	err := writeWebPID(tmpDir, os.Getpid(), 1)
+	require.NoError(t, err)
+
+	cmd := newWebCmd()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"--config-dir", tmpDir, "--no-open"})
+
+	err = cmd.Execute()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "unresponsive")
+	// PID file MUST NOT be removed!
+	assert.FileExists(t, filepath.Join(tmpDir, "web.pid"))
+}
+
+func TestWebCmd_UnboundedStepLogsLookup(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "history.db")
+	store, err := history.NewSQLiteStore(dbPath)
+	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
+
+	// Insert 60 runs. The oldest run (index 0) has the target step
+	ctx := context.Background()
+	for i := 0; i < 60; i++ {
+		runID := fmt.Sprintf("run-unbounded-%02d", i)
+		stepID := fmt.Sprintf("step-unbounded-%02d", i)
+		runMeta := &monitor.RunMetadata{
+			ID:        runID,
+			Name:      fmt.Sprintf("Run %d", i),
+			Workflow:  "ci.yml",
+			Repo:      "test/repo",
+			Status:    monitor.StatusSuccess,
+			StartedAt: time.Now().Add(time.Duration(i) * time.Minute),
+			EndedAt:   time.Now().Add(time.Duration(i)*time.Minute + 10*time.Second),
+			Steps: []*monitor.StepMetadata{
+				{ID: stepID, Name: fmt.Sprintf("Step %d", i), Status: monitor.StatusSuccess},
+			},
+		}
+		err = store.RecordRun(runMeta)
+		require.NoError(t, err)
+		err = store.AppendStepLogs(runID, stepID, []string{fmt.Sprintf("log line for step %d", i)})
+		require.NoError(t, err)
+	}
+
+	adapter := newHistoryRunStoreAdapter(store)
+
+	// Step from oldest run (step-unbounded-00) must be retrievable even though there are 60 runs
+	logs, err := adapter.GetStepLogs(ctx, "step-unbounded-00")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"log line for step 0"}, logs)
+
+	// Step from newest run (step-unbounded-59) must also be retrievable
+	logsNewest, err := adapter.GetStepLogs(ctx, "step-unbounded-59")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"log line for step 59"}, logsNewest)
 }
