@@ -10,9 +10,98 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/adrijshikhar/actr/internal/vault"
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type mockVault struct {
+	secrets map[string]string
+}
+
+var _ vault.Provider = (*mockVault)(nil)
+
+func (m *mockVault) Name() string { return "mock" }
+func (m *mockVault) Get(ctx context.Context, key string) (string, error) {
+	if val, ok := m.secrets[key]; ok {
+		return val, nil
+	}
+	return "", vault.ErrSecretNotFound
+}
+func (m *mockVault) Set(ctx context.Context, key, value string) error {
+	m.secrets[key] = value
+	return nil
+}
+func (m *mockVault) Delete(ctx context.Context, key string) error {
+	delete(m.secrets, key)
+	return nil
+}
+func (m *mockVault) List(ctx context.Context) ([]vault.SecretMetadata, error) {
+	var list []vault.SecretMetadata
+	for k := range m.secrets {
+		list = append(list, vault.SecretMetadata{Key: k, Provider: "mock"})
+	}
+	return list, nil
+}
+
+func TestSecretsCompletion_GetAndDeleteKeys(t *testing.T) {
+	origResolver := vaultProviderResolver
+	t.Cleanup(func() { vaultProviderResolver = origResolver })
+
+	mv := &mockVault{
+		secrets: map[string]string{
+			"GITHUB_TOKEN":   "ghp_123",
+			"TINKER_API_KEY": "secret_abc",
+			"AWS_SECRET":     "aws_pass",
+		},
+	}
+	vaultProviderResolver = func(cmd *cobra.Command) (vault.Provider, error) {
+		return mv, nil
+	}
+
+	tests := []struct {
+		name       string
+		args       []string
+		wantSubstr []string
+	}{
+		{
+			name:       "complete get all keys",
+			args:       []string{"__complete", "secrets", "get", ""},
+			wantSubstr: []string{"GITHUB_TOKEN", "TINKER_API_KEY", "AWS_SECRET"},
+		},
+		{
+			name:       "complete get prefix match",
+			args:       []string{"__complete", "secrets", "get", "TIN"},
+			wantSubstr: []string{"TINKER_API_KEY"},
+		},
+		{
+			name:       "complete delete all keys",
+			args:       []string{"__complete", "secrets", "delete", ""},
+			wantSubstr: []string{"GITHUB_TOKEN", "TINKER_API_KEY", "AWS_SECRET"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := &bytes.Buffer{}
+			errOut := &bytes.Buffer{}
+			cmd := newRootCmd(out, errOut)
+			cmd.SetArgs(tt.args)
+
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			output := out.String()
+			for _, want := range tt.wantSubstr {
+				if !strings.Contains(output, want) {
+					t.Errorf("expected %q in completion output, got:\n%s", want, output)
+				}
+			}
+		})
+	}
+}
 
 func TestSecretsCLI_Lifecycle(t *testing.T) {
 	tempDir := t.TempDir()
