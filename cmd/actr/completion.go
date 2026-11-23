@@ -27,7 +27,7 @@ To load completions in the current shell session:
 
 To install permanently, use 'actr completion install'.`,
 		ValidArgs: []string{"bash", "zsh", "fish", "powershell"},
-		Args:      cobra.ExactValidArgs(1),
+		Args:      cobra.MatchAll(cobra.ExactArgs(1), cobra.OnlyValidArgs),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			shell := args[0]
 			out := cmd.OutOrStdout()
@@ -35,7 +35,97 @@ To install permanently, use 'actr completion install'.`,
 		},
 	}
 
+	cmd.AddCommand(newCompletionInstallCmd(rootCmd))
+
 	return cmd
+}
+
+var (
+	completionTargetResolver = func(shell string) (string, error) {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("lookup user home directory: %w", err)
+		}
+		brewPrefix := detectBrewPrefix()
+		return resolveInstallPath(shell, home, brewPrefix)
+	}
+)
+
+func detectBrewPrefix() string {
+	if p := os.Getenv("HOMEBREW_PREFIX"); p != "" {
+		return p
+	}
+	for _, standard := range []string{"/opt/homebrew", "/usr/local"} {
+		if fi, err := os.Stat(filepath.Join(standard, "share", "zsh", "site-functions")); err == nil && fi.IsDir() {
+			return standard
+		}
+	}
+	return ""
+}
+
+func resolveInstallPath(shell string, homeDir string, brewPrefix string) (string, error) {
+	switch shell {
+	case "zsh":
+		if brewPrefix != "" {
+			siteFunctions := filepath.Join(brewPrefix, "share", "zsh", "site-functions")
+			if fi, err := os.Stat(siteFunctions); err == nil && fi.IsDir() {
+				return filepath.Join(siteFunctions, "_actr"), nil
+			}
+		}
+		return filepath.Join(homeDir, ".zsh", "completions", "_actr"), nil
+	case "fish":
+		return filepath.Join(homeDir, ".config", "fish", "completions", "actr.fish"), nil
+	case "bash":
+		return filepath.Join(homeDir, ".local", "share", "bash-completion", "completions", "actr"), nil
+	default:
+		return "", fmt.Errorf("unsupported shell for automatic installation: %q (supported: zsh, fish, bash)", shell)
+	}
+}
+
+func newCompletionInstallCmd(rootCmd *cobra.Command) *cobra.Command {
+	return &cobra.Command{
+		Use:       "install [bash|zsh|fish]",
+		Short:     "Install completion script into your shell configuration directory",
+		Args:      cobra.MaximumNArgs(1),
+		ValidArgs: []string{"bash", "zsh", "fish"},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			shell := ""
+			if len(args) > 0 {
+				shell = args[0]
+			} else {
+				envShell := os.Getenv("SHELL")
+				if envShell != "" {
+					shell = filepath.Base(envShell)
+				}
+			}
+			if shell == "" {
+				return fmt.Errorf("unable to detect shell from $SHELL; please specify explicitly (zsh, bash, fish)")
+			}
+
+			targetPath, err := completionTargetResolver(shell)
+			if err != nil {
+				return err
+			}
+
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+				return fmt.Errorf("create directory %s: %w", filepath.Dir(targetPath), err)
+			}
+
+			f, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+			if err != nil {
+				return fmt.Errorf("write completion file %s: %w", targetPath, err)
+			}
+			defer func() { _ = f.Close() }()
+
+			if err := generateCompletion(rootCmd, shell, f); err != nil {
+				return err
+			}
+
+			fmt.Fprintf(cmd.OutOrStdout(), "✓ Installed %s completion to %s\n", shell, targetPath)
+			fmt.Fprintf(cmd.OutOrStdout(), "Restart your shell or run: source %s\n", targetPath)
+			return nil
+		},
+	}
 }
 
 func generateCompletion(rootCmd *cobra.Command, shell string, out io.Writer) error {

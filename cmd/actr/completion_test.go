@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -278,3 +279,124 @@ func TestCompletion_RunAndRegisterFlags(t *testing.T) {
 		}
 	})
 }
+
+func TestCompletion_Install(t *testing.T) {
+	tempHome := t.TempDir()
+	brewPrefix := filepath.Join(tempHome, "homebrew")
+	siteFunctions := filepath.Join(brewPrefix, "share", "zsh", "site-functions")
+	if err := os.MkdirAll(siteFunctions, 0755); err != nil {
+		t.Fatalf("failed to create fake site-functions: %v", err)
+	}
+
+	// Test path resolution for Homebrew Zsh
+	targetPath, err := resolveInstallPath("zsh", tempHome, brewPrefix)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expected := filepath.Join(siteFunctions, "_actr")
+	if targetPath != expected {
+		t.Errorf("expected %q, got %q", expected, targetPath)
+	}
+
+	// Test path resolution for fallback Zsh (no brew)
+	zshFallback, err := resolveInstallPath("zsh", tempHome, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expectedZshFallback := filepath.Join(tempHome, ".zsh", "completions", "_actr")
+	if zshFallback != expectedZshFallback {
+		t.Errorf("expected %q, got %q", expectedZshFallback, zshFallback)
+	}
+
+	// Test path resolution for Fish
+	fishPath, err := resolveInstallPath("fish", tempHome, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expectedFish := filepath.Join(tempHome, ".config", "fish", "completions", "actr.fish")
+	if fishPath != expectedFish {
+		t.Errorf("expected %q, got %q", expectedFish, fishPath)
+	}
+
+	// Test path resolution for Bash
+	bashPath, err := resolveInstallPath("bash", tempHome, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expectedBash := filepath.Join(tempHome, ".local", "share", "bash-completion", "completions", "actr")
+	if bashPath != expectedBash {
+		t.Errorf("expected %q, got %q", expectedBash, bashPath)
+	}
+
+	// Test unsupported shell
+	if _, err := resolveInstallPath("unknown", tempHome, ""); err == nil {
+		t.Errorf("expected error for unsupported shell, got nil")
+	}
+
+	// Test execute install command with explicit argument
+	out := &bytes.Buffer{}
+	errOut := &bytes.Buffer{}
+	cmd := newRootCmd(out, errOut)
+	cmd.SetArgs([]string{"completion", "install", "fish"})
+
+	origResolver := completionTargetResolver
+	t.Cleanup(func() { completionTargetResolver = origResolver })
+	completionTargetResolver = func(shell string) (string, error) {
+		return filepath.Join(tempHome, "actr.fish"), nil
+	}
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("completion install error: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(tempHome, "actr.fish"))
+	if err != nil {
+		t.Fatalf("failed to read installed completion file: %v", err)
+	}
+	if !strings.Contains(string(data), "complete -c actr") {
+		t.Errorf("expected fish completion content, got:\n%s", string(data))
+	}
+	if !strings.Contains(out.String(), "Installed fish completion") {
+		t.Errorf("expected success message in stdout, got:\n%s", out.String())
+	}
+
+	// Test execute install command with auto-detection from SHELL
+	t.Setenv("SHELL", "/bin/zsh")
+	out.Reset()
+	errOut.Reset()
+	completionTargetResolver = func(shell string) (string, error) {
+		if shell != "zsh" {
+			t.Errorf("expected auto-detected shell zsh, got %q", shell)
+		}
+		return filepath.Join(tempHome, "_actr"), nil
+	}
+
+	cmd = newRootCmd(out, errOut)
+	cmd.SetArgs([]string{"completion", "install"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("completion install auto-detect error: %v", err)
+	}
+
+	zshData, err := os.ReadFile(filepath.Join(tempHome, "_actr"))
+	if err != nil {
+		t.Fatalf("failed to read installed zsh completion file: %v", err)
+	}
+	if !strings.Contains(string(zshData), "#compdef actr") {
+		t.Errorf("expected zsh completion content, got:\n%s", string(zshData))
+	}
+
+	// Test execute install command without SHELL and without arg
+	t.Setenv("SHELL", "")
+	cmd = newRootCmd(out, errOut)
+	cmd.SetArgs([]string{"completion", "install"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("expected error when SHELL is empty and no args provided, got nil")
+	}
+
+	// Test detectBrewPrefix with environment variable
+	t.Setenv("HOMEBREW_PREFIX", "/custom/homebrew")
+	if prefix := detectBrewPrefix(); prefix != "/custom/homebrew" {
+		t.Errorf("expected /custom/homebrew, got %q", prefix)
+	}
+}
+
