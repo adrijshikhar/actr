@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +19,7 @@ import (
 	"github.com/adrijshikhar/actr/internal/engine"
 	"github.com/adrijshikhar/actr/internal/history"
 	"github.com/adrijshikhar/actr/internal/monitor"
+	"github.com/adrijshikhar/actr/internal/vault"
 )
 
 func TestServer_StatusEndpoint(t *testing.T) {
@@ -1271,6 +1273,511 @@ func TestServer_MetricsEndpoints(t *testing.T) {
 
 		if rec.Code != http.StatusServiceUnavailable {
 			t.Fatalf("expected 503 Service Unavailable, got %d", rec.Code)
+		}
+	})
+}
+
+type mockSecretManager struct {
+	mu      sync.Mutex
+	secrets map[string]string
+	scopes  map[string]string
+	listErr error
+	setErr  error
+	delErr  error
+}
+
+func newMockSecretManager() *mockSecretManager {
+	return &mockSecretManager{
+		secrets: make(map[string]string),
+		scopes:  make(map[string]string),
+	}
+}
+
+func (m *mockSecretManager) ListSecrets(ctx context.Context) ([]vault.SecretMetadata, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
+	var res []vault.SecretMetadata
+	for k := range m.secrets {
+		res = append(res, vault.SecretMetadata{
+			Key:      k,
+			Provider: "mock",
+		})
+	}
+	sort.Slice(res, func(i, j int) bool {
+		return res[i].Key < res[j].Key
+	})
+	return res, nil
+}
+
+func (m *mockSecretManager) SetSecret(ctx context.Context, key, val, scope string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.setErr != nil {
+		return m.setErr
+	}
+	m.secrets[key] = val
+	m.scopes[key] = scope
+	return nil
+}
+
+func (m *mockSecretManager) DeleteSecret(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.delErr != nil {
+		return m.delErr
+	}
+	if _, ok := m.secrets[key]; !ok {
+		return vault.ErrSecretNotFound
+	}
+	delete(m.secrets, key)
+	delete(m.scopes, key)
+	return nil
+}
+
+type mockDaemonController struct {
+	statusStr string
+	statusErr error
+	startErr  error
+	stopErr   error
+	started   bool
+	stopped   bool
+}
+
+func (m *mockDaemonController) Status() (string, error) {
+	if m.statusErr != nil {
+		return "", m.statusErr
+	}
+	return m.statusStr, nil
+}
+
+func (m *mockDaemonController) Start() error {
+	if m.startErr != nil {
+		return m.startErr
+	}
+	m.started = true
+	return nil
+}
+
+func (m *mockDaemonController) Stop() error {
+	if m.stopErr != nil {
+		return m.stopErr
+	}
+	m.stopped = true
+	return nil
+}
+
+func TestServer_Secrets(t *testing.T) {
+	// 1. Unconfigured SecretManager returns 503
+	t.Run("unconfigured returns 503", func(t *testing.T) {
+		srv := NewServer(ServerConfig{SecretManager: nil})
+
+		// GET /api/secrets
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/secrets", nil)
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("GET /api/secrets expected 503, got %d", rec.Code)
+		}
+
+		// POST /api/secrets
+		rec = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodPost, "/api/secrets", strings.NewReader(`{"key":"A","value":"B"}`))
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("POST /api/secrets expected 503, got %d", rec.Code)
+		}
+
+		// DELETE /api/secrets/{key}
+		rec = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodDelete, "/api/secrets/A", nil)
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("DELETE /api/secrets expected 503, got %d", rec.Code)
+		}
+	})
+
+	// 2. List secrets empty returns []
+	t.Run("list empty returns []", func(t *testing.T) {
+		sm := newMockSecretManager()
+		srv := NewServer(ServerConfig{SecretManager: sm})
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/secrets", nil)
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+		body := strings.TrimSpace(rec.Body.String())
+		if body != "[]" {
+			t.Fatalf("expected '[]', got %q", body)
+		}
+	})
+
+	// 3. Set secret successfully
+	t.Run("set secret success", func(t *testing.T) {
+		sm := newMockSecretManager()
+		srv := NewServer(ServerConfig{SecretManager: sm})
+
+		payload := `{"key": "GH_TOKEN", "value": "ghp_super_secret_value", "scope": "repo"}`
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/secrets", strings.NewReader(payload))
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("expected 201 Created, got %d (body: %s)", rec.Code, rec.Body.String())
+		}
+		var res map[string]string
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+			t.Fatalf("unmarshal error: %v", err)
+		}
+		if res["status"] != "saved" || res["key"] != "GH_TOKEN" {
+			t.Fatalf("unexpected response: %+v", res)
+		}
+
+		// Verify stored in manager
+		if sm.secrets["GH_TOKEN"] != "ghp_super_secret_value" {
+			t.Fatalf("secret value not stored in manager")
+		}
+		if sm.scopes["GH_TOKEN"] != "repo" {
+			t.Fatalf("secret scope not stored in manager")
+		}
+	})
+
+	// 4. Set secret validation errors
+	t.Run("set secret validation errors", func(t *testing.T) {
+		sm := newMockSecretManager()
+		srv := NewServer(ServerConfig{SecretManager: sm})
+
+		testCases := []struct {
+			name string
+			body string
+		}{
+			{"empty body", ""},
+			{"invalid json", "{not-json}"},
+			{"missing key", `{"value": "bar"}`},
+			{"empty key", `{"key": "", "value": "bar"}`},
+			{"whitespace key", `{"key": "   ", "value": "bar"}`},
+			{"missing value", `{"key": "foo"}`},
+			{"empty value", `{"key": "foo", "value": ""}`},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				rec := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodPost, "/api/secrets", strings.NewReader(tc.body))
+				srv.ServeHTTP(rec, req)
+
+				if rec.Code != http.StatusBadRequest {
+					t.Fatalf("expected 400 Bad Request for %s, got %d (body: %s)", tc.name, rec.Code, rec.Body.String())
+				}
+			})
+		}
+	})
+
+	// 5. Set secret manager error returns 500
+	t.Run("set secret backend error returns 500", func(t *testing.T) {
+		sm := newMockSecretManager()
+		sm.setErr = errors.New("vault backend disk full")
+		srv := NewServer(ServerConfig{SecretManager: sm})
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/secrets", strings.NewReader(`{"key":"A","value":"B"}`))
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500 Internal Server Error, got %d", rec.Code)
+		}
+	})
+
+	// 6. List secrets with data excludes sensitive values
+	t.Run("list secrets excludes secret values", func(t *testing.T) {
+		sm := newMockSecretManager()
+		sm.secrets["SECRET_KEY"] = "super_classified_password_123"
+		sm.secrets["API_TOKEN"] = "token_classified_xyz"
+		srv := NewServer(ServerConfig{SecretManager: sm})
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/secrets", nil)
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+
+		rawBody := rec.Body.String()
+		if strings.Contains(rawBody, "super_classified_password_123") {
+			t.Fatalf("secret value leaked in GET /api/secrets response: %s", rawBody)
+		}
+		if strings.Contains(rawBody, "token_classified_xyz") {
+			t.Fatalf("secret value leaked in GET /api/secrets response: %s", rawBody)
+		}
+
+		var items []vault.SecretMetadata
+		if err := json.Unmarshal(rec.Body.Bytes(), &items); err != nil {
+			t.Fatalf("unmarshal error: %v", err)
+		}
+		if len(items) != 2 {
+			t.Fatalf("expected 2 secrets metadata items, got %d", len(items))
+		}
+		if items[0].Key != "API_TOKEN" || items[1].Key != "SECRET_KEY" {
+			t.Fatalf("unexpected items: %+v", items)
+		}
+	})
+
+	// 7. List secrets manager error returns 500
+	t.Run("list secrets backend error returns 500", func(t *testing.T) {
+		sm := newMockSecretManager()
+		sm.listErr = errors.New("vault backend error")
+		srv := NewServer(ServerConfig{SecretManager: sm})
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/secrets", nil)
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500 Internal Server Error, got %d", rec.Code)
+		}
+	})
+
+	// 8. Delete secret success
+	t.Run("delete secret success", func(t *testing.T) {
+		sm := newMockSecretManager()
+		sm.secrets["TO_DELETE"] = "delete_me"
+		srv := NewServer(ServerConfig{SecretManager: sm})
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodDelete, "/api/secrets/TO_DELETE", nil)
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d (body: %s)", rec.Code, rec.Body.String())
+		}
+		var res map[string]string
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+			t.Fatalf("unmarshal error: %v", err)
+		}
+		if res["status"] != "deleted" || res["key"] != "TO_DELETE" {
+			t.Fatalf("unexpected delete response: %+v", res)
+		}
+		if _, ok := sm.secrets["TO_DELETE"]; ok {
+			t.Fatalf("secret was not removed from manager")
+		}
+	})
+
+	// 9. Delete secret not found returns 404
+	t.Run("delete secret not found returns 404", func(t *testing.T) {
+		sm := newMockSecretManager()
+		srv := NewServer(ServerConfig{SecretManager: sm})
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodDelete, "/api/secrets/NON_EXISTENT", nil)
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 Not Found, got %d", rec.Code)
+		}
+	})
+
+	// 10. Delete secret manager error returns 500
+	t.Run("delete secret backend error returns 500", func(t *testing.T) {
+		sm := newMockSecretManager()
+		sm.secrets["EXISTS"] = "some_val"
+		sm.delErr = errors.New("vault locked")
+		srv := NewServer(ServerConfig{SecretManager: sm})
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodDelete, "/api/secrets/EXISTS", nil)
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500 Internal Server Error, got %d", rec.Code)
+		}
+	})
+}
+
+func TestServer_Service(t *testing.T) {
+	// 1. Status with DaemonController running
+	t.Run("status with DaemonController running", func(t *testing.T) {
+		ctrl := &mockDaemonController{statusStr: "running"}
+		srv := NewServer(ServerConfig{DaemonController: ctrl})
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/service", nil)
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+		var res map[string]string
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+			t.Fatalf("unmarshal error: %v", err)
+		}
+		if res["status"] != "running" {
+			t.Fatalf("expected status running, got %s", res["status"])
+		}
+	})
+
+	// 2. Status with DaemonController installed/stopped
+	t.Run("status with DaemonController stopped", func(t *testing.T) {
+		ctrl := &mockDaemonController{statusStr: "installed/stopped"}
+		srv := NewServer(ServerConfig{DaemonController: ctrl})
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/service", nil)
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+		var res map[string]string
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+			t.Fatalf("unmarshal error: %v", err)
+		}
+		if res["status"] != "installed/stopped" {
+			t.Fatalf("expected status installed/stopped, got %s", res["status"])
+		}
+	})
+
+	// 3. Status with DaemonController error returns 500
+	t.Run("status with DaemonController error returns 500", func(t *testing.T) {
+		ctrl := &mockDaemonController{statusErr: errors.New("daemon query failed")}
+		srv := NewServer(ServerConfig{DaemonController: ctrl})
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/service", nil)
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500 Internal Server Error, got %d", rec.Code)
+		}
+	})
+
+	// 4. Start DaemonController success
+	t.Run("start DaemonController success", func(t *testing.T) {
+		ctrl := &mockDaemonController{}
+		srv := NewServer(ServerConfig{DaemonController: ctrl})
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/service/start", nil)
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+		var res map[string]string
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+			t.Fatalf("unmarshal error: %v", err)
+		}
+		if res["status"] != "started" {
+			t.Fatalf("expected status started, got %s", res["status"])
+		}
+		if !ctrl.started {
+			t.Fatalf("expected ctrl.started to be true")
+		}
+	})
+
+	// 5. Start DaemonController error returns 500
+	t.Run("start DaemonController error returns 500", func(t *testing.T) {
+		ctrl := &mockDaemonController{startErr: errors.New("start failed")}
+		srv := NewServer(ServerConfig{DaemonController: ctrl})
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/service/start", nil)
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500 Internal Server Error, got %d", rec.Code)
+		}
+	})
+
+	// 6. Stop DaemonController success
+	t.Run("stop DaemonController success", func(t *testing.T) {
+		ctrl := &mockDaemonController{}
+		srv := NewServer(ServerConfig{DaemonController: ctrl})
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/service/stop", nil)
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+		var res map[string]string
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+			t.Fatalf("unmarshal error: %v", err)
+		}
+		if res["status"] != "stopped" {
+			t.Fatalf("expected status stopped, got %s", res["status"])
+		}
+		if !ctrl.stopped {
+			t.Fatalf("expected ctrl.stopped to be true")
+		}
+	})
+
+	// 7. Stop DaemonController error returns 500
+	t.Run("stop DaemonController error returns 500", func(t *testing.T) {
+		ctrl := &mockDaemonController{stopErr: errors.New("stop failed")}
+		srv := NewServer(ServerConfig{DaemonController: ctrl})
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/service/stop", nil)
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500 Internal Server Error, got %d", rec.Code)
+		}
+	})
+
+	// 8. Fallback behavior when DaemonController is nil
+	t.Run("fallback behavior when DaemonController nil", func(t *testing.T) {
+		srv := NewServer(ServerConfig{DaemonController: nil})
+
+		// GET /api/service executes service.Status()
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/service", nil)
+		srv.ServeHTTP(rec, req)
+
+		// Must return either 200 OK with status string or 500 on unsupported platform (never 404 API endpoint not found)
+		if rec.Code != http.StatusOK && rec.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 200 or 500, got %d (body: %s)", rec.Code, rec.Body.String())
+		}
+		if rec.Code == http.StatusOK {
+			var res map[string]string
+			if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+				t.Fatalf("unmarshal error: %v", err)
+			}
+			if _, ok := res["status"]; !ok {
+				t.Fatalf("expected 'status' key in response: %+v", res)
+			}
+		}
+
+		// POST /api/service/start executes service.Start()
+		rec = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodPost, "/api/service/start", nil)
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK && rec.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 200 or 500, got %d (body: %s)", rec.Code, rec.Body.String())
+		}
+
+		// POST /api/service/stop executes service.Stop()
+		rec = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodPost, "/api/service/stop", nil)
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK && rec.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 200 or 500, got %d (body: %s)", rec.Code, rec.Body.String())
 		}
 	})
 }

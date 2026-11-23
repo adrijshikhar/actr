@@ -134,6 +134,16 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/metrics/current", s.handleMetricsCurrent)
 	s.mux.HandleFunc("GET /api/metrics/stream", s.handleMetricsStream)
 
+	// Secrets Vault API endpoints
+	s.mux.HandleFunc("GET /api/secrets", s.handleSecretsList)
+	s.mux.HandleFunc("POST /api/secrets", s.handleSecretSet)
+	s.mux.HandleFunc("DELETE /api/secrets/{key}", s.handleSecretDelete)
+
+	// OS Service API endpoints
+	s.mux.HandleFunc("GET /api/service", s.handleServiceStatus)
+	s.mux.HandleFunc("POST /api/service/start", s.handleServiceStart)
+	s.mux.HandleFunc("POST /api/service/stop", s.handleServiceStop)
+
 	// Catch-all API 404 to ensure API routes never return HTML SPA fallback
 	s.mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusNotFound, "api endpoint not found")
