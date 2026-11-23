@@ -218,17 +218,33 @@ export function LogViewer({
 
   // Incremental ANSI parser cache: only parse newly appended lines
   const parsedCacheRef = useRef<AnsiSegment[][]>([]);
+  const prevFirstLineRef = useRef<string | null>(null);
+  const prevLastLineRef = useRef<string | null>(null);
 
   const parsedLines = useMemo(() => {
     const cached = parsedCacheRef.current;
-    if (logs.length < cached.length) {
-      // Logs were reset or cleared
-      parsedCacheRef.current = logs.map((line) => parseAnsiLine(line));
-    } else if (logs.length > cached.length) {
-      // Incrementally parse only newly added lines
+    const isExtension =
+      cached.length > 0 &&
+      logs.length > cached.length &&
+      logs[0] === prevFirstLineRef.current &&
+      logs[cached.length - 1] === prevLastLineRef.current;
+
+    if (isExtension) {
       const newSegments = logs.slice(cached.length).map((line) => parseAnsiLine(line));
       parsedCacheRef.current = [...cached, ...newSegments];
+    } else {
+      // Brand new logs array, step switched, reset, or non-extension
+      parsedCacheRef.current = logs.map((line) => parseAnsiLine(line));
     }
+
+    if (logs.length > 0) {
+      prevFirstLineRef.current = logs[0];
+      prevLastLineRef.current = logs[logs.length - 1];
+    } else {
+      prevFirstLineRef.current = null;
+      prevLastLineRef.current = null;
+    }
+
     return parsedCacheRef.current;
   }, [logs]);
 

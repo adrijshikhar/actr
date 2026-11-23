@@ -94,6 +94,8 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
 
   // Isolate step log loading: does not touch loading = true or reload run/metrics
   useEffect(() => {
+    let active = true;
+
     if (!runId || !selectedStepId) {
       setStepLogs(null);
       return;
@@ -112,16 +114,27 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
       return;
     }
 
+    // Clear previous step logs while fetching new step logs
+    setStepLogs(null);
+
     // Fetch step-specific logs in background without setting global loading
     fetchLogs(runId, selectedStepId)
       .then((res) => {
-        const fetched = res.logs || [];
-        stepLogsCacheRef.current[selectedStepId] = fetched;
-        setStepLogs(fetched);
+        if (active) {
+          const fetched = res.logs || [];
+          stepLogsCacheRef.current[selectedStepId] = fetched;
+          setStepLogs(fetched);
+        }
       })
       .catch((err) => {
-        console.warn('Failed to fetch step logs for', selectedStepId, err);
+        if (active) {
+          console.warn('Failed to fetch step logs for', selectedStepId, err);
+        }
       });
+
+    return () => {
+      active = false;
+    };
   }, [runId, selectedStepId, run?.status]);
 
   // Set up SSE live subscription if run is active
