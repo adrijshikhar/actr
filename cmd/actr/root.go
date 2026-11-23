@@ -50,6 +50,7 @@ func newRootCmd(out, errOut io.Writer) *cobra.Command {
 	cmd.AddCommand(newRunCmd())
 	cmd.AddCommand(newMonitorCmd())
 	cmd.AddCommand(newSecretsCommand())
+	cmd.AddCommand(newCompletionCmd(cmd))
 
 	return cmd
 }

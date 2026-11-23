@@ -315,8 +315,58 @@ When multiple providers are defined, `actr` cascades through them in priority or
 | `actr service stop` | Stop the background daemon service |
 | `actr service uninstall` | Remove background daemon service definition |
 | `actr completion <shell>` | Generate shell completions (`zsh`, `bash`, `fish`, `powershell`) |
+| `actr completion install [shell]` | Install shell completion script directly to your shell configuration directory |
 | `actr doctor` | Validate OS, architecture, Git, and Node.js prerequisites |
-| `actr version` | Print version and commit build info |
+| `actr --version` | Print version and commit build info |
+
+---
+
+## ⌨️ Shell Autocompletion
+
+`actr` features rich, context-aware dynamic shell completion powered by Cobra:
+
+- **Dynamic Secret Keys**: Tab-complete stored keys in `actr secrets get <KEY>` and `actr secrets delete <KEY>` resolved live from your active vault with timeout protection.
+- **Contextual Runner Labels**: Tab-complete standard runner labels (`self-hosted`, `macOS`, `ARM64`, `linux`, `x64`) with descriptions, supporting comma-separated multi-label chaining (`--labels self-hosted,m<TAB>`).
+- **Runner Instance Names**: Tab-complete configured runner and supervisor worker names (`actr register --name <TAB>`) discovered from local `config.yaml` or `.runner`.
+- **Directory & File Directives**: Native shell tab completion for paths on `--config-dir`, `--work-folder`, `--log-dir`, `--runs-dir`, `--bin`, and `--sock`.
+
+### Quick Installation
+
+Automatically detect your active shell and install the completion file into standard site-functions directories:
+
+```bash
+actr completion install
+```
+
+Or specify your shell explicitly:
+
+```bash
+actr completion install zsh   # Installs to Homebrew site-functions or ~/.zsh/completions/_actr
+actr completion install bash  # Installs to ~/.local/share/bash-completion/completions/actr
+actr completion install fish  # Installs to ~/.config/fish/completions/actr.fish
+```
+
+After installation:
+- **Zsh**: Run `autoload -Uz compinit && compinit` or open a new terminal window.
+- **Bash / Fish**: Open a new terminal window or source the installed path.
+
+### Manual Sourcing
+
+Load completions temporarily into your current terminal session:
+
+```bash
+# Zsh
+source <(actr completion zsh)
+
+# Bash
+source <(actr completion bash)
+
+# Fish
+actr completion fish | source
+
+# PowerShell
+actr completion powershell | Out-String | Invoke-Expression
+```
 
 ---
 

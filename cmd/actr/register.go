@@ -421,5 +421,8 @@ func newRegisterCmd() *cobra.Command {
 	_ = cmd.MarkFlagDirname("config-dir")
 	_ = cmd.MarkFlagDirname("work-folder")
 
+	_ = cmd.RegisterFlagCompletionFunc("labels", completeLabels)
+	_ = cmd.RegisterFlagCompletionFunc("name", completeRunnerNames)
+
 	return cmd
 }

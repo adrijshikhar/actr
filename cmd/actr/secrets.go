@@ -2,12 +2,15 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/adrijshikhar/actr/internal/config"
 	"github.com/adrijshikhar/actr/internal/vault"
@@ -90,9 +93,10 @@ func newSecretsCommand() *cobra.Command {
 	setCmd.Flags().StringVar(&secretValueFlag, "value", "", "Secret value (bypasses masked prompt)")
 
 	getCmd := &cobra.Command{
-		Use:   "get <KEY>",
-		Short: "Retrieve and print a decrypted secret from the vault",
-		Args:  cobra.ExactArgs(1),
+		Use:               "get <KEY>",
+		Short:             "Retrieve and print a decrypted secret from the vault",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeSecretKeys,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			key := args[0]
 			v, err := vaultProviderResolver(cmd)
@@ -131,9 +135,10 @@ func newSecretsCommand() *cobra.Command {
 	}
 
 	deleteCmd := &cobra.Command{
-		Use:   "delete <KEY>",
-		Short: "Remove a secret key from the vault",
-		Args:  cobra.ExactArgs(1),
+		Use:               "delete <KEY>",
+		Short:             "Remove a secret key from the vault",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeSecretKeys,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			key := args[0]
 			v, err := vaultProviderResolver(cmd)
@@ -150,6 +155,36 @@ func newSecretsCommand() *cobra.Command {
 
 	cmd.AddCommand(setCmd, getCmd, listCmd, deleteCmd)
 	return cmd
+}
+
+func completeSecretKeys(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	if len(args) != 0 {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	v, err := vaultProviderResolver(cmd)
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	keys, err := v.List(ctx)
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	var matches []string
+	prefix := strings.ToLower(toComplete)
+	for _, k := range keys {
+		if strings.HasPrefix(strings.ToLower(k.Key), prefix) {
+			matches = append(matches, k.Key)
+		}
+	}
+	slices.Sort(matches)
+	return matches, cobra.ShellCompDirectiveNoFileComp
 }
 
 func resolveVaultProvider(cmd *cobra.Command) (vault.Provider, error) {

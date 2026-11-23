@@ -5,8 +5,9 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "v0.
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "none")
 DATE ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-LDFLAGS=-ldflags "-X main.Version=$(VERSION) -X main.Commit=$(COMMIT) -X main.Date=$(DATE)"
+LDFLAGS=-ldflags "-s -w -X main.Version=$(VERSION) -X main.Commit=$(COMMIT) -X main.Date=$(DATE)"
 INSTALL_DIR ?= $(HOME)/.local/bin
+COMPLETION_SHELL ?= zsh
 
 build:
 	CGO_ENABLED=0 go build $(LDFLAGS) -o bin/$(BINARY_NAME) ./cmd/actr
@@ -14,10 +15,7 @@ build:
 install: build
 	mkdir -p $(INSTALL_DIR)
 	cp bin/$(BINARY_NAME) $(INSTALL_DIR)/$(BINARY_NAME)
-	@if [ -d "$$(brew --prefix 2>/dev/null)/share/zsh/site-functions" ]; then \
-		bin/$(BINARY_NAME) completion zsh > "$$(brew --prefix)/share/zsh/site-functions/_$(BINARY_NAME)"; \
-		echo "Installed zsh completion to $$(brew --prefix)/share/zsh/site-functions/_$(BINARY_NAME)"; \
-	fi
+	bin/$(BINARY_NAME) completion install $(COMPLETION_SHELL)
 
 release-snapshot:
 	goreleaser release --snapshot --clean --skip=publish
