@@ -175,6 +175,7 @@ jobs:
           HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           brew tap adrijshikhar/tap "$PWD/tap" --force 2>/dev/null || true
+          brew trust adrijshikhar/tap 2>/dev/null || brew trust --cask adrijshikhar/tap/actr 2>/dev/null || true
           brew audit --cask --strict --online adrijshikhar/tap/actr
           brew developer off 2>/dev/null || true
 
@@ -182,6 +183,7 @@ jobs:
         env:
           HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          brew trust adrijshikhar/tap 2>/dev/null || brew trust --cask adrijshikhar/tap/actr 2>/dev/null || true
           brew install --cask --force adrijshikhar/tap/actr
           actr -v
 
