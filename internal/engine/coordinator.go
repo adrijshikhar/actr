@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"github.com/adrijshikhar/actr/internal/monitor"
 	"github.com/adrijshikhar/actr/internal/protocol"
 	"github.com/adrijshikhar/actr/internal/telemetry"
+	"github.com/adrijshikhar/actr/internal/vault"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -49,6 +51,7 @@ type Coordinator struct {
 	tracer            *telemetry.Manager
 	actionResolver    action.Resolver
 	nodeDetector      action.NodeDetector
+	vault             vault.Provider
 	mu                sync.RWMutex
 }
 
@@ -112,6 +115,20 @@ func (c *Coordinator) Shutdown(ctx context.Context) error {
 func (c *Coordinator) WithDockerDriver(d driver.Driver) *Coordinator {
 	c.dockerDriver = d
 	return c
+}
+
+// WithVault configures the secret vault provider used for resolving secret environment variables.
+func (c *Coordinator) WithVault(v vault.Provider) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.vault = v
+	return c
+}
+
+func (c *Coordinator) getVault() vault.Provider {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.vault
 }
 
 // WithActionResolver sets a custom action resolver on the Coordinator.
@@ -350,6 +367,9 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	}
 
 	jobID := job.JobID
+	if jobID == "" {
+		jobID = job.ID
+	}
 	if jobID == "" {
 		jobID = "job"
 	}
@@ -964,13 +984,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		}
 
 		// Build step environment: cumulative environment + step-specific overrides + command files
-		stepEnv := make(map[string]string, len(cumulativeEnv)+len(step.Environment)+5)
-		for k, v := range cumulativeEnv {
-			stepEnv[k] = v
-		}
-		for k, v := range step.Environment {
-			stepEnv[k] = evaluateValue(v, parsedContext)
-		}
+		stepEnv := c.prepareStepEnvironment(stepCtx, job, step, cumulativeEnv, parsedContext, jobMasker)
 		stepEnv["GITHUB_ENV"] = envPath
 		stepEnv["GITHUB_OUTPUT"] = outputPath
 		stepEnv["GITHUB_PATH"] = pathFilePath
@@ -1486,6 +1500,117 @@ func isActionStep(step protocol.JobStep) bool {
 		return ref != nil && strings.Contains(ref.Name, "/")
 	}
 	return false
+}
+
+// isTrustedContext evaluates whether the given job is authorized to access secrets from the vault.
+// Local runs, push events, and workflow_dispatch events are always trusted.
+// Pull request events are trusted only if the pull request originates from an internal branch
+// within the same repository (GITHUB_HEAD_REF_REPO == GITHUB_REPOSITORY).
+// Fork pull requests are untrusted to prevent secret exfiltration.
+func isTrustedContext(job *protocol.JobSpecification) bool {
+	if job == nil {
+		return false
+	}
+	if job.IsLocalExecution {
+		return true
+	}
+	eventName := job.EventName
+	if eventName == "" && job.Variables != nil {
+		eventName = job.Variables["GITHUB_EVENT_NAME"]
+	}
+	if eventName == "push" || eventName == "workflow_dispatch" {
+		return true
+	}
+	if eventName == "pull_request" {
+		if job.Variables != nil {
+			headRepo := job.Variables["GITHUB_HEAD_REF_REPO"]
+			baseRepo := job.Variables["GITHUB_REPOSITORY"]
+			if headRepo != "" && (headRepo == baseRepo || strings.EqualFold(headRepo, baseRepo)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (c *Coordinator) logSecurityNotice(jobID, stepID, msg string) {
+	c.NotifyJobStepLog(jobID, stepID, msg)
+	c.mu.RLock()
+	out := c.stdout
+	c.mu.RUnlock()
+	if out != nil {
+		_, _ = fmt.Fprintln(out, msg)
+	}
+}
+
+// prepareStepEnvironment resolves environment variables for a step, inheriting cumulative variables
+// and evaluating step-specific environment values. If a secret vault provider is configured, empty
+// environment variables (v == "") are looked up in the vault. If found in a trusted context (push,
+// workflow_dispatch, local run, same-repo PR), the secret is injected and registered with jobMasker.
+// If the context is untrusted (fork PR), secret resolution is blocked and a security notice is logged.
+func (c *Coordinator) prepareStepEnvironment(
+	ctx context.Context,
+	job *protocol.JobSpecification,
+	step protocol.JobStep,
+	extra ...any,
+) map[string]string {
+	var cumulativeEnv map[string]string
+	var parsedContext map[string]any
+	var jobMasker *SecretMasker
+
+	for _, arg := range extra {
+		switch v := arg.(type) {
+		case map[string]string:
+			cumulativeEnv = v
+		case map[string]any:
+			parsedContext = v
+		case *SecretMasker:
+			jobMasker = v
+		}
+	}
+
+	stepEnv := make(map[string]string, len(cumulativeEnv)+len(step.Environment)+5)
+	for k, v := range cumulativeEnv {
+		stepEnv[k] = v
+	}
+	for k, v := range step.Environment {
+		stepEnv[k] = evaluateValue(v, parsedContext)
+	}
+
+	v := c.getVault()
+	if v != nil {
+		trusted := isTrustedContext(job)
+		jobID := ""
+		if job != nil {
+			jobID = job.JobID
+			if jobID == "" {
+				jobID = job.ID
+			}
+		}
+
+		keys := make([]string, 0, len(stepEnv))
+		for k := range stepEnv {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		for _, k := range keys {
+			if stepEnv[k] == "" {
+				if secretVal, err := v.Get(ctx, k); err == nil && secretVal != "" {
+					if trusted {
+						stepEnv[k] = secretVal
+						if jobMasker != nil {
+							jobMasker.AddMask(secretVal)
+						}
+					} else {
+						c.logSecurityNotice(jobID, step.ID, "Vault secret resolution blocked for untrusted fork PR: "+k)
+					}
+				}
+			}
+		}
+	}
+
+	return stepEnv
 }
 
 func getStepReference(step protocol.JobStep) *protocol.StepReference {

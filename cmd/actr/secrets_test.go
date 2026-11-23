@@ -1,0 +1,285 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestSecretsCLI_Lifecycle(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// 1. Set secret via --value flag
+	var outBuf, errBuf bytes.Buffer
+	code := dispatchWithContext(context.Background(), []string{"secrets", "set", "TEST_KEY", "--value", "secret123", "--config-dir", tempDir}, &outBuf, &errBuf)
+	require.Equal(t, 0, code, "expected secrets set exit 0: %s", errBuf.String())
+
+	// 2. Get secret
+	outBuf.Reset()
+	errBuf.Reset()
+	code = dispatchWithContext(context.Background(), []string{"secrets", "get", "TEST_KEY", "--config-dir", tempDir}, &outBuf, &errBuf)
+	require.Equal(t, 0, code, "expected secrets get exit 0: %s", errBuf.String())
+	assert.Equal(t, "secret123", strings.TrimSpace(outBuf.String()))
+
+	// 3. List secrets
+	outBuf.Reset()
+	errBuf.Reset()
+	code = dispatchWithContext(context.Background(), []string{"secrets", "list", "--config-dir", tempDir}, &outBuf, &errBuf)
+	require.Equal(t, 0, code, "expected secrets list exit 0: %s", errBuf.String())
+	assert.Contains(t, outBuf.String(), "TEST_KEY")
+
+	// 4. Delete secret
+	outBuf.Reset()
+	errBuf.Reset()
+	code = dispatchWithContext(context.Background(), []string{"secrets", "delete", "TEST_KEY", "--config-dir", tempDir}, &outBuf, &errBuf)
+	require.Equal(t, 0, code, "expected secrets delete exit 0: %s", errBuf.String())
+}
+
+func TestSecretsCLI_FileVault_Lifecycle(t *testing.T) {
+	tempDir := t.TempDir()
+	configContent := `
+vault:
+  enabled: true
+  providers:
+    - type: "encrypted-file"
+      path: "` + filepath.Join(tempDir, "vault.enc") + `"
+      auth:
+        passphrase: "test-file-vault-pass"
+`
+	err := os.WriteFile(filepath.Join(tempDir, "config.yaml"), []byte(configContent), 0600)
+	require.NoError(t, err)
+
+	// Set secret
+	var outBuf, errBuf bytes.Buffer
+	code := dispatchWithContext(context.Background(), []string{"secrets", "set", "DB_PASSWORD", "--value", "super-secret-pass", "--config-dir", tempDir}, &outBuf, &errBuf)
+	require.Equal(t, 0, code, "set DB_PASSWORD failed: %s", errBuf.String())
+	assert.Contains(t, outBuf.String(), "✓ Stored DB_PASSWORD in encrypted-file")
+
+	// Set second secret
+	outBuf.Reset()
+	errBuf.Reset()
+	code = dispatchWithContext(context.Background(), []string{"secrets", "set", "API_KEY", "--value", "apikey987", "--config-dir", tempDir}, &outBuf, &errBuf)
+	require.Equal(t, 0, code, "set API_KEY failed: %s", errBuf.String())
+
+	// Get secret
+	outBuf.Reset()
+	errBuf.Reset()
+	code = dispatchWithContext(context.Background(), []string{"secrets", "get", "DB_PASSWORD", "--config-dir", tempDir}, &outBuf, &errBuf)
+	require.Equal(t, 0, code, "get DB_PASSWORD failed: %s", errBuf.String())
+	assert.Equal(t, "super-secret-pass", strings.TrimSpace(outBuf.String()))
+
+	// List secrets
+	outBuf.Reset()
+	errBuf.Reset()
+	code = dispatchWithContext(context.Background(), []string{"secrets", "list", "--config-dir", tempDir}, &outBuf, &errBuf)
+	require.Equal(t, 0, code, "list failed: %s", errBuf.String())
+	listOut := outBuf.String()
+	assert.Contains(t, listOut, "KEY")
+	assert.Contains(t, listOut, "PROVIDER")
+	assert.Contains(t, listOut, "UPDATED")
+	assert.Contains(t, listOut, "DB_PASSWORD")
+	assert.Contains(t, listOut, "API_KEY")
+	assert.Contains(t, listOut, "encrypted-file")
+
+	// Delete secret
+	outBuf.Reset()
+	errBuf.Reset()
+	code = dispatchWithContext(context.Background(), []string{"secrets", "delete", "DB_PASSWORD", "--config-dir", tempDir}, &outBuf, &errBuf)
+	require.Equal(t, 0, code, "delete failed: %s", errBuf.String())
+	assert.Contains(t, outBuf.String(), "✓ Deleted DB_PASSWORD")
+
+	// Get secret after delete should fail
+	outBuf.Reset()
+	errBuf.Reset()
+	code = dispatchWithContext(context.Background(), []string{"secrets", "get", "DB_PASSWORD", "--config-dir", tempDir}, &outBuf, &errBuf)
+	require.NotEqual(t, 0, code)
+	assert.Contains(t, errBuf.String(), "secret not found in vault")
+}
+
+func TestSecretsCLI_PipeInput(t *testing.T) {
+	tempDir := t.TempDir()
+	configContent := `
+vault:
+  providers:
+    - type: "encrypted-file"
+`
+	err := os.WriteFile(filepath.Join(tempDir, "config.yaml"), []byte(configContent), 0600)
+	require.NoError(t, err)
+
+	// Pipe with trailing newline
+	in := strings.NewReader("piped-secret-val-123\n")
+	var outBuf, errBuf bytes.Buffer
+	code := dispatchWithContextAndIn(context.Background(), in, []string{"secrets", "set", "PIPED_KEY", "--config-dir", tempDir}, &outBuf, &errBuf)
+	require.Equal(t, 0, code, "pipe set failed: %s", errBuf.String())
+	assert.Contains(t, outBuf.String(), "✓ Stored PIPED_KEY")
+
+	// Verify retrieval
+	outBuf.Reset()
+	errBuf.Reset()
+	code = dispatchWithContext(context.Background(), []string{"secrets", "get", "PIPED_KEY", "--config-dir", tempDir}, &outBuf, &errBuf)
+	require.Equal(t, 0, code)
+	assert.Equal(t, "piped-secret-val-123", strings.TrimSpace(outBuf.String()))
+}
+
+func TestSecretsCLI_PipeInput_NoTrailingNewline(t *testing.T) {
+	tempDir := t.TempDir()
+	configContent := `
+vault:
+  providers:
+    - type: "encrypted-file"
+`
+	err := os.WriteFile(filepath.Join(tempDir, "config.yaml"), []byte(configContent), 0600)
+	require.NoError(t, err)
+
+	// Pipe ending with EOF (no newline)
+	in := strings.NewReader("eof-secret-val-456")
+	var outBuf, errBuf bytes.Buffer
+	code := dispatchWithContextAndIn(context.Background(), in, []string{"secrets", "set", "EOF_KEY", "--config-dir", tempDir}, &outBuf, &errBuf)
+	require.Equal(t, 0, code, "pipe set failed: %s", errBuf.String())
+
+	// Verify retrieval
+	outBuf.Reset()
+	errBuf.Reset()
+	code = dispatchWithContext(context.Background(), []string{"secrets", "get", "EOF_KEY", "--config-dir", tempDir}, &outBuf, &errBuf)
+	require.Equal(t, 0, code)
+	assert.Equal(t, "eof-secret-val-456", strings.TrimSpace(outBuf.String()))
+}
+
+func TestSecretsCLI_InteractivePrompt(t *testing.T) {
+	tempDir := t.TempDir()
+	configContent := `
+vault:
+  providers:
+    - type: "encrypted-file"
+`
+	err := os.WriteFile(filepath.Join(tempDir, "config.yaml"), []byte(configContent), 0600)
+	require.NoError(t, err)
+
+	origIsTerm := isTerminalReaderFunc
+	origReadPass := readPasswordFunc
+	defer func() {
+		isTerminalReaderFunc = origIsTerm
+		readPasswordFunc = origReadPass
+	}()
+
+	isTerminalReaderFunc = func(r io.Reader) bool { return true }
+	readPasswordFunc = func(fd int) ([]byte, error) {
+		return []byte("interactive-prompt-value"), nil
+	}
+
+	var outBuf, errBuf bytes.Buffer
+	code := dispatchWithContext(context.Background(), []string{"secrets", "set", "INTERACTIVE_KEY", "--config-dir", tempDir}, &outBuf, &errBuf)
+	require.Equal(t, 0, code, "interactive set failed: %s", errBuf.String())
+	assert.Contains(t, outBuf.String(), "Enter secret value for INTERACTIVE_KEY:")
+	assert.Contains(t, outBuf.String(), "✓ Stored INTERACTIVE_KEY")
+
+	// Verify retrieval
+	outBuf.Reset()
+	errBuf.Reset()
+	code = dispatchWithContext(context.Background(), []string{"secrets", "get", "INTERACTIVE_KEY", "--config-dir", tempDir}, &outBuf, &errBuf)
+	require.Equal(t, 0, code)
+	assert.Equal(t, "interactive-prompt-value", strings.TrimSpace(outBuf.String()))
+}
+
+func TestSecretsCLI_InteractivePrompt_ReadError(t *testing.T) {
+	tempDir := t.TempDir()
+	configContent := `
+vault:
+  providers:
+    - type: "encrypted-file"
+`
+	err := os.WriteFile(filepath.Join(tempDir, "config.yaml"), []byte(configContent), 0600)
+	require.NoError(t, err)
+
+	origIsTerm := isTerminalReaderFunc
+	origReadPass := readPasswordFunc
+	defer func() {
+		isTerminalReaderFunc = origIsTerm
+		readPasswordFunc = origReadPass
+	}()
+
+	isTerminalReaderFunc = func(r io.Reader) bool { return true }
+	readPasswordFunc = func(fd int) ([]byte, error) {
+		return nil, errors.New("terminal read error")
+	}
+
+	var outBuf, errBuf bytes.Buffer
+	code := dispatchWithContext(context.Background(), []string{"secrets", "set", "FAIL_KEY", "--config-dir", tempDir}, &outBuf, &errBuf)
+	require.NotEqual(t, 0, code)
+	assert.Contains(t, errBuf.String(), "read secret value: terminal read error")
+}
+
+func TestSecretsCLI_GetNotFound(t *testing.T) {
+	tempDir := t.TempDir()
+	configContent := `
+vault:
+  providers:
+    - type: "encrypted-file"
+`
+	err := os.WriteFile(filepath.Join(tempDir, "config.yaml"), []byte(configContent), 0600)
+	require.NoError(t, err)
+
+	var outBuf, errBuf bytes.Buffer
+	code := dispatchWithContext(context.Background(), []string{"secrets", "get", "NO_SUCH_KEY", "--config-dir", tempDir}, &outBuf, &errBuf)
+	require.NotEqual(t, 0, code)
+	assert.Contains(t, errBuf.String(), "secret not found in vault")
+}
+
+func TestSecretsCLI_DeleteNotFound(t *testing.T) {
+	tempDir := t.TempDir()
+	configContent := `
+vault:
+  providers:
+    - type: "encrypted-file"
+`
+	err := os.WriteFile(filepath.Join(tempDir, "config.yaml"), []byte(configContent), 0600)
+	require.NoError(t, err)
+
+	var outBuf, errBuf bytes.Buffer
+	code := dispatchWithContext(context.Background(), []string{"secrets", "delete", "NO_SUCH_KEY", "--config-dir", tempDir}, &outBuf, &errBuf)
+	require.NotEqual(t, 0, code)
+	assert.Contains(t, errBuf.String(), "secret not found in vault")
+}
+
+func TestSecretsCLI_ArgumentValidation(t *testing.T) {
+	tempDir := t.TempDir()
+
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"set missing key", []string{"secrets", "set", "--config-dir", tempDir}},
+		{"get missing key", []string{"secrets", "get", "--config-dir", tempDir}},
+		{"delete missing key", []string{"secrets", "delete", "--config-dir", tempDir}},
+		{"list unexpected args", []string{"secrets", "list", "unexpected", "--config-dir", tempDir}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var outBuf, errBuf bytes.Buffer
+			code := dispatchWithContext(context.Background(), tt.args, &outBuf, &errBuf)
+			require.NotEqual(t, 0, code)
+		})
+	}
+}
+
+func TestSecretsCLI_Help(t *testing.T) {
+	var outBuf, errBuf bytes.Buffer
+	code := dispatchWithContext(context.Background(), []string{"secrets", "--help"}, &outBuf, &errBuf)
+	require.Equal(t, 0, code)
+	out := outBuf.String()
+	assert.Contains(t, out, "Manage runner-local credentials in the secret vault")
+	assert.Contains(t, out, "set")
+	assert.Contains(t, out, "get")
+	assert.Contains(t, out, "list")
+	assert.Contains(t, out, "delete")
+	assert.Contains(t, out, "--config-dir")
+}

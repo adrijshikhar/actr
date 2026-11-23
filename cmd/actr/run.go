@@ -25,6 +25,7 @@ import (
 	"github.com/adrijshikhar/actr/internal/registration"
 	"github.com/adrijshikhar/actr/internal/supervisor"
 	"github.com/adrijshikhar/actr/internal/telemetry"
+	"github.com/adrijshikhar/actr/internal/vault"
 	"github.com/spf13/cobra"
 )
 
@@ -513,6 +514,13 @@ func newRunCmd() *cobra.Command {
 				if otelMgr != nil {
 					coordEngine = coordEngine.WithTracer(otelMgr)
 				}
+				var vCfg *config.VaultYAMLConfig
+				if yamlCfg != nil {
+					vCfg = &yamlCfg.Vault
+				}
+				if vaultProv, err := vault.NewProviderFromConfig(vCfg, cfgDir); err == nil && vaultProv != nil {
+					coordEngine = coordEngine.WithVault(vaultProv)
+				}
 				coord = coordEngine
 			} else {
 				if c, ok := coord.(*engine.Coordinator); ok {
@@ -524,6 +532,13 @@ func newRunCmd() *cobra.Command {
 					}
 					if otelMgr != nil {
 						c.WithTracer(otelMgr)
+					}
+					var vCfg *config.VaultYAMLConfig
+					if yamlCfg != nil {
+						vCfg = &yamlCfg.Vault
+					}
+					if vaultProv, err := vault.NewProviderFromConfig(vCfg, cfgDir); err == nil && vaultProv != nil {
+						c.WithVault(vaultProv)
 					}
 				} else {
 					type limitsSetter interface {

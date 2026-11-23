@@ -175,6 +175,22 @@ type RetentionYAMLConfig struct {
 	MaxDiskMB int64 `json:"max_disk_mb,omitempty" yaml:"max_disk_mb,omitempty"`
 }
 
+type VaultProviderYAMLConfig struct {
+	Type    string            `json:"type" yaml:"type"`
+	Label   string            `json:"label,omitempty" yaml:"label,omitempty"`
+	Path    string            `json:"path,omitempty" yaml:"path,omitempty"`
+	Address string            `json:"address,omitempty" yaml:"address,omitempty"`
+	Region  string            `json:"region,omitempty" yaml:"region,omitempty"`
+	Prefix  string            `json:"prefix,omitempty" yaml:"prefix,omitempty"`
+	Auth    map[string]string `json:"auth,omitempty" yaml:"auth,omitempty"`
+}
+
+type VaultYAMLConfig struct {
+	Enabled     bool                      `json:"enabled" yaml:"enabled"`
+	TrustedOnly bool                      `json:"trusted_only" yaml:"trusted_only"`
+	Providers   []VaultProviderYAMLConfig `json:"providers" yaml:"providers"`
+}
+
 type RunnerYAMLConfig struct {
 	Runner struct {
 		Name       string `json:"name" yaml:"name"`
@@ -188,6 +204,7 @@ type RunnerYAMLConfig struct {
 	} `json:"limits" yaml:"limits"`
 	Driver    DriverConfig        `json:"driver" yaml:"driver"`
 	Retention RetentionYAMLConfig `json:"retention,omitempty" yaml:"retention,omitempty"`
+	Vault     VaultYAMLConfig     `json:"vault,omitempty" yaml:"vault,omitempty"`
 }
 
 func (c *RunnerYAMLConfig) ParseLimits() (*LimitsConfig, error) {

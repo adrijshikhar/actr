@@ -37,6 +37,9 @@ type JobStep struct {
 	Condition        string            `json:"condition,omitempty"`
 }
 
+// Step is an alias for JobStep for convenience.
+type Step = JobStep
+
 // JobContainer defines the container execution environment for a workflow job.
 type JobContainer struct {
 	Image       string            `json:"image"`
@@ -65,16 +68,19 @@ type ServiceEndpoint struct {
 
 // JobSpecification represents the complete workflow job payload returned by the Run Service.
 type JobSpecification struct {
-	JobID       string            `json:"jobId"`
-	JobName     string            `json:"jobName"`
-	PlanID      string            `json:"planId"`
-	JobToken    string            `json:"jobToken,omitempty"`
-	Steps       []JobStep         `json:"steps"`
-	Variables   map[string]string `json:"variables,omitempty"`
-	Environment map[string]string `json:"environment,omitempty"`
-	ContextData map[string]any    `json:"contextData,omitempty"`
-	Container   *JobContainer     `json:"container,omitempty"`
-	Endpoints   []ServiceEndpoint `json:"endpoints,omitempty"`
+	ID               string            `json:"id,omitempty"`
+	JobID            string            `json:"jobId"`
+	JobName          string            `json:"jobName"`
+	PlanID           string            `json:"planId"`
+	JobToken         string            `json:"jobToken,omitempty"`
+	Steps            []JobStep         `json:"steps"`
+	Variables        map[string]string `json:"variables,omitempty"`
+	Environment      map[string]string `json:"environment,omitempty"`
+	ContextData      map[string]any    `json:"contextData,omitempty"`
+	Container        *JobContainer     `json:"container,omitempty"`
+	Endpoints        []ServiceEndpoint `json:"endpoints,omitempty"`
+	EventName        string            `json:"eventName,omitempty"`
+	IsLocalExecution bool              `json:"isLocalExecution,omitempty"`
 }
 
 type rawStepReference struct {
@@ -143,6 +149,7 @@ type rawJobResources struct {
 }
 
 type rawJobSpec struct {
+	ID                   string           `json:"id"`
 	JobID                string           `json:"jobId"`
 	JobIDAlt             string           `json:"job_id"`
 	JobName              any              `json:"jobName"`
@@ -151,13 +158,15 @@ type rawJobSpec struct {
 	PlanID               string           `json:"planId"`
 	Plan                 *rawPlan         `json:"plan"`
 	Steps                []rawStep        `json:"steps"`
-	Variables            map[string]any    `json:"variables"`
-	EnvironmentVariables any               `json:"environmentVariables"`
+	Variables            map[string]any   `json:"variables"`
+	EnvironmentVariables any              `json:"environmentVariables"`
 	Environment          any              `json:"environment"`
 	Endpoints            []rawEndpoint    `json:"endpoints"`
 	ContextData          map[string]any   `json:"contextData"`
 	Resources            *rawJobResources `json:"resources"`
 	Container            any              `json:"container"`
+	EventName            string           `json:"eventName"`
+	IsLocalExecution     bool             `json:"isLocalExecution"`
 }
 
 func extractASTString(v any) string {
@@ -563,6 +572,16 @@ func (j *JobSpecification) UnmarshalJSON(data []byte) error {
 	if j.JobID == "" {
 		j.JobID = raw.JobIDAlt
 	}
+	if j.JobID == "" {
+		j.JobID = raw.ID
+	}
+	j.ID = raw.ID
+	if j.ID == "" {
+		j.ID = j.JobID
+	}
+
+	j.EventName = raw.EventName
+	j.IsLocalExecution = raw.IsLocalExecution
 
 	jobDisplayName := extractASTString(raw.JobDisplayName)
 	jobName := extractASTString(raw.JobName)
@@ -616,6 +635,9 @@ func (j *JobSpecification) UnmarshalJSON(data []byte) error {
 	}
 	if len(vars) > 0 {
 		j.Variables = vars
+		if j.EventName == "" && vars["GITHUB_EVENT_NAME"] != "" {
+			j.EventName = vars["GITHUB_EVENT_NAME"]
+		}
 	}
 
 	if len(raw.Steps) > 0 {

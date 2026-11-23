@@ -23,6 +23,8 @@ import (
 	"github.com/adrijshikhar/actr/internal/driver"
 	"github.com/adrijshikhar/actr/internal/monitor"
 	"github.com/adrijshikhar/actr/internal/protocol"
+	"github.com/adrijshikhar/actr/internal/vault"
+	"github.com/stretchr/testify/assert"
 )
 
 // mockDriver is a test double implementing driver.Driver.
@@ -2951,5 +2953,324 @@ func TestCoordinator_ExecuteStep_InjectsTraceparent(t *testing.T) {
 	traceparent, ok := firstStep.Environment["TRACEPARENT"]
 	if !ok || !strings.HasPrefix(traceparent, "00-") {
 		t.Fatalf("expected TRACEPARENT starting with '00-', got %q", traceparent)
+	}
+}
+
+func TestCoordinator_VaultFulfillment_TrustedContext(t *testing.T) {
+	mockRunner := &mockDriver{}
+	mockV := vault.NewMockProvider(map[string]string{
+		"SECRET_TOKEN": "runner-vault-secret-value",
+		"OTHER_SECRET": "another-secret-val",
+	})
+
+	coord := NewCoordinator(mockRunner, nil, "").WithVault(mockV)
+
+	// Direct push -> trusted
+	job := &protocol.JobSpecification{
+		EventName: "push",
+		Steps: []protocol.JobStep{
+			{
+				ID: "step-1",
+				Environment: map[string]string{
+					"SECRET_TOKEN": "", // empty in GitHub CI -> should fulfill
+					"OTHER_SECRET": "",
+				},
+			},
+		},
+	}
+
+	jobMasker := NewSecretMasker()
+	fulfilledEnv := coord.prepareStepEnvironment(context.Background(), job, job.Steps[0], jobMasker)
+	assert.Equal(t, "runner-vault-secret-value", fulfilledEnv["SECRET_TOKEN"])
+	assert.Equal(t, "another-secret-val", fulfilledEnv["OTHER_SECRET"])
+
+	// Verify secret is registered in jobMasker
+	masked := jobMasker.Mask("Authorization: Bearer runner-vault-secret-value")
+	assert.Equal(t, "Authorization: Bearer ***", masked)
+}
+
+func TestCoordinator_VaultFulfillment_ForkGuardBlocksUntrusted(t *testing.T) {
+	mockRunner := &mockDriver{}
+	mockV := vault.NewMockProvider(map[string]string{
+		"SECRET_TOKEN": "runner-vault-secret-value",
+	})
+
+	var logCapture bytes.Buffer
+	coord := NewCoordinator(mockRunner, nil, "").WithVault(mockV).WithOutput(&logCapture, &logCapture)
+
+	// Untrusted fork pull request
+	job := &protocol.JobSpecification{
+		ID:        "job-untrusted",
+		EventName: "pull_request",
+		Variables: map[string]string{
+			"GITHUB_HEAD_REF_REPO": "attacker/actr",
+			"GITHUB_REPOSITORY":    "adrijshikhar/actr",
+		},
+		Steps: []protocol.JobStep{
+			{
+				ID: "step-1",
+				Environment: map[string]string{
+					"SECRET_TOKEN": "",
+				},
+			},
+		},
+	}
+
+	fulfilledEnv := coord.prepareStepEnvironment(context.Background(), job, job.Steps[0])
+	// Must stay empty!
+	assert.Equal(t, "", fulfilledEnv["SECRET_TOKEN"])
+
+	// Must log security notice
+	logs := logCapture.String()
+	assert.Contains(t, logs, "Vault secret resolution blocked for untrusted fork PR: SECRET_TOKEN")
+}
+
+func TestCoordinator_VaultFulfillment_EdgeCases(t *testing.T) {
+	mockRunner := &mockDriver{}
+	mockV := vault.NewMockProvider(map[string]string{
+		"SECRET_TOKEN": "runner-vault-secret-value",
+		"EMPTY_SECRET": "",
+	})
+
+	t.Run("nil vault leaves empty env unchanged", func(t *testing.T) {
+		coord := NewCoordinator(mockRunner, nil, "")
+		job := &protocol.JobSpecification{
+			EventName: "push",
+			Steps: []protocol.JobStep{
+				{
+					ID: "step-1",
+					Environment: map[string]string{
+						"SECRET_TOKEN": "",
+					},
+				},
+			},
+		}
+		env := coord.prepareStepEnvironment(context.Background(), job, job.Steps[0])
+		assert.Equal(t, "", env["SECRET_TOKEN"])
+	})
+
+	t.Run("non-empty env var is not overwritten", func(t *testing.T) {
+		coord := NewCoordinator(mockRunner, nil, "").WithVault(mockV)
+		job := &protocol.JobSpecification{
+			EventName: "push",
+			Steps: []protocol.JobStep{
+				{
+					ID: "step-1",
+					Environment: map[string]string{
+						"SECRET_TOKEN": "already-provided-by-user",
+					},
+				},
+			},
+		}
+		env := coord.prepareStepEnvironment(context.Background(), job, job.Steps[0])
+		assert.Equal(t, "already-provided-by-user", env["SECRET_TOKEN"])
+	})
+
+	t.Run("local execution is trusted even with fork variables", func(t *testing.T) {
+		coord := NewCoordinator(mockRunner, nil, "").WithVault(mockV)
+		job := &protocol.JobSpecification{
+			IsLocalExecution: true,
+			EventName:        "pull_request",
+			Variables: map[string]string{
+				"GITHUB_HEAD_REF_REPO": "attacker/actr",
+				"GITHUB_REPOSITORY":    "adrijshikhar/actr",
+			},
+			Steps: []protocol.JobStep{
+				{
+					ID: "step-1",
+					Environment: map[string]string{
+						"SECRET_TOKEN": "",
+					},
+				},
+			},
+		}
+		env := coord.prepareStepEnvironment(context.Background(), job, job.Steps[0])
+		assert.Equal(t, "runner-vault-secret-value", env["SECRET_TOKEN"])
+	})
+
+	t.Run("same repo pull request is trusted", func(t *testing.T) {
+		coord := NewCoordinator(mockRunner, nil, "").WithVault(mockV)
+		job := &protocol.JobSpecification{
+			EventName: "pull_request",
+			Variables: map[string]string{
+				"GITHUB_HEAD_REF_REPO": "adrijshikhar/actr",
+				"GITHUB_REPOSITORY":    "adrijshikhar/actr",
+			},
+			Steps: []protocol.JobStep{
+				{
+					ID: "step-1",
+					Environment: map[string]string{
+						"SECRET_TOKEN": "",
+					},
+				},
+			},
+		}
+		env := coord.prepareStepEnvironment(context.Background(), job, job.Steps[0])
+		assert.Equal(t, "runner-vault-secret-value", env["SECRET_TOKEN"])
+	})
+
+	t.Run("workflow_dispatch is trusted", func(t *testing.T) {
+		coord := NewCoordinator(mockRunner, nil, "").WithVault(mockV)
+		job := &protocol.JobSpecification{
+			EventName: "workflow_dispatch",
+			Steps: []protocol.JobStep{
+				{
+					ID: "step-1",
+					Environment: map[string]string{
+						"SECRET_TOKEN": "",
+					},
+				},
+			},
+		}
+		env := coord.prepareStepEnvironment(context.Background(), job, job.Steps[0])
+		assert.Equal(t, "runner-vault-secret-value", env["SECRET_TOKEN"])
+	})
+
+	t.Run("empty secret in vault remains empty", func(t *testing.T) {
+		coord := NewCoordinator(mockRunner, nil, "").WithVault(mockV)
+		job := &protocol.JobSpecification{
+			EventName: "push",
+			Steps: []protocol.JobStep{
+				{
+					ID: "step-1",
+					Environment: map[string]string{
+						"EMPTY_SECRET": "",
+					},
+				},
+			},
+		}
+		env := coord.prepareStepEnvironment(context.Background(), job, job.Steps[0])
+		assert.Equal(t, "", env["EMPTY_SECRET"])
+	})
+}
+
+func TestIsTrustedContext(t *testing.T) {
+	tests := []struct {
+		name     string
+		job      *protocol.JobSpecification
+		expected bool
+	}{
+		{
+			name:     "nil job",
+			job:      nil,
+			expected: false,
+		},
+		{
+			name: "local execution",
+			job: &protocol.JobSpecification{
+				IsLocalExecution: true,
+			},
+			expected: true,
+		},
+		{
+			name: "local execution overrides untrusted fork",
+			job: &protocol.JobSpecification{
+				IsLocalExecution: true,
+				EventName:        "pull_request",
+				Variables: map[string]string{
+					"GITHUB_HEAD_REF_REPO": "fork/repo",
+					"GITHUB_REPOSITORY":    "origin/repo",
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "direct push event",
+			job: &protocol.JobSpecification{
+				EventName: "push",
+			},
+			expected: true,
+		},
+		{
+			name: "workflow dispatch event",
+			job: &protocol.JobSpecification{
+				EventName: "workflow_dispatch",
+			},
+			expected: true,
+		},
+		{
+			name: "pull request same repo",
+			job: &protocol.JobSpecification{
+				EventName: "pull_request",
+				Variables: map[string]string{
+					"GITHUB_HEAD_REF_REPO": "myorg/myrepo",
+					"GITHUB_REPOSITORY":    "myorg/myrepo",
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "pull request same repo case insensitive",
+			job: &protocol.JobSpecification{
+				EventName: "pull_request",
+				Variables: map[string]string{
+					"GITHUB_HEAD_REF_REPO": "MyOrg/MyRepo",
+					"GITHUB_REPOSITORY":    "myorg/myrepo",
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "pull request fork repo untrusted",
+			job: &protocol.JobSpecification{
+				EventName: "pull_request",
+				Variables: map[string]string{
+					"GITHUB_HEAD_REF_REPO": "attacker/myrepo",
+					"GITHUB_REPOSITORY":    "myorg/myrepo",
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "pull request nil variables",
+			job: &protocol.JobSpecification{
+				EventName: "pull_request",
+			},
+			expected: false,
+		},
+		{
+			name: "pull request empty head repo",
+			job: &protocol.JobSpecification{
+				EventName: "pull_request",
+				Variables: map[string]string{
+					"GITHUB_HEAD_REF_REPO": "",
+					"GITHUB_REPOSITORY":    "myorg/myrepo",
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "untrusted event type issues",
+			job: &protocol.JobSpecification{
+				EventName: "issues",
+			},
+			expected: false,
+		},
+		{
+			name: "fallback to GITHUB_EVENT_NAME variable push",
+			job: &protocol.JobSpecification{
+				Variables: map[string]string{
+					"GITHUB_EVENT_NAME": "push",
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "fallback to GITHUB_EVENT_NAME variable fork PR",
+			job: &protocol.JobSpecification{
+				Variables: map[string]string{
+					"GITHUB_EVENT_NAME":    "pull_request",
+					"GITHUB_HEAD_REF_REPO": "fork/repo",
+					"GITHUB_REPOSITORY":    "origin/repo",
+				},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, isTrustedContext(tc.job))
+		})
 	}
 }

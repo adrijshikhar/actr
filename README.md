@@ -26,6 +26,7 @@ actr register              # zero-click registration (auto-detects repo & token 
 actr service install       # install background OS service (launchd on macOS, systemd on Linux)
 actr service start         # start the runner daemon in the background
 actr monitor               # launch interactive TUI dashboard (tree, telemetry, live logs)
+actr secrets list          # list credentials stored in runner-local secret vault
 actr doctor                # check prerequisites, git, node, and toolchain dependencies
 ```
 
@@ -41,6 +42,8 @@ actr doctor                # check prerequisites, git, node, and toolchain depen
 - **OpenTelemetry & metrics export** — stream live runner and host metrics directly to any OTLP collector (InfluxDB v3, Prometheus, Datadog, Grafana) via `--otel-endpoint`.
 - **Local run & log persistence** — automatically preserves past job metadata, duration, peak vitals (CPU/RSS), and full ANSI-colored step logs under `~/.actr/runs/`.
 - **Offline history browsing** — inspect historical runs anytime with `actr monitor` even when the daemon is stopped, with seamless background auto-reconnect when the runner starts.
+- **Pluggable Runner Secret Vault** — zero-SDK credential management with native macOS Keychain out-of-the-box, authenticated Argon2id + AES-256-GCM file vaults, HashiCorp Vault KV v2, and AWS Secrets Manager.
+- **Fork Guard & Automatic Masking** — default-deny security policy preventing secret resolution on untrusted fork PRs, with guaranteed `***` redaction across step logs and stdout.
 - **Decoupled daemon architecture** — background daemon runs headlessly; terminal monitor attaches/detaches over a Unix socket (`~/.actr/daemon.sock`) without interrupting jobs.
 - **Strict workspace hygiene** — credentials, runner state, and IPC socket live exclusively in `~/.actr/` (`0600` permissions), never polluting your repository.
 - **Self-healing & unattended** — automated token refresh, session recovery, and process-group isolation (`-pgid`) on cancellation.
@@ -215,6 +218,86 @@ actr run --otel-endpoint localhost:4317 --otel-protocol grpc --otel-headers "Aut
 
 ---
 
+## 🔐 Runner Secret Vault & Pluggable Providers
+
+`actr` includes a native, pluggable secret vault subsystem that resolves empty step environment variables (e.g. `DEPLOY_KEY: ""` from `${{ secrets.DEPLOY_KEY }}`) at runtime directly from runner-managed credential stores, without relying on external cloud SDKs or leaking plaintext credentials into logs.
+
+### Out-of-the-Box Defaults (Zero Configuration)
+
+When running without a custom `vault:` block in `config.yaml`, `actr` defaults automatically:
+- **macOS (`darwin`)**: Hardware-backed **Apple Keychain** (`com.github.actr.secrets`) via `/usr/bin/security`. No passphrases or unencrypted key files required.
+- **Linux & other OS**: Local encrypted vault at `~/.actr/vault.enc` using **AES-256-GCM** authenticated encryption with **Argon2id** key derivation (`0600` permissions, atomic rename).
+
+### CLI Secret Management
+
+Manage credentials locally on the runner:
+
+```bash
+# Interactive masked password prompt
+actr secrets set DEPLOY_KEY
+
+# Pass via flag
+actr secrets set API_TOKEN --value "secret-token-xyz"
+
+# Pipe from stdin / password managers
+echo "my-super-secret" | actr secrets set NPM_TOKEN
+
+# List stored keys and providers
+actr secrets list
+
+# Print decrypted value
+actr secrets get DEPLOY_KEY
+
+# Delete a key
+actr secrets delete DEPLOY_KEY
+```
+
+### Pluggable Vault Adapters (`config.yaml`)
+
+Configure single or cascading multi-vault fallback chains in `~/.actr/config.yaml`:
+
+```yaml
+vault:
+  providers:
+    # 1. Native OS Keychain (macOS security CLI, Windows DPAPI stubs)
+    - type: keychain
+      label: "com.github.actr.secrets"
+
+    # 2. Authenticated AES-256-GCM + Argon2id encrypted file
+    - type: encrypted-file
+      path: "~/.actr/vault.enc"
+      auth:
+        passphrase: "runner-master-passphrase"
+
+    # 3. HashiCorp Vault (pure-Go REST client, KV v2 engine)
+    - type: hashicorp-vault
+      address: "https://vault.internal.corp:8200"
+      path: "actr/runner"
+      auth:
+        token: "s.xxxxxxxxxxxx"
+
+    # 4. AWS Secrets Manager (pure-Go REST client, zero AWS SDK bloat)
+    - type: aws-secrets-manager
+      region: "us-east-1"
+      prefix: "actr/ci/"
+```
+
+When multiple providers are defined, `actr` cascades through them in priority order:
+- **Get**: Checks Provider 1 → Provider 2 → Provider 3 until found.
+- **Set**: Writes to the first writable provider, bypassing read-only backends.
+- **List**: Merges and deduplicates keys across all providers.
+
+### Security Guarantees
+
+1. **Fork Guard Execution Policy**:
+   Untrusted pull requests (originating from forks where `GITHUB_HEAD_REF_REPO != GITHUB_REPOSITORY`) are strictly blocked from resolving secrets. An audit warning is logged and environment variables remain empty, preventing secret exfiltration through malicious PR workflows. Trusted `push`, `workflow_dispatch`, same-repo PRs, and local executions resolve secrets normally.
+2. **Automatic Output Redaction**:
+   All secrets resolved from the vault are registered with `SecretMasker` and dynamically sanitized to `***` across stdout, stderr, and step logs.
+3. **Zero CGO & Zero Cloud SDKs**:
+   Built with pure Go standard library primitives, maintaining instant startup, cross-compilation portability, and a lean ~24MB static binary.
+
+---
+
 ## 🛠️ Usage
 
 | Command | Description |
@@ -222,6 +305,10 @@ actr run --otel-endpoint localhost:4317 --otel-protocol grpc --otel-headers "Aut
 | `actr register` | Interactive zero-click runner registration wizard |
 | `actr run` | Run runner daemon in foreground (listens for and executes jobs) |
 | `actr monitor` | Open interactive TUI dashboard (connects to live daemon or browses offline history) |
+| `actr secrets set <KEY>` | Store or update a secret in the vault (masked prompt, flag, or stdin pipe) |
+| `actr secrets get <KEY>` | Retrieve and print a decrypted secret from the vault |
+| `actr secrets list` | List all keys and provider names stored in the vault |
+| `actr secrets delete <KEY>` | Remove a secret key from the vault |
 | `actr service install` | Install native OS background daemon (`launchd` on macOS, `systemd` on Linux) |
 | `actr service start` | Start the background daemon service |
 | `actr service status` | Check service status (`running`, `installed/stopped`, `not installed`) |
