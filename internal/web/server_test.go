@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -823,4 +825,452 @@ func TestServer_RunLogs_Masking(t *testing.T) {
 			t.Fatalf("expected 503 Service Unavailable, got %d", rec.Code)
 		}
 	}
+}
+
+type mockEventSubscriber struct {
+	eventsCh    chan monitor.Event
+	subscribeFn func(ctx context.Context) (<-chan monitor.Event, func(), error)
+	unsubCalled bool
+	subErr      error
+	mu          sync.Mutex
+}
+
+func (m *mockEventSubscriber) SubscribeEvents(ctx context.Context) (<-chan monitor.Event, func(), error) {
+	if m.subscribeFn != nil {
+		return m.subscribeFn(ctx)
+	}
+	if m.subErr != nil {
+		return nil, nil, m.subErr
+	}
+	unsub := func() {
+		m.mu.Lock()
+		m.unsubCalled = true
+		m.mu.Unlock()
+	}
+	return m.eventsCh, unsub, nil
+}
+
+type mockMetricsProvider struct {
+	metrics *monitor.RunnerMetrics
+	err     error
+}
+
+func (m *mockMetricsProvider) GetCurrentMetrics(ctx context.Context) (*monitor.RunnerMetrics, error) {
+	return m.metrics, m.err
+}
+
+type nonFlusherResponseWriter struct {
+	http.ResponseWriter
+}
+
+func TestServer_LogsStream_SSE(t *testing.T) {
+	masker := engine.NewSecretMasker()
+	masker.AddMask("SUPER_SECRET_TOKEN_123")
+
+	eventsCh := make(chan monitor.Event, 20)
+	mockSub := &mockEventSubscriber{
+		eventsCh: eventsCh,
+	}
+
+	srv := NewServer(ServerConfig{
+		EventSubscriber: mockSub,
+		Masker:          masker,
+	})
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	// 1. Successful stream with events, masking, and completion
+	t.Run("stream events and masking", func(t *testing.T) {
+		req, err := http.NewRequest(http.MethodGet, ts.URL+"/api/runs/run-sse-1/logs/stream", nil)
+		if err != nil {
+			t.Fatalf("new request failed: %v", err)
+		}
+
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+		}
+		if ctype := resp.Header.Get("Content-Type"); !strings.Contains(ctype, "text/event-stream") {
+			t.Fatalf("expected text/event-stream, got %s", ctype)
+		}
+		if cc := resp.Header.Get("Cache-Control"); !strings.Contains(cc, "no-cache") {
+			t.Fatalf("expected no-cache, got %s", cc)
+		}
+		if accel := resp.Header.Get("X-Accel-Buffering"); accel != "no" {
+			t.Fatalf("expected X-Accel-Buffering: no, got %s", accel)
+		}
+
+		// Send events
+		eventsCh <- monitor.Event{
+			Type:    monitor.EventStepLog,
+			JobID:   "different-job-999",
+			StepID:  "step-diff",
+			LogLine: "Ignored log for different job",
+		}
+		eventsCh <- monitor.Event{
+			Type:   monitor.EventStepStart,
+			JobID:  "run-sse-1",
+			StepID: "step-1",
+			Step: &monitor.StepInfo{
+				ID:     "step-1",
+				Name:   "Init Step",
+				Number: 1,
+				Status: monitor.StatusRunning,
+			},
+		}
+		eventsCh <- monitor.Event{
+			Type:    monitor.EventStepLog,
+			JobID:   "run-sse-1",
+			StepID:  "step-1",
+			LogLine: "Authenticating with SUPER_SECRET_TOKEN_123 in runner",
+		}
+		eventsCh <- monitor.Event{
+			Type:   monitor.EventStepFinish,
+			JobID:  "run-sse-1",
+			StepID: "step-1",
+			Step: &monitor.StepInfo{
+				ID:     "step-1",
+				Name:   "Init Step",
+				Number: 1,
+				Status: monitor.StatusSuccess,
+			},
+		}
+		eventsCh <- monitor.Event{
+			Type:  monitor.EventJobFinish,
+			JobID: "run-sse-1",
+			Job: &monitor.JobInfo{
+				ID:     "run-sse-1",
+				Status: monitor.StatusSuccess,
+			},
+		}
+
+		// Read streamed response
+		reader := bufio.NewReader(resp.Body)
+		var receivedEvents []string
+		var receivedData []string
+
+		// Read until EOF (job_complete exits the handler)
+		doneCh := make(chan struct{})
+		go func() {
+			defer close(doneCh)
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					return
+				}
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "event:") {
+					receivedEvents = append(receivedEvents, strings.TrimSpace(strings.TrimPrefix(line, "event:")))
+				} else if strings.HasPrefix(line, "data:") {
+					receivedData = append(receivedData, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+				}
+			}
+		}()
+
+		select {
+		case <-doneCh:
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for SSE stream to complete on job_finish")
+		}
+
+		// Verify received events
+		expectedEvents := []string{"step_start", "log", "step_complete", "job_complete"}
+		if len(receivedEvents) != len(expectedEvents) {
+			t.Fatalf("expected events %v, got %v", expectedEvents, receivedEvents)
+		}
+		for i, ev := range expectedEvents {
+			if receivedEvents[i] != ev {
+				t.Errorf("at index %d, expected event %q, got %q", i, ev, receivedEvents[i])
+			}
+		}
+
+		// Verify secret was masked in log event data
+		if len(receivedData) < 2 {
+			t.Fatalf("expected at least 2 data lines, got %d", len(receivedData))
+		}
+		logData := receivedData[1]
+		if strings.Contains(logData, "SUPER_SECRET_TOKEN_123") {
+			t.Fatalf("stream leaked secret token: %s", logData)
+		}
+		if !strings.Contains(logData, "***") {
+			t.Fatalf("stream log data missing mask replacement: %s", logData)
+		}
+		if !strings.Contains(logData, "Authenticating with") {
+			t.Fatalf("stream log data missing original content: %s", logData)
+		}
+	})
+
+	// 2. Client context cancellation
+	t.Run("client cancellation terminates stream", func(t *testing.T) {
+		mockSubCancel := &mockEventSubscriber{
+			eventsCh: make(chan monitor.Event),
+		}
+		srvCancel := NewServer(ServerConfig{
+			EventSubscriber: mockSubCancel,
+		})
+		tsCancel := httptest.NewServer(srvCancel)
+		defer tsCancel.Close()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, tsCancel.URL+"/api/runs/run-cancel/logs/stream", nil)
+		if err != nil {
+			t.Fatalf("new request failed: %v", err)
+		}
+
+		resp, err := tsCancel.Client().Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		// Cancel client context
+		cancel()
+
+		// Read until EOF
+		buf := make([]byte, 1024)
+		for {
+			_, err := resp.Body.Read(buf)
+			if err != nil {
+				break
+			}
+		}
+
+		// Check unsubscribe was called (server goroutine cleans up asynchronously)
+		var unsubCalled bool
+		for i := 0; i < 50; i++ {
+			mockSubCancel.mu.Lock()
+			unsubCalled = mockSubCancel.unsubCalled
+			mockSubCancel.mu.Unlock()
+			if unsubCalled {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if !unsubCalled {
+			t.Errorf("expected unsubscribe to be called upon client cancellation")
+		}
+	})
+
+	// 3. Unconfigured EventSubscriber returns 503
+	t.Run("unconfigured EventSubscriber returns 503", func(t *testing.T) {
+		srvNil := NewServer(ServerConfig{
+			EventSubscriber: nil,
+		})
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/runs/run-123/logs/stream", nil)
+		srvNil.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 Service Unavailable, got %d", rec.Code)
+		}
+	})
+
+	// 4. Non-flusher response writer returns 500
+	t.Run("non-flusher response writer returns 500", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/runs/run-123/logs/stream", nil)
+		srv.ServeHTTP(nonFlusherResponseWriter{rec}, req)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500 Internal Server Error, got %d", rec.Code)
+		}
+	})
+}
+
+func TestServer_MetricsEndpoints(t *testing.T) {
+	mockMetrics := &monitor.RunnerMetrics{
+		Timestamp:    time.Now().UTC(),
+		ProcessCount: 5,
+		StepCPU:      12.5,
+		HostCPU:      42.0,
+		HostMemUsed:  1024 * 1024 * 500,
+		HostMemTotal: 1024 * 1024 * 1000,
+	}
+	provider := &mockMetricsProvider{
+		metrics: mockMetrics,
+	}
+
+	samples := []*monitor.TelemetrySample{
+		{
+			Timestamp: time.Now().UTC().Add(-time.Minute),
+			HostCPU:   30.0,
+		},
+		{
+			Timestamp: time.Now().UTC(),
+			HostCPU:   35.0,
+		},
+	}
+	mockStore := &mockRunStore{
+		metrics: map[string][]*monitor.TelemetrySample{
+			"run-metrics-1": samples,
+			"run-empty":     {},
+		},
+	}
+
+	srv := NewServer(ServerConfig{
+		MetricsProvider: provider,
+		RunStore:        mockStore,
+	})
+
+	// 1. GET /api/metrics/current with MetricsProvider
+	t.Run("metrics current with provider", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/metrics/current", nil)
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+		var res monitor.RunnerMetrics
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+			t.Fatalf("unmarshal error: %v", err)
+		}
+		if res.ProcessCount != 5 || res.HostCPU != 42.0 {
+			t.Fatalf("unexpected metrics response: %+v", res)
+		}
+	})
+
+	// 2. GET /api/metrics/current fallback to host vitals
+	t.Run("metrics current fallback without provider", func(t *testing.T) {
+		srvFallback := NewServer(ServerConfig{
+			MetricsProvider: nil,
+		})
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/metrics/current", nil)
+		srvFallback.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+		var res monitor.RunnerMetrics
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+			t.Fatalf("unmarshal error: %v", err)
+		}
+		if res.Timestamp.IsZero() {
+			t.Fatalf("expected non-zero timestamp in fallback metrics")
+		}
+	})
+
+	// 3. GET /api/metrics/stream SSE
+	t.Run("metrics stream SSE", func(t *testing.T) {
+		ts := httptest.NewServer(srv)
+		defer ts.Close()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/api/metrics/stream", nil)
+		if err != nil {
+			t.Fatalf("new request failed: %v", err)
+		}
+
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+		}
+		if ctype := resp.Header.Get("Content-Type"); !strings.Contains(ctype, "text/event-stream") {
+			t.Fatalf("expected text/event-stream, got %s", ctype)
+		}
+
+		reader := bufio.NewReader(resp.Body)
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("failed reading event line: %v", err)
+		}
+		if !strings.HasPrefix(strings.TrimSpace(line), "event: metrics") {
+			t.Fatalf("expected 'event: metrics', got %q", line)
+		}
+
+		dataLine, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("failed reading data line: %v", err)
+		}
+		if !strings.HasPrefix(strings.TrimSpace(dataLine), "data:") {
+			t.Fatalf("expected 'data: ...', got %q", dataLine)
+		}
+
+		jsonData := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(dataLine), "data:"))
+		var streamedMetrics monitor.RunnerMetrics
+		if err := json.Unmarshal([]byte(jsonData), &streamedMetrics); err != nil {
+			t.Fatalf("unmarshal streamed metrics error: %v, data: %s", err, jsonData)
+		}
+		if streamedMetrics.HostCPU != 42.0 {
+			t.Fatalf("expected HostCPU 42.0, got %f", streamedMetrics.HostCPU)
+		}
+
+		// Cancel context and verify it terminates
+		cancel()
+	})
+
+	// 4. GET /api/metrics/stream non-flusher returns 500
+	t.Run("metrics stream non-flusher returns 500", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/metrics/stream", nil)
+		srv.ServeHTTP(nonFlusherResponseWriter{rec}, req)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500 Internal Server Error, got %d", rec.Code)
+		}
+	})
+
+	// 5. GET /api/runs/{id}/metrics with samples
+	t.Run("run metrics history with samples", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/runs/run-metrics-1/metrics", nil)
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+		var res []*monitor.TelemetrySample
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+			t.Fatalf("unmarshal error: %v", err)
+		}
+		if len(res) != 2 {
+			t.Fatalf("expected 2 samples, got %d", len(res))
+		}
+		if res[0].HostCPU != 30.0 || res[1].HostCPU != 35.0 {
+			t.Fatalf("unexpected sample contents: %+v", res)
+		}
+	})
+
+	// 6. GET /api/runs/{id}/metrics empty samples returns []
+	t.Run("run metrics history empty returns []", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/runs/run-empty/metrics", nil)
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+		body := strings.TrimSpace(rec.Body.String())
+		if body != "[]" {
+			t.Fatalf("expected empty array '[]', got %q", body)
+		}
+	})
+
+	// 7. GET /api/runs/{id}/metrics unconfigured RunStore returns 503
+	t.Run("run metrics unconfigured RunStore returns 503", func(t *testing.T) {
+		srvNilStore := NewServer(ServerConfig{
+			RunStore: nil,
+		})
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/runs/run-1/metrics", nil)
+		srvNilStore.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 Service Unavailable, got %d", rec.Code)
+		}
+	})
 }

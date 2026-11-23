@@ -63,6 +63,10 @@ type Masker interface {
 	Mask(string) string
 }
 
+type MetricsProvider interface {
+	GetCurrentMetrics(ctx context.Context) (*monitor.RunnerMetrics, error)
+}
+
 // ServerConfig configures the Web Dashboard HTTP server.
 type ServerConfig struct {
 	Port             int
@@ -76,6 +80,7 @@ type ServerConfig struct {
 	EventSubscriber  EventSubscriber
 	DaemonController DaemonController
 	RunnerProvider   RunnerProvider
+	MetricsProvider  MetricsProvider
 	Masker           Masker
 }
 
@@ -122,6 +127,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/runs", s.handleRuns)
 	s.mux.HandleFunc("GET /api/runs/{id}", s.handleRunDetail)
 	s.mux.HandleFunc("GET /api/runs/{id}/logs", s.handleRunLogs)
+	s.mux.HandleFunc("GET /api/runs/{id}/logs/stream", s.handleRunLogsStream)
+	s.mux.HandleFunc("GET /api/runs/{id}/metrics", s.handleRunMetrics)
+
+	// Live Metrics API endpoints
+	s.mux.HandleFunc("GET /api/metrics/current", s.handleMetricsCurrent)
+	s.mux.HandleFunc("GET /api/metrics/stream", s.handleMetricsStream)
 
 	// Catch-all API 404 to ensure API routes never return HTML SPA fallback
 	s.mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
