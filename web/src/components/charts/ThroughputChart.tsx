@@ -20,7 +20,7 @@ export function formatRate(bytesPerSec: number, decimals = 1): string {
   const k = 1024;
   const sizes = ['B/s', 'KB/s', 'MB/s', 'GB/s', 'TB/s'];
   const i = Math.floor(Math.log(bytesPerSec) / Math.log(k));
-  const safeI = Math.min(i, sizes.length - 1);
+  const safeI = Math.max(0, Math.min(i, sizes.length - 1));
   return `${parseFloat((bytesPerSec / Math.pow(k, safeI)).toFixed(decimals))} ${sizes[safeI]}`;
 }
 
