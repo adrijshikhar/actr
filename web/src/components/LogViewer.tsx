@@ -187,6 +187,9 @@ function parseAnsiLine(rawLine: string): AnsiSegment[] {
   return segments.length > 0 ? segments : [{ text: '' }];
 }
 
+const LINE_HEIGHT = 24;
+const OVERSCAN = 15;
+
 export function LogViewer({
   logs = [],
   isLoading = false,
@@ -209,10 +212,32 @@ export function LogViewer({
   const [activeMatchIndex, setActiveMatchIndex] = useState(0);
   const [copied, setCopied] = useState(false);
 
-  // Pre-parse ANSI segments
+  // Virtual windowing states
+  const [scrollTop, setScrollTop] = useState(0);
+  const [containerHeight, setContainerHeight] = useState(480);
+
+  // Incremental ANSI parser cache: only parse newly appended lines
+  const parsedCacheRef = useRef<AnsiSegment[][]>([]);
+
   const parsedLines = useMemo(() => {
-    return logs.map((line) => parseAnsiLine(line));
+    const cached = parsedCacheRef.current;
+    if (logs.length < cached.length) {
+      // Logs were reset or cleared
+      parsedCacheRef.current = logs.map((line) => parseAnsiLine(line));
+    } else if (logs.length > cached.length) {
+      // Incrementally parse only newly added lines
+      const newSegments = logs.slice(cached.length).map((line) => parseAnsiLine(line));
+      parsedCacheRef.current = [...cached, ...newSegments];
+    }
+    return parsedCacheRef.current;
   }, [logs]);
+
+  // Synchronize container height on mount/resize/fullscreen
+  useEffect(() => {
+    if (containerRef.current) {
+      setContainerHeight(containerRef.current.clientHeight || 480);
+    }
+  }, [isFullscreen, height]);
 
   // Search match positions: line indices matching the query
   const searchMatches = useMemo(() => {
@@ -233,16 +258,16 @@ export function LogViewer({
     setActiveMatchIndex(0);
   }, [searchQuery]);
 
-  // Jump to active match
+  // Jump to active match using virtual scroll offset calculation
   useEffect(() => {
     if (searchMatches.length > 0 && searchMatches[activeMatchIndex] !== undefined) {
       const lineIdx = searchMatches[activeMatchIndex];
-      const el = document.getElementById(`log-line-${lineIdx}`);
-      if (el) {
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      if (containerRef.current) {
+        const targetScrollTop = Math.max(0, lineIdx * LINE_HEIGHT - containerHeight / 2);
+        containerRef.current.scrollTo({ top: targetScrollTop, behavior: 'smooth' });
       }
     }
-  }, [searchMatches, activeMatchIndex]);
+  }, [searchMatches, activeMatchIndex, containerHeight]);
 
   // Sticky autoscroll on new logs
   useEffect(() => {
@@ -251,11 +276,13 @@ export function LogViewer({
     }
   }, [logs, isStickyPinned]);
 
-  // Track scroll position to manage sticky pin
+  // Track scroll position to manage sticky pin and virtual window
   const handleScroll = useCallback(() => {
     if (!containerRef.current) return;
-    const { scrollTop, scrollHeight, clientHeight } = containerRef.current;
-    const atBottom = scrollHeight - scrollTop - clientHeight < 40;
+    const { scrollTop: st, scrollHeight, clientHeight } = containerRef.current;
+    setScrollTop(st);
+    setContainerHeight(clientHeight);
+    const atBottom = scrollHeight - st - clientHeight < 40;
     setIsStickyPinned(atBottom);
   }, []);
 
@@ -265,6 +292,28 @@ export function LogViewer({
       setIsStickyPinned(true);
     }
   };
+
+  // Virtual windowing calculations
+  const totalLines = logs.length;
+  const totalHeight = totalLines * LINE_HEIGHT;
+  const startIndex = Math.max(0, Math.floor(scrollTop / LINE_HEIGHT) - OVERSCAN);
+  const endIndex = Math.min(
+    totalLines,
+    Math.ceil((scrollTop + containerHeight) / LINE_HEIGHT) + OVERSCAN
+  );
+
+  const visibleLines = useMemo(() => {
+    const result: Array<{ index: number; segments: AnsiSegment[] }> = [];
+    for (let i = startIndex; i < endIndex; i++) {
+      result.push({
+        index: i,
+        segments: parsedLines[i] || [{ text: '' }],
+      });
+    }
+    return result;
+  }, [startIndex, endIndex, parsedLines]);
+
+  const offsetY = startIndex * LINE_HEIGHT;
 
   // Keyboard shortcuts (Cmd+F / Ctrl+F, 'z' for zoom/fullscreen, Esc)
   useEffect(() => {
@@ -566,40 +615,54 @@ export function LogViewer({
             )}
           </div>
         ) : (
-          <div className="table w-full border-collapse">
-            {parsedLines.map((segments, lineIdx) => {
-              const isMatch = searchMatches.includes(lineIdx);
-              const isCurrentMatch =
-                searchMatches.length > 0 && searchMatches[activeMatchIndex] === lineIdx;
+          <div
+            style={{ height: totalHeight, position: 'relative', width: '100%', minWidth: 'max-content' }}
+            className="font-mono text-xs"
+          >
+            <div
+              style={{
+                transform: `translateY(${offsetY}px)`,
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                right: 0,
+              }}
+            >
+              {visibleLines.map(({ index: lineIdx, segments }) => {
+                const isMatch = searchMatches.includes(lineIdx);
+                const isCurrentMatch =
+                  searchMatches.length > 0 && searchMatches[activeMatchIndex] === lineIdx;
 
-              return (
-                <div
-                  key={lineIdx}
-                  id={`log-line-${lineIdx}`}
-                  className={cn(
-                    'table-row hover:bg-geist-hover/60 transition-colors duration-75',
-                    isCurrentMatch && 'bg-status-warning-bg/40',
-                    isMatch && !isCurrentMatch && 'bg-status-warning-bg/15'
-                  )}
-                >
-                  {/* Line Number Gutter */}
-                  {showLineNumbers && (
-                    <div className="table-cell select-none text-right pr-3 pl-1 py-0.5 text-[11px] text-geist-faint/70 w-12 align-top border-r border-geist-hairline/40 flex-shrink-0">
-                      {lineIdx + 1}
+                return (
+                  <div
+                    key={lineIdx}
+                    id={`log-line-${lineIdx}`}
+                    style={{ height: LINE_HEIGHT }}
+                    className={cn(
+                      'flex items-center hover:bg-geist-hover/60 transition-colors duration-75 text-[12px] leading-[24px]',
+                      isCurrentMatch && 'bg-status-warning-bg/40',
+                      isMatch && !isCurrentMatch && 'bg-status-warning-bg/15'
+                    )}
+                  >
+                    {/* Line Number Gutter */}
+                    {showLineNumbers && (
+                      <div className="select-none text-right pr-3 pl-1 text-[11px] text-geist-faint/70 w-12 flex-shrink-0 border-r border-geist-hairline/40 h-full flex items-center justify-end">
+                        {lineIdx + 1}
+                      </div>
+                    )}
+
+                    {/* Line Text Content */}
+                    <div className="pl-3 pr-2 whitespace-pre flex-1 font-mono text-geist-ink">
+                      {segments.map((seg, segIdx) => (
+                        <React.Fragment key={segIdx}>
+                          {renderHighlightedText(seg.text, searchQuery, seg.style)}
+                        </React.Fragment>
+                      ))}
                     </div>
-                  )}
-
-                  {/* Line Text Content */}
-                  <div className="table-cell pl-3 pr-2 py-0.5 text-[12px] leading-relaxed whitespace-pre-wrap break-all text-geist-ink align-top">
-                    {segments.map((seg, segIdx) => (
-                      <React.Fragment key={segIdx}>
-                        {renderHighlightedText(seg.text, searchQuery, seg.style)}
-                      </React.Fragment>
-                    ))}
                   </div>
-                </div>
-              );
-            })}
+                );
+              })}
+            </div>
           </div>
         )}
 

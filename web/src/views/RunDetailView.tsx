@@ -41,13 +41,15 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
   const [steps, setSteps] = useState<StepMetadata[]>([]);
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
   const [logLines, setLogLines] = useState<StoredLogLine[]>([]);
+  const [stepLogs, setStepLogs] = useState<string[] | null>(null);
   const [metrics, setMetrics] = useState<TelemetrySample[]>([]);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<'logs' | 'telemetry'>('logs');
 
   const unsubscribeRef = useRef<(() => void) | null>(null);
+  const stepLogsCacheRef = useRef<Record<string, string[]>>({});
 
-  // Load run details, initial steps, and telemetry metrics
+  // Load run details, initial steps, and telemetry metrics (isolated from step selection)
   const loadRunData = useCallback(async () => {
     if (!runId) return;
     try {
@@ -66,14 +68,13 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
         console.warn('Failed to fetch run metrics:', e);
       }
 
-      // If run already completed, fetch historical logs
+      // If run already completed, fetch historical full logs
       const isFinished = runData.status === 'completed' || runData.status === 'failed';
       if (isFinished) {
         try {
-          const res = await fetchLogs(runId, selectedStepId || undefined);
+          const res = await fetchLogs(runId);
           const lines = (res.logs || []).map((l) => ({
             line: l,
-            stepId: selectedStepId || undefined,
           }));
           setLogLines(lines);
         } catch (e) {
@@ -85,11 +86,43 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
     } finally {
       setLoading(false);
     }
-  }, [runId, selectedStepId]);
+  }, [runId]);
 
   useEffect(() => {
     loadRunData();
   }, [loadRunData]);
+
+  // Isolate step log loading: does not touch loading = true or reload run/metrics
+  useEffect(() => {
+    if (!runId || !selectedStepId) {
+      setStepLogs(null);
+      return;
+    }
+
+    const isFinished = run?.status === 'completed' || run?.status === 'failed';
+    if (!isFinished) {
+      // During active run, client-side filtering by stepId handles it
+      setStepLogs(null);
+      return;
+    }
+
+    // Check in-memory step cache
+    if (stepLogsCacheRef.current[selectedStepId]) {
+      setStepLogs(stepLogsCacheRef.current[selectedStepId]);
+      return;
+    }
+
+    // Fetch step-specific logs in background without setting global loading
+    fetchLogs(runId, selectedStepId)
+      .then((res) => {
+        const fetched = res.logs || [];
+        stepLogsCacheRef.current[selectedStepId] = fetched;
+        setStepLogs(fetched);
+      })
+      .catch((err) => {
+        console.warn('Failed to fetch step logs for', selectedStepId, err);
+      });
+  }, [runId, selectedStepId, run?.status]);
 
   // Set up SSE live subscription if run is active
   useEffect(() => {
@@ -160,9 +193,14 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
     if (!selectedStepId) {
       return logLines.map((l) => l.line);
     }
+    // If step-specific logs were fetched from backend
+    if (stepLogs !== null) {
+      return stepLogs;
+    }
+    // Otherwise filter in-memory logLines (tagged by SSE during streaming)
     const filtered = logLines.filter((l) => !l.stepId || l.stepId === selectedStepId);
     return filtered.map((l) => l.line);
-  }, [logLines, selectedStepId]);
+  }, [logLines, selectedStepId, stepLogs]);
 
   if (!runId) {
     return (

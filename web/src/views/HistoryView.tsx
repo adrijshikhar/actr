@@ -37,8 +37,28 @@ export function HistoryView({
 
   // Filters
   const [searchQuery, setSearchQuery] = useState<string>('');
-  const [statusFilter, setStatusFilter] = useState<string>('all');
+  const [debouncedQuery, setDebouncedQuery] = useState<string>('');
   const [repoFilter, setRepoFilter] = useState<string>('');
+  const [debouncedRepo, setDebouncedRepo] = useState<string>('');
+  const [statusFilter, setStatusFilter] = useState<string>('all');
+
+  // Debounce search query changes by 300ms
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedQuery(searchQuery);
+      setOffset(0);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
+
+  // Debounce repo filter changes by 300ms
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedRepo(repoFilter);
+      setOffset(0);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [repoFilter]);
 
   const loadData = useCallback(async () => {
     try {
@@ -47,9 +67,9 @@ export function HistoryView({
         limit: PAGE_SIZE,
         offset,
       };
-      if (searchQuery.trim()) params.q = searchQuery.trim();
+      if (debouncedQuery.trim()) params.q = debouncedQuery.trim();
       if (statusFilter !== 'all') params.status = statusFilter;
-      if (repoFilter.trim()) params.repo = repoFilter.trim();
+      if (debouncedRepo.trim()) params.repo = debouncedRepo.trim();
 
       const res = await fetchRuns(params);
       setRunsList(res.runs || []);
@@ -59,7 +79,7 @@ export function HistoryView({
     } finally {
       setLoading(false);
     }
-  }, [offset, searchQuery, statusFilter, repoFilter]);
+  }, [offset, debouncedQuery, statusFilter, debouncedRepo]);
 
   useEffect(() => {
     loadData();
@@ -67,8 +87,9 @@ export function HistoryView({
 
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    setDebouncedQuery(searchQuery);
+    setDebouncedRepo(repoFilter);
     setOffset(0);
-    loadData();
   };
 
   const handleRefresh = () => {
