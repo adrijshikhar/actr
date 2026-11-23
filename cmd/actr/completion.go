@@ -116,14 +116,21 @@ func newCompletionInstallCmd(rootCmd *cobra.Command) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("write completion file %s: %w", targetPath, err)
 			}
-			defer func() { _ = f.Close() }()
 
-			if err := generateCompletion(rootCmd, shell, f); err != nil {
-				return err
+			genErr := generateCompletion(rootCmd, shell, f)
+			_ = f.Close()
+			if genErr != nil {
+				_ = os.Remove(targetPath)
+				return genErr
 			}
 
 			fmt.Fprintf(cmd.OutOrStdout(), "✓ Installed %s completion to %s\n", shell, targetPath)
-			fmt.Fprintf(cmd.OutOrStdout(), "Restart your shell or run: source %s\n", targetPath)
+			if shell == "zsh" {
+				fmt.Fprintln(cmd.OutOrStdout(), "Restart your shell or run:")
+				fmt.Fprintln(cmd.OutOrStdout(), "  autoload -Uz compinit && compinit")
+			} else {
+				fmt.Fprintf(cmd.OutOrStdout(), "Restart your shell or run: source %s\n", targetPath)
+			}
 			return nil
 		},
 	}
@@ -153,11 +160,25 @@ func completeLabels(cmd *cobra.Command, args []string, toComplete string) ([]str
 		"linux\tLinux operating system label",
 		"x64\tx86_64 architecture label",
 	}
+
+	prefix := ""
+	token := toComplete
+	if idx := strings.LastIndex(toComplete, ","); idx != -1 {
+		prefix = toComplete[:idx+1]
+		token = toComplete[idx+1:]
+	}
+
+	tokenLower := strings.ToLower(token)
 	var matches []string
-	prefix := strings.ToLower(toComplete)
 	for _, l := range labels {
-		if strings.HasPrefix(strings.ToLower(l), prefix) {
-			matches = append(matches, l)
+		parts := strings.SplitN(l, "\t", 2)
+		name := parts[0]
+		if strings.HasPrefix(strings.ToLower(name), tokenLower) {
+			if len(parts) == 2 {
+				matches = append(matches, fmt.Sprintf("%s%s\t%s", prefix, name, parts[1]))
+			} else {
+				matches = append(matches, prefix+name)
+			}
 		}
 	}
 	slices.Sort(matches)
@@ -165,10 +186,13 @@ func completeLabels(cmd *cobra.Command, args []string, toComplete string) ([]str
 }
 
 func completeRunnerNames(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	cfgDir := config.DefaultConfigDir()
-	if f := cmd.Flag("config-dir"); f != nil && f.Value.String() != "" {
-		cfgDir = f.Value.String()
+	configDir := config.DefaultConfigDir()
+	var changed bool
+	if f := cmd.Flag("config-dir"); f != nil {
+		configDir = f.Value.String()
+		changed = f.Changed
 	}
+	cfgDir := resolveConfigDir(configDir, changed)
 	var names []string
 
 	// Check multi-repo configs

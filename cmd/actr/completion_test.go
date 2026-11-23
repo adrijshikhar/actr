@@ -114,21 +114,13 @@ func TestCompletion_PowershellAndInvalid(t *testing.T) {
 func TestCompletion_RunAndRegisterFlags(t *testing.T) {
 	expectedLabels := []string{"self-hosted", "macOS", "ARM64", "linux", "x64"}
 
-	t.Run("run --labels completion", func(t *testing.T) {
-		out := &bytes.Buffer{}
-		errOut := &bytes.Buffer{}
-		cmd := newRootCmd(out, errOut)
-
-		cmd.SetArgs([]string{"__complete", "run", "--labels", ""})
-		if err := cmd.Execute(); err != nil {
-			t.Fatalf("unexpected error: %v", err)
+	t.Run("run command does not have dangling labels or name flags", func(t *testing.T) {
+		runCmd := newRunCmd()
+		if runCmd.Flags().Lookup("labels") != nil {
+			t.Errorf("expected no labels flag on run cmd")
 		}
-
-		output := out.String()
-		for _, label := range expectedLabels {
-			if !strings.Contains(output, label) {
-				t.Errorf("expected label %q in run --labels completion, got:\n%s", label, output)
-			}
+		if runCmd.Flags().Lookup("name") != nil {
+			t.Errorf("expected no name flag on run cmd")
 		}
 	})
 
@@ -150,7 +142,7 @@ func TestCompletion_RunAndRegisterFlags(t *testing.T) {
 		}
 	})
 
-	t.Run("name completion from configs", func(t *testing.T) {
+	t.Run("name completion from configs on register command", func(t *testing.T) {
 		tmpDir := t.TempDir()
 
 		// 1. Setup single runner config in tmpDir
@@ -177,33 +169,16 @@ func TestCompletion_RunAndRegisterFlags(t *testing.T) {
 			t.Fatalf("failed to save supervisor config: %v", err)
 		}
 
-		// Test on run command
+		// Test on register command
 		out := &bytes.Buffer{}
 		errOut := &bytes.Buffer{}
 		cmd := newRootCmd(out, errOut)
-		cmd.SetArgs([]string{"__complete", "run", "--config-dir", tmpDir, "--name", ""})
-		if err := cmd.Execute(); err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		output := out.String()
-		if !strings.Contains(output, "test-runner-alpha") {
-			t.Errorf("expected 'test-runner-alpha' in run --name completion, got:\n%s", output)
-		}
-		if !strings.Contains(output, "repo-worker-beta") {
-			t.Errorf("expected 'repo-worker-beta' in run --name completion, got:\n%s", output)
-		}
-
-		// Test on register command
-		out.Reset()
-		errOut.Reset()
-		cmd = newRootCmd(out, errOut)
 		cmd.SetArgs([]string{"__complete", "register", "--config-dir", tmpDir, "--name", ""})
 		if err := cmd.Execute(); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		output = out.String()
+		output := out.String()
 		if !strings.Contains(output, "test-runner-alpha") {
 			t.Errorf("expected 'test-runner-alpha' in register --name completion, got:\n%s", output)
 		}
@@ -211,24 +186,61 @@ func TestCompletion_RunAndRegisterFlags(t *testing.T) {
 			t.Errorf("expected 'repo-worker-beta' in register --name completion, got:\n%s", output)
 		}
 
-		// Test prefix filtering on run --name
+		// Test prefix filtering on register --name
 		out.Reset()
 		errOut.Reset()
 		cmd = newRootCmd(out, errOut)
-		cmd.SetArgs([]string{"__complete", "run", "--config-dir", tmpDir, "--name", "repo-"})
+		cmd.SetArgs([]string{"__complete", "register", "--config-dir", tmpDir, "--name", "repo-"})
 		if err := cmd.Execute(); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		output = out.String()
 		if !strings.Contains(output, "repo-worker-beta") {
-			t.Errorf("expected 'repo-worker-beta' in run --name prefix completion, got:\n%s", output)
+			t.Errorf("expected 'repo-worker-beta' in register --name prefix completion, got:\n%s", output)
 		}
 		if strings.Contains(output, "test-runner-alpha") {
-			t.Errorf("unexpected 'test-runner-alpha' in run --name prefix completion, got:\n%s", output)
+			t.Errorf("unexpected 'test-runner-alpha' in register --name prefix completion, got:\n%s", output)
 		}
 	})
 
-	t.Run("labels prefix filtering", func(t *testing.T) {
+	t.Run("name completion discovers config from current working directory", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		supCfg := &config.SupervisorConfig{
+			Version: "1",
+			Repos: map[string]config.RepoConfig{
+				"local-repo-worker": {
+					URL: "https://github.com/org/local-repo",
+				},
+			},
+		}
+		if err := config.SaveSupervisorConfig(filepath.Join(tmpDir, "config.yaml"), supCfg); err != nil {
+			t.Fatalf("failed to save supervisor config: %v", err)
+		}
+
+		origWd, err := os.Getwd()
+		if err != nil {
+			t.Fatalf("failed to get working dir: %v", err)
+		}
+		if err := os.Chdir(tmpDir); err != nil {
+			t.Fatalf("failed to chdir to tmpDir: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chdir(origWd) })
+
+		out := &bytes.Buffer{}
+		errOut := &bytes.Buffer{}
+		cmd := newRootCmd(out, errOut)
+		cmd.SetArgs([]string{"__complete", "register", "--name", ""})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		output := out.String()
+		if !strings.Contains(output, "local-repo-worker") {
+			t.Errorf("expected 'local-repo-worker' discovered from cwd config.yaml, got:\n%s", output)
+		}
+	})
+
+	t.Run("labels prefix and comma filtering", func(t *testing.T) {
 		out := &bytes.Buffer{}
 		errOut := &bytes.Buffer{}
 		cmd := newRootCmd(out, errOut)
@@ -244,6 +256,32 @@ func TestCompletion_RunAndRegisterFlags(t *testing.T) {
 		}
 		if strings.Contains(output, "linux") {
 			t.Errorf("unexpected 'linux' in register --labels prefix completion, got:\n%s", output)
+		}
+
+		// Multi-value comma autocompletion
+		out.Reset()
+		errOut.Reset()
+		cmd = newRootCmd(out, errOut)
+		cmd.SetArgs([]string{"__complete", "register", "--labels", "self-hosted,m"})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		output = out.String()
+		if !strings.Contains(output, "self-hosted,macOS") {
+			t.Errorf("expected 'self-hosted,macOS' in comma completion, got:\n%s", output)
+		}
+
+		// Trailing comma completes all options prefixed
+		out.Reset()
+		errOut.Reset()
+		cmd = newRootCmd(out, errOut)
+		cmd.SetArgs([]string{"__complete", "register", "--labels", "self-hosted,"})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		output = out.String()
+		if !strings.Contains(output, "self-hosted,ARM64") || !strings.Contains(output, "self-hosted,macOS") {
+			t.Errorf("expected prefixed labels after trailing comma, got:\n%s", output)
 		}
 	})
 
@@ -373,6 +411,9 @@ func TestCompletion_Install(t *testing.T) {
 	if !strings.Contains(out.String(), "Installed fish completion") {
 		t.Errorf("expected success message in stdout, got:\n%s", out.String())
 	}
+	if !strings.Contains(out.String(), "Restart your shell or run: source") {
+		t.Errorf("expected reload instructions in fish install output, got:\n%s", out.String())
+	}
 
 	// Test execute install command with auto-detection from SHELL
 	t.Setenv("SHELL", "/bin/zsh")
@@ -398,6 +439,30 @@ func TestCompletion_Install(t *testing.T) {
 	if !strings.Contains(string(zshData), "#compdef actr") {
 		t.Errorf("expected zsh completion content, got:\n%s", string(zshData))
 	}
+	if !strings.Contains(out.String(), "autoload -Uz compinit && compinit") {
+		t.Errorf("expected zsh compinit instructions in stdout, got:\n%s", out.String())
+	}
+
+	// Test atomic cleanup when completion generation fails
+	t.Run("atomic cleanup on generateCompletion error", func(t *testing.T) {
+		failDir := t.TempDir()
+		failPath := filepath.Join(failDir, "partial.tmp")
+		completionTargetResolver = func(shell string) (string, error) {
+			return failPath, nil
+		}
+
+		failOut := &bytes.Buffer{}
+		failErrOut := &bytes.Buffer{}
+		failCmd := newRootCmd(failOut, failErrOut)
+		failCmd.SetArgs([]string{"completion", "install", "unsupported"})
+		runErr := failCmd.Execute()
+		if runErr == nil {
+			t.Fatal("expected error installing unsupported shell, got nil")
+		}
+		if _, statErr := os.Stat(failPath); !os.IsNotExist(statErr) {
+			t.Errorf("expected partial file %s to be cleaned up, but it still exists (err: %v)", failPath, statErr)
+		}
+	})
 
 	// Test execute install command without SHELL and without arg
 	t.Setenv("SHELL", "")

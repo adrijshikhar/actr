@@ -7,6 +7,7 @@ DATE ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 LDFLAGS=-ldflags "-s -w -X main.Version=$(VERSION) -X main.Commit=$(COMMIT) -X main.Date=$(DATE)"
 INSTALL_DIR ?= $(HOME)/.local/bin
+COMPLETION_SHELL ?= zsh
 
 build:
 	CGO_ENABLED=0 go build $(LDFLAGS) -o bin/$(BINARY_NAME) ./cmd/actr
@@ -14,7 +15,7 @@ build:
 install: build
 	mkdir -p $(INSTALL_DIR)
 	cp bin/$(BINARY_NAME) $(INSTALL_DIR)/$(BINARY_NAME)
-	bin/$(BINARY_NAME) completion install zsh
+	bin/$(BINARY_NAME) completion install $(COMPLETION_SHELL)
 
 release-snapshot:
 	goreleaser release --snapshot --clean --skip=publish

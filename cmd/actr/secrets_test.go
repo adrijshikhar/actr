@@ -103,6 +103,85 @@ func TestSecretsCompletion_GetAndDeleteKeys(t *testing.T) {
 	}
 }
 
+type errorListVault struct {
+	mockVault
+}
+
+func (e *errorListVault) List(ctx context.Context) ([]vault.SecretMetadata, error) {
+	return nil, errors.New("simulated vault list failure")
+}
+
+func TestSecretsCompletion_FaultRecoveryAndEdgeCases(t *testing.T) {
+	origResolver := vaultProviderResolver
+	t.Cleanup(func() { vaultProviderResolver = origResolver })
+
+	t.Run("extra args len != 0 returns empty slice and NoFileComp", func(t *testing.T) {
+		mv := &mockVault{
+			secrets: map[string]string{"KEY": "val"},
+		}
+		vaultProviderResolver = func(cmd *cobra.Command) (vault.Provider, error) {
+			return mv, nil
+		}
+
+		// Direct function call
+		cmd := newRootCmd(&bytes.Buffer{}, &bytes.Buffer{})
+		matches, directive := completeSecretKeys(cmd, []string{"KEY"}, "extra")
+		assert.Empty(t, matches)
+		assert.Equal(t, cobra.ShellCompDirectiveNoFileComp, directive)
+
+		// Invocation via cobra __complete
+		out := &bytes.Buffer{}
+		errOut := &bytes.Buffer{}
+		cmd = newRootCmd(out, errOut)
+		cmd.SetArgs([]string{"__complete", "secrets", "get", "KEY", "extra"})
+		err := cmd.Execute()
+		require.NoError(t, err)
+		assert.NotContains(t, out.String(), "KEY")
+	})
+
+	t.Run("vaultProviderResolver error returns empty slice without panic", func(t *testing.T) {
+		vaultProviderResolver = func(cmd *cobra.Command) (vault.Provider, error) {
+			return nil, errors.New("failed to connect to vault")
+		}
+
+		// Direct function call
+		cmd := newRootCmd(&bytes.Buffer{}, &bytes.Buffer{})
+		matches, directive := completeSecretKeys(cmd, nil, "")
+		assert.Empty(t, matches)
+		assert.Equal(t, cobra.ShellCompDirectiveNoFileComp, directive)
+
+		// Invocation via cobra __complete
+		out := &bytes.Buffer{}
+		errOut := &bytes.Buffer{}
+		cmd = newRootCmd(out, errOut)
+		cmd.SetArgs([]string{"__complete", "secrets", "get", ""})
+		err := cmd.Execute()
+		require.NoError(t, err)
+		assert.NotContains(t, out.String(), "KEY")
+	})
+
+	t.Run("v.List error returns empty slice without panic", func(t *testing.T) {
+		vaultProviderResolver = func(cmd *cobra.Command) (vault.Provider, error) {
+			return &errorListVault{}, nil
+		}
+
+		// Direct function call
+		cmd := newRootCmd(&bytes.Buffer{}, &bytes.Buffer{})
+		matches, directive := completeSecretKeys(cmd, nil, "")
+		assert.Empty(t, matches)
+		assert.Equal(t, cobra.ShellCompDirectiveNoFileComp, directive)
+
+		// Invocation via cobra __complete
+		out := &bytes.Buffer{}
+		errOut := &bytes.Buffer{}
+		cmd = newRootCmd(out, errOut)
+		cmd.SetArgs([]string{"__complete", "secrets", "get", ""})
+		err := cmd.Execute()
+		require.NoError(t, err)
+		assert.NotContains(t, out.String(), "KEY")
+	})
+}
+
 func TestSecretsCLI_Lifecycle(t *testing.T) {
 	tempDir := t.TempDir()
 

@@ -115,6 +115,12 @@ func resolveConfigDir(dir string, explicitlySet bool) string {
 	if _, err := os.Stat(".runner"); err == nil {
 		return "."
 	}
+	if _, err := os.Stat("config.yaml"); err == nil {
+		return "."
+	}
+	if _, err := os.Stat("config.yml"); err == nil {
+		return "."
+	}
 	if dir != "" {
 		return dir
 	}
@@ -211,8 +217,6 @@ func newRunCmd() *cobra.Command {
 		otelEndpointFlag string
 		otelProtocolFlag string
 		otelHeadersFlag  string
-		labelsFlag       []string
-		nameFlag         string
 	)
 
 	cmd := &cobra.Command{
@@ -776,14 +780,9 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&otelEndpointFlag, "otel-endpoint", "", "OpenTelemetry OTLP exporter endpoint (e.g. http://localhost:4318, for InfluxDB / Prometheus / Datadog)")
 	cmd.Flags().StringVar(&otelProtocolFlag, "otel-protocol", "", "OpenTelemetry OTLP protocol (grpc or http/protobuf)")
 	cmd.Flags().StringVar(&otelHeadersFlag, "otel-headers", "", "OpenTelemetry OTLP exporter headers (e.g. Authorization=Token <token>)")
-	cmd.Flags().StringSliceVar(&labelsFlag, "labels", nil, "runner labels (optional)")
-	cmd.Flags().StringVar(&nameFlag, "name", "", "runner or repository worker name (optional)")
 
 	_ = cmd.MarkFlagDirname("config-dir")
 	_ = cmd.MarkFlagDirname("runs-dir")
-
-	_ = cmd.RegisterFlagCompletionFunc("labels", completeLabels)
-	_ = cmd.RegisterFlagCompletionFunc("name", completeRunnerNames)
 
 	return cmd
 }
