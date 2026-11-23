@@ -328,6 +328,20 @@ func TestCompletion_Install(t *testing.T) {
 		t.Errorf("expected %q, got %q", expectedBash, bashPath)
 	}
 
+	// Test case-insensitivity in resolveInstallPath (e.g. "ZSH", "Fish", "BASH")
+	zshUpper, err := resolveInstallPath("ZSH", tempHome, "")
+	if err != nil || zshUpper != expectedZshFallback {
+		t.Errorf("expected %q for ZSH, got %q (err: %v)", expectedZshFallback, zshUpper, err)
+	}
+	fishMixed, err := resolveInstallPath("Fish", tempHome, "")
+	if err != nil || fishMixed != expectedFish {
+		t.Errorf("expected %q for Fish, got %q (err: %v)", expectedFish, fishMixed, err)
+	}
+	bashUpper, err := resolveInstallPath("BASH", tempHome, "")
+	if err != nil || bashUpper != expectedBash {
+		t.Errorf("expected %q for BASH, got %q (err: %v)", expectedBash, bashUpper, err)
+	}
+
 	// Test unsupported shell
 	if _, err := resolveInstallPath("unknown", tempHome, ""); err == nil {
 		t.Errorf("expected error for unsupported shell, got nil")

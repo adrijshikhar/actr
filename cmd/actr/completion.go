@@ -64,6 +64,7 @@ func detectBrewPrefix() string {
 }
 
 func resolveInstallPath(shell string, homeDir string, brewPrefix string) (string, error) {
+	shell = strings.ToLower(shell)
 	switch shell {
 	case "zsh":
 		if brewPrefix != "" {
@@ -91,11 +92,11 @@ func newCompletionInstallCmd(rootCmd *cobra.Command) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			shell := ""
 			if len(args) > 0 {
-				shell = args[0]
+				shell = strings.ToLower(args[0])
 			} else {
 				envShell := os.Getenv("SHELL")
 				if envShell != "" {
-					shell = filepath.Base(envShell)
+					shell = strings.ToLower(filepath.Base(envShell))
 				}
 			}
 			if shell == "" {
@@ -129,6 +130,7 @@ func newCompletionInstallCmd(rootCmd *cobra.Command) *cobra.Command {
 }
 
 func generateCompletion(rootCmd *cobra.Command, shell string, out io.Writer) error {
+	shell = strings.ToLower(shell)
 	switch shell {
 	case "bash":
 		return rootCmd.GenBashCompletionV2(out, true)
