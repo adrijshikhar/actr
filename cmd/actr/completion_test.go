@@ -91,6 +91,25 @@ func TestCompletion_ShellGeneration(t *testing.T) {
 	}
 }
 
+func TestCompletion_PowershellAndInvalid(t *testing.T) {
+	out := &bytes.Buffer{}
+	errOut := &bytes.Buffer{}
+	cmd := newRootCmd(out, errOut)
+
+	cmd.SetArgs([]string{"completion", "powershell"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected powershell completion error: %v", err)
+	}
+	if !strings.Contains(out.String(), "Register-ArgumentCompleter") {
+		t.Errorf("expected powershell completion script to contain Register-ArgumentCompleter, got:\n%s", out.String())
+	}
+
+	cmd.SetArgs([]string{"completion", "invalid-shell"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatalf("expected error for invalid shell, got nil")
+	}
+}
+
 func TestCompletion_RunAndRegisterFlags(t *testing.T) {
 	expectedLabels := []string{"self-hosted", "macOS", "ARM64", "linux", "x64"}
 
