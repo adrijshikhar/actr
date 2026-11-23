@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -211,6 +212,8 @@ func newRunCmd() *cobra.Command {
 		otelEndpointFlag string
 		otelProtocolFlag string
 		otelHeadersFlag  string
+		labelsFlag       []string
+		nameFlag         string
 	)
 
 	cmd := &cobra.Command{
@@ -774,7 +777,66 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&otelEndpointFlag, "otel-endpoint", "", "OpenTelemetry OTLP exporter endpoint (e.g. http://localhost:4318, for InfluxDB / Prometheus / Datadog)")
 	cmd.Flags().StringVar(&otelProtocolFlag, "otel-protocol", "", "OpenTelemetry OTLP protocol (grpc or http/protobuf)")
 	cmd.Flags().StringVar(&otelHeadersFlag, "otel-headers", "", "OpenTelemetry OTLP exporter headers (e.g. Authorization=Token <token>)")
+	cmd.Flags().StringSliceVar(&labelsFlag, "labels", nil, "runner labels (optional)")
+	cmd.Flags().StringVar(&nameFlag, "name", "", "runner or repository worker name (optional)")
+
 	_ = cmd.MarkFlagDirname("config-dir")
+	_ = cmd.MarkFlagDirname("work-folder")
+	_ = cmd.MarkFlagDirname("log-dir")
+	_ = cmd.MarkFlagDirname("runs-dir")
+
+	_ = cmd.RegisterFlagCompletionFunc("labels", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		labels := []string{
+			"self-hosted\tDefault self-hosted runner label",
+			"macOS\tmacOS operating system label",
+			"ARM64\tApple Silicon / ARM64 architecture label",
+			"linux\tLinux operating system label",
+			"x64\tx86_64 architecture label",
+		}
+		var matches []string
+		prefix := strings.ToLower(toComplete)
+		for _, l := range labels {
+			if strings.HasPrefix(strings.ToLower(l), prefix) {
+				matches = append(matches, l)
+			}
+		}
+		slices.Sort(matches)
+		return matches, cobra.ShellCompDirectiveNoFileComp
+	})
+
+	_ = cmd.RegisterFlagCompletionFunc("name", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		cfgDir := config.DefaultConfigDir()
+		if f := cmd.Flag("config-dir"); f != nil && f.Value.String() != "" {
+			cfgDir = f.Value.String()
+		}
+		var names []string
+
+		// Check multi-repo configs
+		multiCfgPath := filepath.Join(cfgDir, "config.yaml")
+		if _, err := os.Stat(multiCfgPath); os.IsNotExist(err) {
+			multiCfgPath = filepath.Join(cfgDir, "config.yml")
+		}
+		if multiCfg, err := config.LoadSupervisorConfig(multiCfgPath); err == nil && multiCfg != nil {
+			for rName := range multiCfg.Repos {
+				names = append(names, fmt.Sprintf("%s\tRepository runner worker", rName))
+			}
+		}
+
+		// Check single-runner config
+		if rCfg, err := config.LoadRunnerConfig(cfgDir); err == nil && rCfg != nil && rCfg.AgentName != "" {
+			names = append(names, fmt.Sprintf("%s\tConfigured runner instance", rCfg.AgentName))
+		}
+
+		var matches []string
+		prefix := strings.ToLower(toComplete)
+		for _, n := range names {
+			if strings.HasPrefix(strings.ToLower(n), prefix) {
+				matches = append(matches, n)
+			}
+		}
+		slices.Sort(matches)
+		return matches, cobra.ShellCompDirectiveNoFileComp
+	})
 
 	return cmd
 }
