@@ -170,7 +170,7 @@ func TestServer_StartStopLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to query running server: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -207,7 +207,7 @@ func TestServer_StartStopLifecycle_BackgroundContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to query running server: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	if err := srv.Stop(); err != nil {
 		t.Fatalf("failed to stop server: %v", err)
@@ -893,7 +893,7 @@ func TestServer_LogsStream_SSE(t *testing.T) {
 		if err != nil {
 			t.Fatalf("request failed: %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
@@ -1029,7 +1029,7 @@ func TestServer_LogsStream_SSE(t *testing.T) {
 		if err != nil {
 			t.Fatalf("request failed: %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		// Cancel client context
 		cancel()
@@ -1176,7 +1176,7 @@ func TestServer_MetricsEndpoints(t *testing.T) {
 		if err != nil {
 			t.Fatalf("request failed: %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("expected 200 OK, got %d", resp.StatusCode)

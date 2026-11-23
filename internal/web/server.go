@@ -263,9 +263,7 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	go func() {
-		if err := s.httpServer.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			// Server closed or listener error
-		}
+		_ = s.httpServer.Serve(l)
 	}()
 
 	return nil

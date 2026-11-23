@@ -3,6 +3,10 @@ bin/
 /dist/
 !internal/web/dist/
 
+# Frontend dependencies
+node_modules/
+web/node_modules/
+
 # Test artifacts & logs
 *.log
 _diag/
