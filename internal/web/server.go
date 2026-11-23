@@ -46,6 +46,23 @@ type DaemonController interface {
 	Stop() error
 }
 
+type RunnerInfo struct {
+	Repo           string   `json:"repo"`
+	Name           string   `json:"name"`
+	Labels         []string `json:"labels"`
+	MaxConcurrency int      `json:"max_concurrency"`
+	ActiveSlots    int      `json:"active_slots"`
+	Status         string   `json:"status"`
+}
+
+type RunnerProvider interface {
+	GetRunners(ctx context.Context) ([]RunnerInfo, error)
+}
+
+type Masker interface {
+	Mask(string) string
+}
+
 // ServerConfig configures the Web Dashboard HTTP server.
 type ServerConfig struct {
 	Port             int
@@ -58,6 +75,8 @@ type ServerConfig struct {
 	SecretManager    SecretManager
 	EventSubscriber  EventSubscriber
 	DaemonController DaemonController
+	RunnerProvider   RunnerProvider
+	Masker           Masker
 }
 
 // Server represents the web dashboard HTTP server.
@@ -97,6 +116,12 @@ func NewServer(cfg ServerConfig) *Server {
 func (s *Server) routes() {
 	// Status API endpoint
 	s.mux.HandleFunc("GET /api/status", s.handleStatus)
+
+	// Runners and Run history API endpoints
+	s.mux.HandleFunc("GET /api/runners", s.handleRunners)
+	s.mux.HandleFunc("GET /api/runs", s.handleRuns)
+	s.mux.HandleFunc("GET /api/runs/{id}", s.handleRunDetail)
+	s.mux.HandleFunc("GET /api/runs/{id}/logs", s.handleRunLogs)
 
 	// Catch-all API 404 to ensure API routes never return HTML SPA fallback
 	s.mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
