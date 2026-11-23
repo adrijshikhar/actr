@@ -1,23 +1,16 @@
 // Typed Server-Sent Events (SSE) Manager for actr web dashboard
-import type { RunnerMetrics } from './api';
+import type { RunnerMetrics, StepMetadata, RunRecord } from './api';
 
 export interface SSELogEvent {
   type: string;
+  step_id?: string;
+  line?: string;
+  log_line?: string;
   job_id?: string;
   repo_alias?: string;
-  step_id?: string;
-  log_line?: string;
-  step?: {
-    id: string;
-    number: number;
-    name: string;
-    status: string;
-  };
-  job?: {
-    id: string;
-    name: string;
-    workflow: string;
-  };
+  step?: StepMetadata | any;
+  job?: RunRecord | any;
+  [key: string]: any;
 }
 
 export interface SSESubscriptionOptions {
@@ -47,6 +40,19 @@ export function subscribeLogs(
   const handleMessage = (e: MessageEvent) => {
     try {
       const data = JSON.parse(e.data) as SSELogEvent;
+      data.type = data.type || e.type;
+      if (data.line && !data.log_line) {
+        data.log_line = data.line;
+      }
+      if (!data.line && data.log_line) {
+        data.line = data.log_line;
+      }
+      if (e.type.startsWith('step_') && !data.step) {
+        data.step = { ...data };
+      }
+      if ((e.type.startsWith('job_') || e.type.startsWith('run_')) && !data.job) {
+        data.job = { ...data };
+      }
       onEvent(data);
     } catch (err) {
       console.warn('Failed to parse SSE log data:', e.data, err);
@@ -70,6 +76,10 @@ export function subscribeLogs(
       // Custom event types sent by actr monitor
       const customEvents = [
         'log',
+        'step_start',
+        'step_complete',
+        'job_start',
+        'job_complete',
         'step_started',
         'step_finished',
         'run_started',
