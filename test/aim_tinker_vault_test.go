@@ -32,15 +32,13 @@ func TestAim_TinkerVaultIntegration(t *testing.T) {
 		t.Skip("TINKER_API_KEY is empty; skipping live Tinker API test")
 	}
 
-	tinkerBaseURL, err := keychainV.Get(ctx, "TINKER_API_BASE_URL")
-	if err != nil || tinkerBaseURL == "" {
-		if envURL := os.Getenv("TINKER_API_BASE_URL"); envURL != "" {
-			_ = keychainV.Set(ctx, "TINKER_API_BASE_URL", envURL)
-			tinkerBaseURL = envURL
-		} else {
-			tinkerBaseURL = "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1"
-			_ = keychainV.Set(ctx, "TINKER_API_BASE_URL", tinkerBaseURL)
+	baseURL, err := keychainV.Get(ctx, "TINKER_API_BASE_URL")
+	if err != nil || baseURL == "" {
+		targetURL := os.Getenv("TINKER_API_BASE_URL")
+		if targetURL == "" {
+			targetURL = "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1"
 		}
+		_ = keychainV.Set(ctx, "TINKER_API_BASE_URL", targetURL)
 	}
 
 	tmpDir := t.TempDir()
