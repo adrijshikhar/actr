@@ -113,22 +113,22 @@ export function DiskAreaChart({
 
   const content = (
     <>
-      <div className="flex items-center justify-between mb-3">
-        <div>
-          <div className="flex items-center gap-2">
-            <HardDrive className="w-4 h-4 text-status-warning-text" />
-            <h3 className="text-xs font-semibold text-white tracking-tight">{title}</h3>
+      <div className="flex items-center justify-between gap-2 mb-3 min-w-0">
+        <div className="min-w-0 pr-2">
+          <div className="flex items-center gap-1.5">
+            <HardDrive className="w-3.5 h-3.5 text-status-warning-text flex-shrink-0" />
+            <h3 className="text-xs font-semibold text-white tracking-tight truncate">{title}</h3>
           </div>
           {description && (
-            <p className="text-[11px] text-geist-faint mt-0.5">{description}</p>
+            <p className="text-[11px] text-geist-faint truncate mt-0.5">{description}</p>
           )}
         </div>
 
         {latestSample && (
-          <div className="flex items-center gap-2 text-xs font-mono">
-            <span className="w-2 h-2 rounded-full bg-[#f5a623] animate-pulse" />
-            <span className="text-geist-secondary">Write:</span>
-            <span className="text-white font-semibold">{formatRate(latestSample.writeRate)}</span>
+          <div className="flex items-center gap-1.5 text-[11px] font-mono tracking-tight whitespace-nowrap flex-shrink-0 tabular-nums">
+            <span className="w-1.5 h-1.5 rounded-full bg-[#f5a623] animate-pulse flex-shrink-0" />
+            <span className="text-geist-faint">Write:</span>
+            <span className="text-white font-medium">{formatRate(latestSample.writeRate)}</span>
           </div>
         )}
       </div>

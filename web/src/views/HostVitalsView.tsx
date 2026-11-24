@@ -249,168 +249,173 @@ export function HostVitalsView({
   return (
     <div className="space-y-6">
       {/* View Header & Stream State Bar */}
-      <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4 p-4 rounded-geist bg-geist-surface border border-geist-hairline">
-        <div className="space-y-1.5 min-w-0">
-          <div className="flex items-center gap-2.5 flex-wrap">
-            <Activity className="w-5 h-5 text-geist-blue flex-shrink-0" />
-            <h2 className="text-base font-semibold text-white tracking-tight">Host Node Telemetry</h2>
-            <Badge
-              variant="outline"
-              className={cn(
-                'text-[10px] font-mono gap-1.5 transition-colors',
-                isPaused
-                  ? 'text-status-warning-text border-status-warning-border bg-status-warning-bg/20'
-                  : streamActive
-                  ? 'text-status-success-solid border-status-success-border bg-status-success-bg/20'
-                  : 'text-geist-faint border-geist-hairline bg-geist-hover'
-              )}
-            >
-              <span
+      <div className="p-3 sm:p-4 rounded-geist bg-geist-surface border border-geist-hairline">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+          {/* Left: Identity, Stream Status & Buffer Info */}
+          <div className="space-y-1 min-w-0 pr-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <Activity className="w-4 h-4 text-geist-blue flex-shrink-0" />
+              <h2 className="text-sm font-semibold text-white tracking-tight whitespace-nowrap">Host Node Telemetry</h2>
+              <Badge
+                variant="outline"
                 className={cn(
-                  'w-1.5 h-1.5 rounded-full',
+                  'text-[10px] font-mono px-1.5 py-0.5 gap-1 whitespace-nowrap transition-colors',
                   isPaused
-                    ? 'bg-status-warning-text'
+                    ? 'text-status-warning-text border-status-warning-border bg-status-warning-bg/20'
                     : streamActive
-                    ? 'bg-status-success-solid animate-pulse'
-                    : 'bg-geist-faint'
+                    ? 'text-status-success-solid border-status-success-border bg-status-success-bg/20'
+                    : 'text-geist-faint border-geist-hairline bg-geist-hover'
                 )}
-              />
-              {isPaused
-                ? 'Frozen (Paused)'
-                : streamActive
-                ? refreshCadence === '1'
-                  ? '1s SSE Stream (Active)'
-                  : `${refreshCadence}s Refresh Cadence`
-                : 'Connecting...'}
-            </Badge>
+              >
+                <span
+                  className={cn(
+                    'w-1.5 h-1.5 rounded-full flex-shrink-0',
+                    isPaused
+                      ? 'bg-status-warning-text'
+                      : streamActive
+                      ? 'bg-status-success-solid animate-pulse'
+                      : 'bg-geist-faint'
+                  )}
+                />
+                {isPaused
+                  ? 'Paused'
+                  : streamActive
+                  ? refreshCadence === '1'
+                    ? 'Live (1s)'
+                    : `${refreshCadence}s Stream`
+                  : 'Connecting'}
+              </Badge>
+            </div>
 
-            <span className="text-[11px] font-mono text-geist-faint">
-              Buffer: <span className="text-geist-secondary font-medium">{visibleMetrics.length}s</span> / {allSamplesRef.current.length}s retained
-            </span>
-            {lastTick && (
-              <span className="text-[11px] font-mono text-geist-faint">
-                · Last: <span className="text-geist-secondary font-medium">{lastTick}</span>
-              </span>
-            )}
-          </div>
-          <p className="text-xs text-geist-secondary truncate">
-            Continuous real-time hardware telemetry and kernel I/O sampled at 1,000ms cadence.
-          </p>
-        </div>
-
-        {/* Grafana-Style Window, Auto-Refresh, and Layout Controls */}
-        <div className="flex items-center gap-1.5 sm:gap-2 text-xs font-mono text-geist-faint flex-wrap xl:flex-nowrap flex-shrink-0">
-          {/* 1. Time Range / Window Control */}
-          <div className="flex items-center gap-1.5 bg-geist-canvas border border-geist-hairline rounded px-2 py-1 text-xs font-mono text-geist-secondary hover:border-geist-borderHover transition-colors">
-            <Clock className="w-3.5 h-3.5 text-geist-faint flex-shrink-0" />
-            <label htmlFor="time-window-select" className="sr-only">
-              Time Window Range
-            </label>
-            <select
-              id="time-window-select"
-              value={timeWindow}
-              onChange={(e) => setTimeWindow(Number(e.target.value))}
-              className="bg-transparent text-white font-medium text-xs focus:outline-none cursor-pointer pr-1"
-              title="Select rolling time window"
-            >
-              {TIME_WINDOWS.map((w) => (
-                <option key={w.value} value={w.value} className="bg-geist-surface text-white">
-                  {w.label}
-                </option>
-              ))}
-            </select>
+            <div className="flex items-center gap-2 text-[11px] font-mono tracking-tight text-geist-faint truncate tabular-nums">
+              <span className="text-geist-secondary font-sans truncate">Continuous kernel I/O & hardware telemetry</span>
+              <span>·</span>
+              <span className="whitespace-nowrap">Window: <span className="text-white font-medium">{visibleMetrics.length}s</span></span>
+              <span>·</span>
+              <span className="whitespace-nowrap">Buffer: <span className="text-white font-medium">{allSamplesRef.current.length}s</span></span>
+              {lastTick && (
+                <>
+                  <span>·</span>
+                  <span className="whitespace-nowrap">Last: <span className="text-white font-medium">{lastTick}</span></span>
+                </>
+              )}
+            </div>
           </div>
 
-          {/* 2. Play / Pause Freeze Toggle */}
-          <button
-            type="button"
-            onClick={togglePause}
-            aria-label={isPaused ? 'Resume live metrics stream' : 'Pause metrics stream'}
-            className={cn(
-              'flex items-center gap-1.5 px-2 py-1 rounded text-xs font-mono transition-colors border cursor-pointer select-none',
-              isPaused
-                ? 'border-status-warning-border bg-status-warning-bg/30 text-status-warning-text hover:bg-status-warning-bg/50'
-                : 'border-geist-hairline bg-geist-canvas text-geist-secondary hover:text-white hover:bg-geist-hover'
-            )}
-            title={isPaused ? 'Resume live streaming' : 'Freeze graph to inspect data points'}
-          >
-            {isPaused ? (
-              <>
-                <Play className="w-3 h-3 fill-status-warning-text text-status-warning-text" />
-                <span>Resume</span>
-              </>
-            ) : (
-              <>
-                <Pause className="w-3 h-3" />
-                <span>Pause</span>
-              </>
-            )}
-          </button>
+          {/* Right: Consolidated Grafana-Style Toolbar (Single Row, Never Wraps) */}
+          <div className="flex items-center gap-1.5 text-xs font-mono flex-shrink-0">
+            {/* 1. Time Range / Window Control */}
+            <div className="flex items-center gap-1 bg-geist-canvas border border-geist-hairline rounded px-2 py-1 text-[11px] font-mono tracking-tight text-geist-secondary hover:border-geist-borderHover transition-colors">
+              <Clock className="w-3 h-3 text-geist-faint flex-shrink-0" />
+              <label htmlFor="time-window-select" className="sr-only">
+                Time Window Range
+              </label>
+              <select
+                id="time-window-select"
+                value={timeWindow}
+                onChange={(e) => setTimeWindow(Number(e.target.value))}
+                className="bg-transparent text-white font-medium text-[11px] font-mono focus:outline-none cursor-pointer pr-0.5"
+                title="Select rolling time window"
+              >
+                {TIME_WINDOWS.map((w) => (
+                  <option key={w.value} value={w.value} className="bg-geist-surface text-white">
+                    {w.label}
+                  </option>
+                ))}
+              </select>
+            </div>
 
-          {/* 3. Auto-Refresh Cadence Selector */}
-          <div className="flex items-center gap-1.5 bg-geist-canvas border border-geist-hairline rounded px-2 py-1 text-xs font-mono text-geist-secondary hover:border-geist-borderHover transition-colors">
-            <RotateCw className="w-3.5 h-3.5 text-geist-faint flex-shrink-0" />
-            <label htmlFor="refresh-cadence-select" className="sr-only">
-              Auto-Refresh Cadence
-            </label>
-            <select
-              id="refresh-cadence-select"
-              value={refreshCadence}
-              onChange={(e) => handleCadenceChange(e.target.value)}
-              className="bg-transparent text-white font-medium text-xs focus:outline-none cursor-pointer pr-1"
-              title="Select auto-refresh interval"
-            >
-              {REFRESH_INTERVALS.map((r) => (
-                <option key={r.value} value={r.value} className="bg-geist-surface text-white">
-                  {r.label}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          {/* 4. Manual Poll Button */}
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleManualPoll}
-            disabled={isPolling}
-            className="h-7 text-xs px-2 gap-1.5 border-geist-hairline bg-geist-canvas hover:bg-geist-hover text-geist-secondary hover:text-white"
-            title="Fetch instantaneous telemetry snapshot"
-          >
-            <RefreshCw className={cn('w-3 h-3', isPolling && 'animate-spin text-geist-blue')} />
-            <span className="hidden sm:inline">Poll</span>
-          </Button>
-
-          {/* 5. Layout Mode Switcher */}
-          <div className="flex items-center border border-geist-hairline rounded bg-geist-canvas p-0.5">
+            {/* 2. Play / Pause Freeze Toggle */}
             <button
               type="button"
-              onClick={() => setLayoutMode('grid')}
+              onClick={togglePause}
+              aria-label={isPaused ? 'Resume live metrics stream' : 'Pause metrics stream'}
               className={cn(
-                'flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-sans transition-colors cursor-pointer',
-                layoutMode === 'grid'
-                  ? 'bg-geist-elevated text-white font-medium shadow-sm'
-                  : 'text-geist-faint hover:text-white'
+                'flex items-center gap-1 px-2 py-1 rounded text-[11px] font-mono tracking-tight transition-colors border cursor-pointer select-none',
+                isPaused
+                  ? 'border-status-warning-border bg-status-warning-bg/30 text-status-warning-text hover:bg-status-warning-bg/50'
+                  : 'border-geist-hairline bg-geist-canvas text-geist-secondary hover:text-white hover:bg-geist-hover'
               )}
-              title="2x2 Grid View"
+              title={isPaused ? 'Resume live streaming' : 'Freeze graph to inspect data points'}
             >
-              <LayoutGrid className="w-3 h-3" />
-              <span>Grid</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => setLayoutMode('stacked')}
-              className={cn(
-                'flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-sans transition-colors cursor-pointer',
-                layoutMode === 'stacked'
-                  ? 'bg-geist-elevated text-white font-medium shadow-sm'
-                  : 'text-geist-faint hover:text-white'
+              {isPaused ? (
+                <>
+                  <Play className="w-3 h-3 fill-status-warning-text text-status-warning-text" />
+                  <span>Resume</span>
+                </>
+              ) : (
+                <>
+                  <Pause className="w-3 h-3" />
+                  <span>Pause</span>
+                </>
               )}
-              title="Stacked Full-Width View"
-            >
-              <Rows className="w-3 h-3" />
-              <span>Stacked</span>
             </button>
+
+            {/* 3. Auto-Refresh Cadence Selector */}
+            <div className="flex items-center gap-1 bg-geist-canvas border border-geist-hairline rounded px-2 py-1 text-[11px] font-mono tracking-tight text-geist-secondary hover:border-geist-borderHover transition-colors">
+              <RotateCw className="w-3 h-3 text-geist-faint flex-shrink-0" />
+              <label htmlFor="refresh-cadence-select" className="sr-only">
+                Auto-Refresh Cadence
+              </label>
+              <select
+                id="refresh-cadence-select"
+                value={refreshCadence}
+                onChange={(e) => handleCadenceChange(e.target.value)}
+                className="bg-transparent text-white font-medium text-[11px] font-mono focus:outline-none cursor-pointer pr-0.5"
+                title="Select auto-refresh interval"
+              >
+                {REFRESH_INTERVALS.map((r) => (
+                  <option key={r.value} value={r.value} className="bg-geist-surface text-white">
+                    {r.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* 4. Manual Poll Button */}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleManualPoll}
+              disabled={isPolling}
+              className="h-[26px] text-[11px] font-mono tracking-tight px-2 gap-1 border-geist-hairline bg-geist-canvas hover:bg-geist-hover text-geist-secondary hover:text-white"
+              title="Fetch instantaneous telemetry snapshot"
+            >
+              <RefreshCw className={cn('w-3 h-3', isPolling && 'animate-spin text-geist-blue')} />
+              <span>Poll</span>
+            </Button>
+
+            {/* 5. Layout Mode Switcher (Icon-only compact segmented button) */}
+            <div className="flex items-center border border-geist-hairline rounded bg-geist-canvas p-0.5 ml-0.5">
+              <button
+                type="button"
+                onClick={() => setLayoutMode('grid')}
+                className={cn(
+                  'p-1 rounded transition-colors cursor-pointer',
+                  layoutMode === 'grid'
+                    ? 'bg-geist-elevated text-white shadow-sm'
+                    : 'text-geist-faint hover:text-white'
+                )}
+                title="2x2 Grid View"
+                aria-label="2x2 Grid View"
+              >
+                <LayoutGrid className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setLayoutMode('stacked')}
+                className={cn(
+                  'p-1 rounded transition-colors cursor-pointer',
+                  layoutMode === 'stacked'
+                    ? 'bg-geist-elevated text-white shadow-sm'
+                    : 'text-geist-faint hover:text-white'
+                )}
+                title="Stacked View"
+                aria-label="Stacked View"
+              >
+                <Rows className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -531,7 +536,7 @@ export function HostVitalsView({
           data={visibleMetrics}
           height={layoutMode === 'grid' ? 200 : 240}
           title="CPU Utilization"
-          description="Physical processor core execution load over time"
+          description="Physical core execution load over time"
           showCard={true}
         />
 
@@ -541,7 +546,7 @@ export function HostVitalsView({
           height={layoutMode === 'grid' ? 200 : 240}
           totalMemoryBytes={status?.host_mem_total}
           title="Memory Allocation"
-          description="Physical RAM resident set size and host allocation over time"
+          description="Physical RAM resident set size and host allocation"
           showCard={true}
         />
 
@@ -550,7 +555,7 @@ export function HostVitalsView({
           data={visibleMetrics}
           height={layoutMode === 'grid' ? 200 : 240}
           title="Disk Write Activity"
-          description="Real-time storage controller commit rate over time"
+          description="Real-time storage controller commit rate"
           showCard={true}
         />
 
@@ -559,7 +564,7 @@ export function HostVitalsView({
           data={visibleMetrics}
           height={layoutMode === 'grid' ? 200 : 240}
           title="Network Bandwidth"
-          description="Interface socket throughput (Ingress RX / Egress TX) over time"
+          description="Socket throughput (RX / TX)"
           showCard={true}
         />
       </div>
