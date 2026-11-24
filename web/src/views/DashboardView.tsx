@@ -1,3 +1,4 @@
+import { useState, useEffect } from 'react';
 import {
   Power,
   Server,
@@ -12,11 +13,13 @@ import {
   Boxes,
   RotateCcw,
 } from 'lucide-react';
-import type { StatusResponse, RunnerInfo, RunRecord } from '@/lib/api';
+import type { StatusResponse, RunnerInfo, RunRecord, TelemetrySample } from '@/lib/api';
 import { SlotGauge } from '@/components/charts/SlotGauge';
+import { VitalsAreaChart } from '@/components/charts/VitalsAreaChart';
+import { subscribeMetrics } from '@/lib/sse';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { cn, formatBytes, formatDuration, formatRelativeTime } from '@/lib/utils';
+import { cn, formatBytes, formatDuration, formatRelativeTime, formatAppVersion, getProgressWidthClass } from '@/lib/utils';
 
 export interface DashboardViewProps {
   status: StatusResponse | null;
@@ -33,8 +36,8 @@ export function DashboardView({
   runs = [],
   runners = [],
   onSelectRun,
-  onToggleService,
-  serviceActionLoading = false,
+  onToggleService: _onToggleService,
+  serviceActionLoading: _serviceActionLoading = false,
   onRefresh,
 }: DashboardViewProps) {
   // Aggregate runner capacity
@@ -49,6 +52,59 @@ export function DashboardView({
 
   const activeRuns = runs.filter((r) => r.status === 'running' || r.status === 'in_progress');
   const recentRuns = runs.slice(0, 10);
+
+  const [liveMetrics, setLiveMetrics] = useState<TelemetrySample[]>([]);
+
+  useEffect(() => {
+    function createHostSample(sample: { timestamp: string; host_cpu: number; host_mem_used: number; host_mem_total: number }): TelemetrySample {
+      return {
+        timestamp: sample.timestamp,
+        pid: 0,
+        pgid: 0,
+        process_count: 0,
+        step_cpu: sample.host_cpu,
+        step_rss_bytes: sample.host_mem_used,
+        step_elapsed_sec: 0,
+        disk_used_bytes: 0,
+        disk_free_bytes: 0,
+        disk_total_bytes: 0,
+        disk_used_ratio: 0,
+        disk_write_rate: 0,
+        disk_inodes_free: 0,
+        net_rx_rate: 0,
+        net_tx_rate: 0,
+        host_cpu: sample.host_cpu,
+        host_mem_used: sample.host_mem_used,
+        host_mem_total: sample.host_mem_total,
+        host_load_1m: 0,
+      };
+    }
+
+    if (status) {
+      const initialSample = createHostSample({
+        timestamp: new Date().toISOString(),
+        host_cpu: status.host_cpu || 0,
+        host_mem_used: status.host_mem_used || 0,
+        host_mem_total: status.host_mem_total || 0,
+      });
+      setLiveMetrics((prev) => (prev.length === 0 ? [initialSample] : prev));
+    }
+
+    const unsub = subscribeMetrics((m) => {
+      const s = createHostSample({
+        timestamp: m.timestamp || new Date().toISOString(),
+        host_cpu: m.host_cpu ?? 0,
+        host_mem_used: m.host_mem_used ?? 0,
+        host_mem_total: m.host_mem_total ?? 0,
+      });
+      setLiveMetrics((prev) => {
+        const next = [...prev, s];
+        return next.length > 30 ? next.slice(-30) : next;
+      });
+    });
+
+    return () => unsub();
+  }, [status?.daemon_connected]);
 
   return (
     <div className="space-y-6">
@@ -104,7 +160,7 @@ export function DashboardView({
                 </span>
               </div>
               <p className="text-xs text-geist-secondary">
-                actr orchestrator v{status?.version || '0.1.0'}
+                actr orchestrator {formatAppVersion(status?.version).display}
               </p>
               <p className="text-[11px] text-geist-faint font-mono">
                 Uptime: {formatDuration(status?.uptime_seconds || 0)}
@@ -112,17 +168,9 @@ export function DashboardView({
             </div>
           </div>
 
-          <div className="pt-3 border-t border-geist-hairline/60">
-            <Button
-              variant={status?.daemon_connected ? 'outline' : 'default'}
-              size="sm"
-              onClick={onToggleService}
-              disabled={serviceActionLoading || !status}
-              className="w-full text-xs h-8 gap-1.5 justify-center"
-            >
-              <Power className="w-3.5 h-3.5" />
-              <span>{status?.daemon_connected ? 'Stop Daemon Service' : 'Start Daemon Service'}</span>
-            </Button>
+          <div className="pt-3 border-t border-geist-hairline/60 flex items-center justify-between text-xs font-mono text-geist-faint">
+            <span>Daemon Control</span>
+            <span className="text-geist-secondary">Sidebar Action</span>
           </div>
         </div>
 
@@ -145,8 +193,10 @@ export function DashboardView({
           <div className="space-y-2 pt-3 border-t border-geist-hairline/60">
             <div className="w-full bg-geist-elevated h-2 rounded-full overflow-hidden border border-geist-hairline">
               <div
-                className="bg-geist-blue h-full transition-all duration-500 rounded-full"
-                style={{ width: `${Math.min(status?.host_cpu || 0, 100)}%` }}
+                className={cn(
+                  'bg-geist-blue h-full transition-all duration-500 rounded-full',
+                  getProgressWidthClass(status?.host_cpu || 0)
+                )}
               />
             </div>
             <div className="flex items-center justify-between text-[11px] font-mono text-geist-faint">
@@ -177,8 +227,10 @@ export function DashboardView({
           <div className="space-y-2 pt-3 border-t border-geist-hairline/60">
             <div className="w-full bg-geist-elevated h-2 rounded-full overflow-hidden border border-geist-hairline">
               <div
-                className="bg-status-success-solid h-full transition-all duration-500 rounded-full"
-                style={{ width: `${memPercent}%` }}
+                className={cn(
+                  'bg-status-success-solid h-full transition-all duration-500 rounded-full',
+                  getProgressWidthClass(memPercent)
+                )}
               />
             </div>
             <div className="flex items-center justify-between text-[11px] font-mono text-geist-faint">
@@ -189,6 +241,14 @@ export function DashboardView({
         </div>
       </div>
 
+      {/* Live Host Vitals Real-Time Area Chart */}
+      <VitalsAreaChart
+        data={liveMetrics}
+        height={200}
+        title="Live Host Node Vitals"
+        description="Streaming real-time host telemetry via 1s Server-Sent Events"
+      />
+
       {/* Summary KPI Strip */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <div className="p-3 rounded-geist bg-geist-surface/70 border border-geist-hairline flex items-center justify-between">
@@ -197,7 +257,7 @@ export function DashboardView({
               Active Jobs
             </div>
             <div className="text-xl font-bold font-mono text-white">
-              {status?.active_jobs ?? activeRuns.length}
+              {Math.max(status?.active_jobs ?? 0, activeRuns.length)}
             </div>
           </div>
           <Activity className="w-5 h-5 text-status-warning-text opacity-70" />

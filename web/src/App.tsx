@@ -5,7 +5,6 @@ import {
   History,
   KeyRound,
   Terminal,
-  Activity,
   Cpu,
   HardDrive,
   RefreshCw,
@@ -13,6 +12,7 @@ import {
   ChevronRight,
   Clock,
   AlertCircle,
+  Menu,
 } from 'lucide-react';
 import {
   fetchStatus,
@@ -28,7 +28,7 @@ import {
 } from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { cn, formatBytes, formatDuration } from '@/lib/utils';
+import { cn, formatBytes, formatDuration, formatAppVersion } from '@/lib/utils';
 import {
   DashboardView,
   RunnersView,
@@ -54,6 +54,15 @@ export default function App() {
   const [runs, setRuns] = useState<RunRecord[]>([]);
   const [secrets, setSecrets] = useState<SecretMetadata[]>([]);
   const [serviceActionLoading, setServiceActionLoading] = useState(false);
+  const [showStopModal, setShowStopModal] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+
+  const totalRunners = runners.length || status?.total_runners || 0;
+  const activeJobsCount = Math.max(
+    status?.active_jobs || 0,
+    runs.filter((r) => r.status === 'running' || r.status === 'in_progress').length
+  );
+  const versionInfo = formatAppVersion(status?.version);
 
   const loadStatus = useCallback(async () => {
     try {
@@ -139,31 +148,52 @@ export default function App() {
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-geist-canvas text-geist-ink font-sans selection:bg-[#0070f3]/25 selection:text-white">
+      {/* Mobile Backdrop */}
+      {mobileNavOpen && (
+        <div
+          onClick={() => setMobileNavOpen(false)}
+          className="fixed inset-0 bg-black/60 z-20 md:hidden backdrop-blur-sm"
+        />
+      )}
+
       {/* Sidebar Navigation */}
-      <aside className="w-64 flex-shrink-0 flex flex-col justify-between border-r border-geist-hairline bg-geist-surface select-none">
+      <aside
+        className={cn(
+          'w-64 flex-shrink-0 flex flex-col justify-between border-r border-geist-hairline bg-geist-surface select-none z-30 transition-transform duration-200 ease-in-out',
+          'fixed md:relative inset-y-0 left-0',
+          mobileNavOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'
+        )}
+      >
         {/* Brand & App Identity */}
         <div>
           <div className="h-14 flex items-center justify-between px-4 border-b border-geist-hairline">
-            <div className="flex items-center gap-2.5">
-              <div className="w-7 h-7 rounded-geist bg-[#ededed] text-[#0a0a0a] flex items-center justify-center font-mono font-bold text-sm tracking-tight shadow-sm">
-                a
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="w-7 h-7 rounded-[6px] bg-gradient-to-b from-[#242424] to-[#121212] border border-geist-borderHover/80 flex items-center justify-center shadow-sm flex-shrink-0">
+                <Terminal className="w-3.5 h-3.5 text-white" />
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1.5 min-w-0">
                 <span className="font-semibold text-sm tracking-tight text-white">actr</span>
-                <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-geist-hover text-geist-faint border border-geist-hairline">
+                <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-geist-hover text-geist-secondary border border-geist-hairline flex-shrink-0">
                   web
                 </span>
               </div>
             </div>
-            <Badge variant="outline" className="font-mono text-[10px] text-geist-secondary px-1.5 py-0">
-              {status?.version || 'dev'}
+            <Badge
+              variant="outline"
+              className="font-mono text-[11px] text-geist-secondary px-2 py-0.5 whitespace-nowrap flex-shrink-0"
+              title={`actr version: ${versionInfo.full}`}
+            >
+              {versionInfo.display}
             </Badge>
           </div>
 
           {/* Navigation Links */}
           <nav className="p-3 space-y-1">
             <button
-              onClick={() => setActiveTab('dashboard')}
+              onClick={() => {
+                setActiveTab('dashboard');
+                setMobileNavOpen(false);
+              }}
               className={cn(
                 'w-full flex items-center gap-2.5 px-3 py-2 rounded-geist text-xs font-medium transition-colors duration-150 cursor-pointer',
                 activeTab === 'dashboard'
@@ -176,7 +206,10 @@ export default function App() {
             </button>
 
             <button
-              onClick={() => setActiveTab('runners')}
+              onClick={() => {
+                setActiveTab('runners');
+                setMobileNavOpen(false);
+              }}
               className={cn(
                 'w-full flex items-center justify-between px-3 py-2 rounded-geist text-xs font-medium transition-colors duration-150 cursor-pointer',
                 activeTab === 'runners'
@@ -188,15 +221,18 @@ export default function App() {
                 <Server className="w-4 h-4 text-geist-secondary" />
                 <span>Runners</span>
               </div>
-              {status?.total_runners !== undefined && (
+              {totalRunners > 0 && (
                 <span className="font-mono text-[10px] text-geist-faint">
-                  {status.total_runners}
+                  {totalRunners}
                 </span>
               )}
             </button>
 
             <button
-              onClick={() => setActiveTab('history')}
+              onClick={() => {
+                setActiveTab('history');
+                setMobileNavOpen(false);
+              }}
               className={cn(
                 'w-full flex items-center justify-between px-3 py-2 rounded-geist text-xs font-medium transition-colors duration-150 cursor-pointer',
                 activeTab === 'history'
@@ -208,13 +244,16 @@ export default function App() {
                 <History className="w-4 h-4 text-geist-secondary" />
                 <span>History</span>
               </div>
-              {status?.active_jobs ? (
+              {activeJobsCount > 0 ? (
                 <span className="w-2 h-2 rounded-full bg-status-warning-solid animate-pulse" />
               ) : null}
             </button>
 
             <button
-              onClick={() => setActiveTab('secrets')}
+              onClick={() => {
+                setActiveTab('secrets');
+                setMobileNavOpen(false);
+              }}
               className={cn(
                 'w-full flex items-center gap-2.5 px-3 py-2 rounded-geist text-xs font-medium transition-colors duration-150 cursor-pointer',
                 activeTab === 'secrets'
@@ -228,7 +267,10 @@ export default function App() {
 
             {activeRunId && (
               <button
-                onClick={() => setActiveTab('run-detail')}
+                onClick={() => {
+                  setActiveTab('run-detail');
+                  setMobileNavOpen(false);
+                }}
                 className={cn(
                   'w-full flex items-center justify-between px-3 py-2 rounded-geist text-xs font-medium transition-colors duration-150 cursor-pointer',
                   activeTab === 'run-detail'
@@ -271,9 +313,16 @@ export default function App() {
             <Button
               variant="outline"
               size="sm"
-              onClick={handleToggleService}
+              onClick={() => {
+                if (status?.daemon_connected) {
+                  setShowStopModal(true);
+                } else {
+                  handleToggleService();
+                }
+              }}
               disabled={serviceActionLoading || !status}
-              className="w-full text-xs h-7 gap-1.5 justify-center"
+              className="w-full text-xs h-8 gap-1.5 justify-center"
+              aria-label={status?.daemon_connected ? 'Stop Daemon Service' : 'Start Daemon Service'}
             >
               <Power className="w-3.5 h-3.5" />
               <span>{status?.daemon_connected ? 'Stop Service' : 'Start Service'}</span>
@@ -287,13 +336,21 @@ export default function App() {
         {/* Top Navbar */}
         <header className="h-14 flex items-center justify-between px-6 border-b border-geist-hairline bg-geist-surface/50 backdrop-blur select-none">
           <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={() => setMobileNavOpen(true)}
+              className="md:hidden text-geist-secondary hover:text-white p-1 rounded hover:bg-geist-hover cursor-pointer"
+              aria-label="Open navigation menu"
+            >
+              <Menu className="w-5 h-5" />
+            </button>
             <h1 className="text-sm font-semibold capitalize text-white">
               {activeTab === 'run-detail' ? `Run Detail (${activeRunId?.slice(0, 8)})` : activeTab}
             </h1>
             {activeTab === 'dashboard' && (
-              <Badge variant="outline" className="text-[11px] gap-1 font-mono text-geist-secondary">
-                <Activity className="w-3 h-3 text-geist-blue" />
-                Live Vitals
+              <Badge variant="outline" className="text-[11px] gap-1.5 font-mono text-status-success-solid border-status-success-border bg-status-success-bg/20">
+                <span className="w-1.5 h-1.5 rounded-full bg-status-success-solid animate-pulse" />
+                Live Vitals (1s)
               </Badge>
             )}
           </div>
@@ -395,12 +452,58 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-3 text-[11px] text-geist-faint">
-            <span>Jobs: {status?.active_jobs || 0} active</span>
+            <span>Jobs: {activeJobsCount} active</span>
             <span className="text-geist-hairline">|</span>
             <span>Refreshed: {lastRefreshed.toLocaleTimeString()}</span>
           </div>
         </footer>
       </main>
+
+      {/* Stop Daemon Confirmation Modal */}
+      {showStopModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-150">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="stop-daemon-title"
+            className="w-full max-w-sm rounded-geist bg-geist-surface border border-status-danger-border shadow-2xl p-5 space-y-4 animate-in zoom-in-95 duration-150"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center gap-2.5 text-status-danger-text">
+              <AlertCircle className="w-5 h-5 flex-shrink-0" />
+              <h3 id="stop-daemon-title" className="text-sm font-semibold text-white">
+                Stop actr Daemon?
+              </h3>
+            </div>
+            <p className="text-xs text-geist-secondary leading-relaxed">
+              This will stop the local actr daemon service. Any active runner jobs and live log streams will be interrupted.
+            </p>
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-geist-hairline">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setShowStopModal(false)}
+                className="h-8 text-xs px-3"
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                size="sm"
+                onClick={() => {
+                  setShowStopModal(false);
+                  handleToggleService();
+                }}
+                disabled={serviceActionLoading}
+                className="h-8 text-xs px-3 gap-1.5"
+              >
+                <Power className="w-3.5 h-3.5" />
+                <span>Stop Service</span>
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

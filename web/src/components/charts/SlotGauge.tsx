@@ -67,7 +67,7 @@ export function SlotGauge({
       )}
 
       {/* Radial Ring */}
-      <div className="relative flex items-center justify-center" style={{ width: size, height: size }}>
+      <div className="w-32 h-32 relative flex items-center justify-center">
         <svg
           width={size}
           height={size}
@@ -95,9 +95,7 @@ export function SlotGauge({
             strokeDasharray={circumference}
             strokeDashoffset={strokeDashoffset}
             strokeLinecap="round"
-            style={{
-              transition: 'stroke-dashoffset 0.6s cubic-bezier(0.16, 1, 0.3, 1), stroke 0.3s ease',
-            }}
+            className="transition-all duration-500 ease-out"
           />
         </svg>
 
@@ -116,8 +114,14 @@ export function SlotGauge({
             slots
           </span>
           <span
-            className="text-[11px] font-mono font-medium mt-0.5 transition-colors duration-300"
-            style={{ color: statusColor }}
+            className={cn(
+              'text-[11px] font-mono font-medium mt-0.5 transition-colors duration-300',
+              percentage >= 100
+                ? 'text-status-danger-solid'
+                : percentage >= 75
+                ? 'text-status-warning-solid'
+                : 'text-status-success-solid'
+            )}
           >
             {percentage}%
           </span>
@@ -130,9 +134,12 @@ export function SlotGauge({
           <span
             className={cn(
               'w-1.5 h-1.5 rounded-full',
-              percentage >= 100 && 'animate-ping'
+              percentage >= 100
+                ? 'bg-status-danger-solid animate-ping'
+                : percentage >= 75
+                ? 'bg-status-warning-solid'
+                : 'bg-status-success-solid'
             )}
-            style={{ backgroundColor: statusColor }}
           />
           {statusText}
         </Badge>

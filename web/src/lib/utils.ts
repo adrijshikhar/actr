@@ -38,3 +38,47 @@ export function formatRelativeTime(dateStr: string): string {
   const diffDays = Math.floor(diffHour / 24);
   return `${diffDays}d ago`;
 }
+
+export function formatAppVersion(raw?: string): { display: string; full: string } {
+  if (!raw || raw === 'dev') return { display: 'v0.2.0-dev', full: raw || 'dev' };
+  let clean = raw;
+  while (clean.startsWith('vv')) {
+    clean = clean.slice(1);
+  }
+  const match = clean.match(/^(v\d+\.\d+\.\d+)/);
+  if (match) {
+    const isDirty = clean.includes('dirty');
+    const isAhead = clean.includes('-g') || clean.split('-').length > 2;
+    const display = (isDirty || isAhead) ? `${match[1]}-dev` : match[1];
+    return {
+      display,
+      full: clean,
+    };
+  }
+  return { display: clean.length > 10 ? `${clean.slice(0, 8)}…` : clean, full: clean };
+}
+
+export function getProgressWidthClass(percent: number): string {
+  const clamped = Math.max(0, Math.min(100, Math.round(percent)));
+  if (clamped <= 0) return 'w-0';
+  if (clamped <= 5) return 'w-[5%]';
+  if (clamped <= 10) return 'w-[10%]';
+  if (clamped <= 15) return 'w-[15%]';
+  if (clamped <= 20) return 'w-[20%]';
+  if (clamped <= 25) return 'w-[25%]';
+  if (clamped <= 30) return 'w-[30%]';
+  if (clamped <= 35) return 'w-[35%]';
+  if (clamped <= 40) return 'w-[40%]';
+  if (clamped <= 45) return 'w-[45%]';
+  if (clamped <= 50) return 'w-[50%]';
+  if (clamped <= 55) return 'w-[55%]';
+  if (clamped <= 60) return 'w-[60%]';
+  if (clamped <= 65) return 'w-[65%]';
+  if (clamped <= 70) return 'w-[70%]';
+  if (clamped <= 75) return 'w-[75%]';
+  if (clamped <= 80) return 'w-[80%]';
+  if (clamped <= 85) return 'w-[85%]';
+  if (clamped <= 90) return 'w-[90%]';
+  if (clamped <= 95) return 'w-[95%]';
+  return 'w-full';
+}

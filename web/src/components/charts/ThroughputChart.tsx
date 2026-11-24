@@ -125,6 +125,7 @@ export function ThroughputChart({
   const reactId = useId().replace(/:/g, '');
   const diskGradientId = `throughput-disk-${reactId}`;
   const netGradientId = `throughput-net-${reactId}`;
+  const heightClass = height <= 200 ? 'h-52' : 'h-60';
 
   const chartData = useMemo<ProcessedThroughputPoint[]>(() => {
     if (!data || data.length === 0) return [];
@@ -193,10 +194,7 @@ export function ThroughputChart({
       </div>
 
       {chartData.length === 0 ? (
-        <div
-          className="flex flex-col items-center justify-center text-center rounded-geist bg-geist-canvas border border-geist-hairlineSoft select-none"
-          style={{ height }}
-        >
+        <div className={cn("w-full flex flex-col items-center justify-center text-center rounded-geist bg-geist-canvas border border-geist-hairlineSoft select-none", heightClass)}>
           <HardDrive className="w-7 h-7 text-geist-faint mb-2 opacity-50" />
           <p className="text-xs font-medium text-geist-body">No throughput data recorded</p>
           <p className="text-[11px] text-geist-faint mt-0.5">
@@ -204,7 +202,7 @@ export function ThroughputChart({
           </p>
         </div>
       ) : (
-        <div style={{ width: '100%', height }}>
+        <div className={cn("w-full", heightClass)}>
           <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
             <AreaChart data={chartData} margin={{ top: 10, right: 10, left: -15, bottom: 0 }}>
               <defs>
@@ -265,7 +263,7 @@ export function ThroughputChart({
                 <Legend
                   verticalAlign="top"
                   align="right"
-                  wrapperStyle={{ paddingBottom: '8px', fontSize: '11px', fontFamily: 'Geist Mono, monospace' }}
+                  className="pb-2 text-[11px] font-mono"
                   formatter={(value) => <span className="text-geist-secondary text-[11px]">{value}</span>}
                 />
               )}

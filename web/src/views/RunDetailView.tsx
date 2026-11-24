@@ -520,21 +520,24 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
                 </div>
               )}
 
-              {/* Vitals Area Chart: CPU % and Memory RSS */}
-              <VitalsAreaChart
-                data={metrics}
-                height={240}
-                title="Process & Host Vitals (CPU / Memory)"
-                description="Live sampled CPU percentage and memory resident set size (RSS)"
-              />
+              {/* Charts Grid: Side-by-side on wide screens */}
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                {/* Vitals Area Chart: CPU % and Memory RSS */}
+                <VitalsAreaChart
+                  data={metrics}
+                  height={240}
+                  title="Process & Host Vitals (CPU / Memory)"
+                  description="Live sampled CPU percentage and memory resident set size (RSS)"
+                />
 
-              {/* Throughput Chart: Disk Write & Net RX/TX */}
-              <ThroughputChart
-                data={metrics}
-                height={240}
-                title="I/O & Network Throughput"
-                description="Disk write throughput rate and network interface ingress/egress"
-              />
+                {/* Throughput Chart: Disk Write & Net RX/TX */}
+                <ThroughputChart
+                  data={metrics}
+                  height={240}
+                  title="I/O & Network Throughput"
+                  description="Disk write throughput rate and network interface ingress/egress"
+                />
+              </div>
             </TabsContent>
           </Tabs>
         </div>

@@ -153,6 +153,7 @@ export type RunnerMetrics = TelemetrySample;
 export interface SecretMetadata {
   key: string;
   provider: string;
+  scope?: string;
   updatedAt?: string;
 }
 

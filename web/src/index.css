@@ -20,7 +20,7 @@
     --secondary-foreground: 0 0% 93%;
 
     --muted: 0 0% 10%; /* #1a1a1a Vercel Muted Track */
-    --muted-foreground: 0 0% 63%; /* #a1a1a1 Vercel Muted Text */
+    --muted-foreground: 0 0% 65%; /* #a6a6a6 Vercel Muted Text (passes WCAG AA) */
 
     --accent: 0 0% 10%; /* #1a1a1a Vercel Hover */
     --accent-foreground: 0 0% 98%;
@@ -28,7 +28,7 @@
     --destructive: 358 75% 59%; /* #e5484d Vercel Red */
     --destructive-foreground: 0 0% 98%;
 
-    --border: 0 0% 15%; /* #262626 Hairline Border */
+    --border: 0 0% 19%; /* #303030 Defined Hairline Border */
     --input: 0 0% 15%;
     --ring: 212 100% 48%; /* #0070f3 Vercel Blue Focus Ring */
 

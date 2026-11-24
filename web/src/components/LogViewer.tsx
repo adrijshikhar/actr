@@ -477,10 +477,9 @@ export function LogViewer({
         'rounded-geist bg-geist-surface border border-geist-hairline flex flex-col overflow-hidden font-mono select-text transition-all duration-200',
         isFullscreen
           ? 'fixed inset-0 z-50 rounded-none border-none bg-geist-canvas h-screen w-screen p-4'
-          : '',
+          : 'h-[520px]',
         className
       )}
-      style={!isFullscreen ? { height } : undefined}
     >
       {/* Top Console Toolbar */}
       <div className="h-10 px-3 bg-geist-elevated border-b border-geist-hairline flex items-center justify-between flex-shrink-0 select-none">
@@ -511,10 +510,11 @@ export function LogViewer({
               }
             }}
             className={cn(
-              'h-7 px-2 text-xs text-geist-secondary hover:text-white',
+              'h-8 px-2.5 text-xs text-geist-secondary hover:text-white',
               isSearchOpen && 'bg-geist-hover text-white'
             )}
             title="Search logs (Cmd+F)"
+            aria-label="Search logs"
           >
             <Search className="w-3.5 h-3.5" />
           </Button>
@@ -525,8 +525,9 @@ export function LogViewer({
             size="sm"
             onClick={handleCopy}
             disabled={logs.length === 0}
-            className="h-7 px-2 text-xs text-geist-secondary hover:text-white gap-1"
+            className="h-8 px-2.5 text-xs text-geist-secondary hover:text-white gap-1"
             title="Copy all logs"
+            aria-label="Copy logs to clipboard"
           >
             {copied ? (
               <>
@@ -548,8 +549,9 @@ export function LogViewer({
               size="sm"
               onClick={onClear}
               disabled={logs.length === 0}
-              className="h-7 px-2 text-xs text-geist-secondary hover:text-white"
+              className="h-8 px-2.5 text-xs text-geist-secondary hover:text-white"
               title="Clear output"
+              aria-label="Clear log output"
             >
               <RotateCcw className="w-3.5 h-3.5" />
             </Button>
@@ -560,8 +562,9 @@ export function LogViewer({
             variant="ghost"
             size="sm"
             onClick={() => setIsFullscreen((prev) => !prev)}
-            className="h-7 px-2 text-xs text-geist-secondary hover:text-white"
+            className="h-8 px-2.5 text-xs text-geist-secondary hover:text-white"
             title={isFullscreen ? 'Exit full screen (z / Esc)' : 'Full screen (z)'}
+            aria-label={isFullscreen ? 'Exit full screen' : 'Full screen'}
           >
             {isFullscreen ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
           </Button>
@@ -672,17 +675,12 @@ export function LogViewer({
           </div>
         ) : (
           <div
-            style={{ height: totalHeight, position: 'relative', width: '100%', minWidth: 'max-content' }}
-            className="font-mono text-xs"
+            style={{ height: totalHeight }}
+            className="font-mono text-xs relative w-full min-w-max"
           >
             <div
-              style={{
-                transform: `translateY(${offsetY}px)`,
-                position: 'absolute',
-                top: 0,
-                left: 0,
-                right: 0,
-              }}
+              style={{ transform: `translateY(${offsetY}px)` }}
+              className="absolute inset-x-0 top-0"
             >
               {visibleLines.map(({ index: lineIdx, segments }) => {
                 const isMatch = searchMatches.includes(lineIdx);
@@ -693,9 +691,8 @@ export function LogViewer({
                   <div
                     key={lineIdx}
                     id={`log-line-${lineIdx}`}
-                    style={{ height: LINE_HEIGHT }}
                     className={cn(
-                      'flex items-center hover:bg-geist-hover/60 transition-colors duration-75 text-[12px] leading-[24px]',
+                      'h-6 leading-6 flex items-center hover:bg-geist-hover/60 transition-colors duration-75 text-[12px]',
                       isCurrentMatch && 'bg-status-warning-bg/40',
                       isMatch && !isCurrentMatch && 'bg-status-warning-bg/15'
                     )}
@@ -708,7 +705,7 @@ export function LogViewer({
                     )}
 
                     {/* Line Text Content */}
-                    <div className="pl-3 pr-2 whitespace-pre flex-1 font-mono text-geist-ink">
+                    <div className="pl-3 pr-2 whitespace-pre flex-1 font-mono text-geist-ink flex items-center">
                       {segments.map((seg, segIdx) => (
                         <React.Fragment key={segIdx}>
                           {renderHighlightedText(seg.text, searchQuery, seg.style)}
@@ -726,9 +723,10 @@ export function LogViewer({
         {!isStickyPinned && logs.length > 10 && (
           <button
             onClick={scrollToBottom}
-            className="sticky bottom-2 ml-auto mr-2 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-geist-elevated/90 hover:bg-geist-hover border border-geist-hairline text-white text-[11px] font-sans font-medium shadow-xl backdrop-blur transition-all duration-150 cursor-pointer"
+            className="sticky bottom-2 ml-auto mr-2 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-geist-elevated/90 hover:bg-geist-hover border border-geist-hairline text-white text-[11px] font-sans font-medium shadow-xl backdrop-blur transition-all duration-150 cursor-pointer group"
+            aria-label="Resume autoscroll to bottom"
           >
-            <ArrowDown className="w-3.5 h-3.5 text-geist-blue animate-bounce" />
+            <ArrowDown className="w-3.5 h-3.5 text-geist-blue transition-transform duration-200 group-hover:translate-y-0.5" />
             <span>Resume autoscroll</span>
           </button>
         )}

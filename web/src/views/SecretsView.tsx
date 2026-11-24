@@ -219,6 +219,7 @@ export function SecretsView({
               <thead>
                 <tr className="border-b border-geist-hairline bg-geist-elevated/40 text-[11px] text-geist-faint font-mono uppercase tracking-wider">
                   <th className="py-2.5 px-4 font-medium">Secret Key</th>
+                  <th className="py-2.5 px-4 font-medium">Scope</th>
                   <th className="py-2.5 px-4 font-medium">Provider</th>
                   <th className="py-2.5 px-4 font-medium">Encryption</th>
                   <th className="py-2.5 px-4 font-medium">Updated</th>
@@ -238,14 +239,27 @@ export function SecretsView({
                       </div>
                     </td>
 
+                    <td className="py-3 px-4 whitespace-nowrap">
+                      <span
+                        className={cn(
+                          'px-2 py-0.5 rounded text-[11px] font-mono border',
+                          sec.scope?.startsWith('repo:')
+                            ? 'bg-geist-blue/15 text-geist-blueText border-geist-blue/30'
+                            : 'bg-geist-elevated text-geist-secondary border-geist-hairline'
+                        )}
+                      >
+                        {sec.scope || 'global'}
+                      </span>
+                    </td>
+
                     <td className="py-3 px-4 whitespace-nowrap text-geist-secondary">
-                      <span className="px-1.5 py-0.5 rounded bg-geist-elevated text-geist-secondary border border-geist-hairline text-[11px]">
+                      <span className="px-2 py-0.5 rounded bg-geist-elevated text-geist-secondary border border-geist-hairline text-[11px]">
                         {sec.provider || 'local-vault'}
                       </span>
                     </td>
 
                     <td className="py-3 px-4 whitespace-nowrap">
-                      <Badge variant="outline" className="font-mono text-[10px] text-geist-faint">
+                      <Badge variant="outline" className="font-mono text-[11px] px-2 py-0.5 text-geist-faint">
                         AES-256-GCM
                       </Badge>
                     </td>
@@ -259,8 +273,9 @@ export function SecretsView({
                         variant="ghost"
                         size="sm"
                         onClick={() => setDeleteTargetKey(sec.key)}
-                        className="h-7 w-7 p-0 text-geist-faint hover:text-status-danger-text hover:bg-status-danger-bg"
+                        className="h-8 w-8 p-0 text-geist-faint hover:text-status-danger-text hover:bg-status-danger-bg"
                         title={`Delete ${sec.key}`}
+                        aria-label={`Delete secret ${sec.key}`}
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </Button>
@@ -277,17 +292,24 @@ export function SecretsView({
       {isAddOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm animate-in fade-in duration-150">
           <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="add-secret-title"
             className="w-full max-w-md rounded-geist bg-geist-surface border border-geist-hairline shadow-2xl p-6 space-y-4 animate-in zoom-in-95 duration-150"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between pb-3 border-b border-geist-hairline">
               <div className="flex items-center gap-2">
                 <Shield className="w-4 h-4 text-geist-blue" />
-                <h3 className="text-sm font-semibold text-white">Add Encrypted Secret</h3>
+                <h3 id="add-secret-title" className="text-sm font-semibold text-white">
+                  Add Encrypted Secret
+                </h3>
               </div>
               <button
+                type="button"
                 onClick={() => setIsAddOpen(false)}
-                className="text-geist-faint hover:text-white text-xs font-mono"
+                className="text-geist-faint hover:text-white text-xs font-mono p-1"
+                aria-label="Close dialog"
               >
                 ✕
               </button>
@@ -296,10 +318,11 @@ export function SecretsView({
             <form onSubmit={handleAddSecret} className="space-y-4">
               {/* Secret Key */}
               <div className="space-y-1">
-                <label className="text-xs font-medium text-geist-secondary block">
+                <label htmlFor="secret-key-input" className="text-xs font-medium text-geist-secondary block">
                   Key Name <span className="text-status-danger-text">*</span>
                 </label>
                 <input
+                  id="secret-key-input"
                   type="text"
                   required
                   value={newKey}
@@ -312,11 +335,12 @@ export function SecretsView({
 
               {/* Secret Value */}
               <div className="space-y-1">
-                <label className="text-xs font-medium text-geist-secondary block">
+                <label htmlFor="secret-value-input" className="text-xs font-medium text-geist-secondary block">
                   Secret Value <span className="text-status-danger-text">*</span>
                 </label>
                 <div className="relative">
                   <input
+                    id="secret-value-input"
                     type={showValue ? 'text' : 'password'}
                     required
                     value={newValue}
@@ -328,6 +352,7 @@ export function SecretsView({
                     type="button"
                     onClick={() => setShowValue((prev) => !prev)}
                     className="absolute right-2.5 top-1/2 -translate-y-1/2 text-geist-faint hover:text-white"
+                    aria-label="Toggle secret visibility"
                   >
                     {showValue ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
                   </button>
@@ -367,10 +392,11 @@ export function SecretsView({
 
               {newScope === 'repo' && (
                 <div className="space-y-1 animate-in fade-in duration-100">
-                  <label className="text-xs font-medium text-geist-secondary block">
+                  <label htmlFor="secret-repo-input" className="text-xs font-medium text-geist-secondary block">
                     Target Repository
                   </label>
                   <input
+                    id="secret-repo-input"
                     type="text"
                     value={newRepo}
                     onChange={(e) => setNewRepo(e.target.value)}
@@ -411,12 +437,15 @@ export function SecretsView({
       {deleteTargetKey && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm animate-in fade-in duration-150">
           <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-secret-title"
             className="w-full max-w-sm rounded-geist bg-geist-surface border border-status-danger-border shadow-2xl p-5 space-y-4 animate-in zoom-in-95 duration-150"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center gap-2.5 text-status-danger-text">
               <AlertCircle className="w-5 h-5 flex-shrink-0" />
-              <h3 className="text-sm font-semibold">Delete Secret</h3>
+              <h3 id="delete-secret-title" className="text-sm font-semibold">Delete Secret</h3>
             </div>
 
             <p className="text-xs text-geist-secondary leading-relaxed">
