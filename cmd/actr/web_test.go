@@ -51,6 +51,10 @@ func TestWebCmd_Flags(t *testing.T) {
 	require.NotNil(t, sockFlag, "sock flag should exist")
 	assert.Equal(t, "", sockFlag.DefValue)
 
+	demoFlag := cmd.Flag("demo")
+	require.NotNil(t, demoFlag, "demo flag should exist")
+	assert.Equal(t, "false", demoFlag.DefValue)
+
 	// Check subcommands
 	subCmds := make(map[string]bool)
 	for _, c := range cmd.Commands() {
@@ -78,6 +82,7 @@ func TestWebCmd_Help(t *testing.T) {
 	assert.Contains(t, out, "--dev")
 	assert.Contains(t, out, "--no-open")
 	assert.Contains(t, out, "--foreground")
+	assert.Contains(t, out, "--demo")
 	assert.Contains(t, out, "--config-dir")
 	assert.Contains(t, out, "--sock")
 	assert.Contains(t, out, "18490")

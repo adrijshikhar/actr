@@ -12,10 +12,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/adrijshikhar/actr/internal/config"
+	"github.com/adrijshikhar/actr/internal/demo"
 	"github.com/adrijshikhar/actr/internal/engine"
 	"github.com/adrijshikhar/actr/internal/history"
 	"github.com/adrijshikhar/actr/internal/logger"
@@ -119,6 +121,7 @@ func newWebCmd() *cobra.Command {
 		devMode       bool
 		noOpen        bool
 		foreground    bool
+		demoMode      bool
 		configDirFlag string
 		sockPath      string
 	)
@@ -135,15 +138,16 @@ To view or control the server, use:
 
 Examples:
   actr web
+  actr web --demo
   actr web --no-open
   actr web --port 18490
   actr web --foreground`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfgDir := resolveConfigDir(configDirFlag, cmd.Flags().Changed("config-dir"))
 			if foreground {
-				return runWebForeground(cmd, port, devMode, noOpen, cfgDir, sockPath)
+				return runWebForeground(cmd, port, devMode, noOpen, demoMode, cfgDir, sockPath)
 			}
-			return startWebBackground(cmd, port, devMode, noOpen, cfgDir, sockPath)
+			return startWebBackground(cmd, port, devMode, noOpen, demoMode, cfgDir, sockPath)
 		},
 	}
 
@@ -151,6 +155,7 @@ Examples:
 	cmd.Flags().BoolVar(&devMode, "dev", false, "run in development proxy mode")
 	cmd.Flags().BoolVar(&noOpen, "no-open", false, "do not open browser automatically")
 	cmd.Flags().BoolVarP(&foreground, "foreground", "f", false, "run in foreground attached to terminal")
+	cmd.Flags().BoolVar(&demoMode, "demo", false, "run web dashboard with simulated live workflow execution and telemetry")
 	cmd.Flags().StringVar(&configDirFlag, "config-dir", config.DefaultConfigDir(), "path to directory containing runner configuration and daemon socket")
 	cmd.Flags().StringVar(&sockPath, "sock", "", "path to daemon unix socket")
 
@@ -172,6 +177,7 @@ func newWebStartCmd() *cobra.Command {
 		devMode       bool
 		noOpen        bool
 		foreground    bool
+		demoMode      bool
 		configDirFlag string
 		sockPath      string
 	)
@@ -182,9 +188,9 @@ func newWebStartCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfgDir := resolveConfigDir(configDirFlag, cmd.Flags().Changed("config-dir"))
 			if foreground {
-				return runWebForeground(cmd, port, devMode, noOpen, cfgDir, sockPath)
+				return runWebForeground(cmd, port, devMode, noOpen, demoMode, cfgDir, sockPath)
 			}
-			return startWebBackground(cmd, port, devMode, noOpen, cfgDir, sockPath)
+			return startWebBackground(cmd, port, devMode, noOpen, demoMode, cfgDir, sockPath)
 		},
 	}
 
@@ -192,6 +198,7 @@ func newWebStartCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&devMode, "dev", false, "run in development proxy mode")
 	cmd.Flags().BoolVar(&noOpen, "no-open", false, "do not open browser automatically")
 	cmd.Flags().BoolVarP(&foreground, "foreground", "f", false, "run in foreground attached to terminal")
+	cmd.Flags().BoolVar(&demoMode, "demo", false, "run web dashboard with simulated live workflow execution and telemetry")
 	cmd.Flags().StringVar(&configDirFlag, "config-dir", config.DefaultConfigDir(), "path to directory containing runner configuration and daemon socket")
 	cmd.Flags().StringVar(&sockPath, "sock", "", "path to daemon unix socket")
 
@@ -263,7 +270,7 @@ func newWebStatusCmd() *cobra.Command {
 	return cmd
 }
 
-func startWebBackground(cmd *cobra.Command, port int, devMode, noOpen bool, cfgDir, sockPath string) error {
+func startWebBackground(cmd *cobra.Command, port int, devMode, noOpen, demoMode bool, cfgDir, sockPath string) error {
 	// 1. Check if already running
 	if info, err := readWebPID(cfgDir); err == nil {
 		if isProcessAlive(info.PID) {
@@ -290,6 +297,9 @@ func startWebBackground(cmd *cobra.Command, port int, devMode, noOpen bool, cfgD
 	args := []string{"web", "--foreground", "--port", strconv.Itoa(port), "--no-open"}
 	if devMode {
 		args = append(args, "--dev")
+	}
+	if demoMode {
+		args = append(args, "--demo")
 	}
 	if cfgDir != "" {
 		args = append(args, "--config-dir", cfgDir)
@@ -367,7 +377,7 @@ func startWebBackground(cmd *cobra.Command, port int, devMode, noOpen bool, cfgD
 	return nil
 }
 
-func runWebForeground(cmd *cobra.Command, port int, devMode, noOpen bool, cfgDir, sockPath string) error {
+func runWebForeground(cmd *cobra.Command, port int, devMode, noOpen, demoMode bool, cfgDir, sockPath string) error {
 	if info, err := readWebPID(cfgDir); err == nil && isProcessAlive(info.PID) {
 		return fmt.Errorf("actr web dashboard is already running at http://127.0.0.1:%d (PID %d)", info.Port, info.PID)
 	}
@@ -380,41 +390,101 @@ func runWebForeground(cmd *cobra.Command, port int, devMode, noOpen bool, cfgDir
 		Version:   GetVersion(),
 	}
 
-	// 1. History RunStore
-	dbPath := filepath.Join(cfgDir, "history.db")
-	if store, err := history.NewSQLiteStore(dbPath); err == nil && store != nil {
-		defer func() { _ = store.Close() }()
-		serverCfg.RunStore = newHistoryRunStoreAdapter(store)
-	}
-
-	// 2. SecretManager & Masker
 	masker := engine.NewSecretMasker()
-	if vProvider, err := resolveVaultForDir(cfgDir); err == nil && vProvider != nil {
-		serverCfg.SecretManager = &vaultSecretManagerAdapter{provider: vProvider}
-		if secList, err := vProvider.List(cmd.Context()); err == nil {
-			for _, sec := range secList {
-				if val, err := vProvider.Get(cmd.Context(), sec.Key); err == nil && val != "" {
-					masker.AddMask(val)
-				}
-			}
-		}
-	}
-	serverCfg.Masker = masker
 
-	// 3. Monitor Client (EventSubscriber & MetricsProvider)
-	// Always initialize when sockPath is available because monitor.Client dials lazily on HTTP request
-	if sockPath == "" {
-		sockPath = filepath.Join(cfgDir, "daemon.sock")
-	}
-	if sockPath != "" {
-		mClient := monitor.NewClient(sockPath)
+	var (
+		tmpDemoDir string
+		demoCancel context.CancelFunc
+	)
+	defer func() {
+		if demoCancel != nil {
+			demoCancel()
+		}
+		if tmpDemoDir != "" {
+			_ = os.RemoveAll(tmpDemoDir)
+		}
+	}()
+
+	if demoMode {
+		var err error
+		tmpDemoDir, err = os.MkdirTemp("", "actr-demo-web-*")
+		if err != nil {
+			return fmt.Errorf("create demo temp dir: %w", err)
+		}
+		demoStore, err := history.NewSQLiteStore(filepath.Join(tmpDemoDir, "demo_history.db"))
+		if err != nil {
+			return fmt.Errorf("create demo sqlite store: %w", err)
+		}
+		defer func() { _ = demoStore.Close() }()
+
+		if err := demo.SeedHistoryStore(demoStore); err != nil {
+			return fmt.Errorf("seed demo history store: %w", err)
+		}
+		hAdapter := newHistoryRunStoreAdapter(demoStore)
+		hAdapter.demoMode = true
+		serverCfg.RunStore = hAdapter
+
+		tmpSock := filepath.Join(os.TempDir(), fmt.Sprintf("actr-demo-web-%d.sock", os.Getpid()))
+		var demoCtx context.Context
+		demoCtx, demoCancel = context.WithCancel(cmd.Context())
+
+		demoServer, err := demo.StartServerWithStore(demoCtx, tmpSock, demoStore)
+		if err != nil {
+			return fmt.Errorf("start demo monitor server: %w", err)
+		}
+		defer func() {
+			_ = demoServer.Stop()
+			_ = os.Remove(tmpSock)
+		}()
+
+		mClient := monitor.NewClient(tmpSock)
 		mAdapter := &monitorClientAdapter{client: mClient}
 		serverCfg.EventSubscriber = mAdapter
 		serverCfg.MetricsProvider = mAdapter
-	}
 
-	// 4. DaemonController
-	serverCfg.DaemonController = &serviceDaemonController{}
+		serverCfg.RunnerProvider = &demoRunnerProvider{}
+		demoSecMgr := newDemoSecretManager()
+		serverCfg.SecretManager = demoSecMgr
+		for _, sec := range demoSecMgr.listSecretsInternal() {
+			masker.AddMask(sec.Value)
+		}
+		serverCfg.DaemonController = &demoDaemonController{status: "running"}
+	} else {
+		// 1. History RunStore
+		dbPath := filepath.Join(cfgDir, "history.db")
+		if store, err := history.NewSQLiteStore(dbPath); err == nil && store != nil {
+			defer func() { _ = store.Close() }()
+			serverCfg.RunStore = newHistoryRunStoreAdapter(store)
+		}
+
+		// 2. SecretManager & Masker
+		if vProvider, err := resolveVaultForDir(cfgDir); err == nil && vProvider != nil {
+			serverCfg.SecretManager = &vaultSecretManagerAdapter{provider: vProvider}
+			if secList, err := vProvider.List(cmd.Context()); err == nil {
+				for _, sec := range secList {
+					if val, err := vProvider.Get(cmd.Context(), sec.Key); err == nil && val != "" {
+						masker.AddMask(val)
+					}
+				}
+			}
+		}
+
+		// 3. Monitor Client (EventSubscriber & MetricsProvider)
+		// Always initialize when sockPath is available because monitor.Client dials lazily on HTTP request
+		if sockPath == "" {
+			sockPath = filepath.Join(cfgDir, "daemon.sock")
+		}
+		if sockPath != "" {
+			mClient := monitor.NewClient(sockPath)
+			mAdapter := &monitorClientAdapter{client: mClient}
+			serverCfg.EventSubscriber = mAdapter
+			serverCfg.MetricsProvider = mAdapter
+		}
+
+		// 4. DaemonController
+		serverCfg.DaemonController = &serviceDaemonController{}
+	}
+	serverCfg.Masker = masker
 
 	srv := web.NewServer(serverCfg)
 
@@ -485,7 +555,8 @@ func resolveVaultForDir(cfgDir string) (vault.Provider, error) {
 
 // historyRunStoreAdapter adapts *history.SQLiteStore to satisfy web.RunStore.
 type historyRunStoreAdapter struct {
-	store *history.SQLiteStore
+	store    *history.SQLiteStore
+	demoMode bool
 }
 
 var _ web.RunStore = (*historyRunStoreAdapter)(nil)
@@ -566,6 +637,30 @@ func (a *historyRunStoreAdapter) GetStepLogs(ctx context.Context, runID, stepID 
 }
 
 func (a *historyRunStoreAdapter) GetRunMetrics(ctx context.Context, runID string) ([]*monitor.TelemetrySample, error) {
+	if a.demoMode {
+		now := time.Now().UTC()
+		var samples []*monitor.TelemetrySample
+		for i := 20; i >= 0; i-- {
+			t := now.Add(-time.Duration(i*10) * time.Second)
+			factor := float64(20-i) / 20.0
+			cpu := 25.0 + 45.0*factor + float64((i*7)%15)
+			mem := uint64(180*1024*1024) + uint64(factor*float64(120*1024*1024))
+			diskWrite := uint64(2*1024*1024) + uint64((i%4)*1024*1024)
+			diskRead := uint64(5*1024*1024) + uint64((i%3)*2*1024*1024)
+			samples = append(samples, &monitor.TelemetrySample{
+				Timestamp:        t,
+				StepCPU:          cpu,
+				StepRSSBytes:     mem,
+				HostCPU:          cpu,
+				HostMemUsed:      mem,
+				DiskWriteRate:    diskWrite,
+				StepDiskReadRate: diskRead,
+				NetRxRate:        uint64(512 * 1024),
+				NetTxRate:        uint64(128 * 1024),
+			})
+		}
+		return samples, nil
+	}
 	return []*monitor.TelemetrySample{}, nil
 }
 
@@ -628,4 +723,148 @@ func (s *serviceDaemonController) Start() error {
 
 func (s *serviceDaemonController) Stop() error {
 	return service.Stop()
+}
+
+// demoSecretItem holds a demo secret entry.
+type demoSecretItem struct {
+	Key   string
+	Value string
+	Scope string
+}
+
+// demoSecretManager satisfies web.SecretManager with mock secrets.
+type demoSecretManager struct {
+	mu      sync.Mutex
+	secrets map[string]demoSecretItem
+}
+
+var _ web.SecretManager = (*demoSecretManager)(nil)
+
+func newDemoSecretManager() *demoSecretManager {
+	return &demoSecretManager{
+		secrets: map[string]demoSecretItem{
+			"GITHUB_TOKEN": {
+				Key:   "GITHUB_TOKEN",
+				Value: "demo_mock_github_pat_value_unredacted_01",
+				Scope: "repo",
+			},
+			"DOCKER_PASSWORD": {
+				Key:   "DOCKER_PASSWORD",
+				Value: "demo_mock_docker_registry_access_pass_02",
+				Scope: "global",
+			},
+			"NPM_TOKEN": {
+				Key:   "NPM_TOKEN",
+				Value: "demo_mock_npm_registry_publish_token_03",
+				Scope: "global",
+			},
+			"SLACK_WEBHOOK_URL": {
+				Key:   "SLACK_WEBHOOK_URL",
+				Value: "https://hooks.slack.com/services/T00/B00/SECRET",
+				Scope: "alerts",
+			},
+		},
+	}
+}
+
+func (m *demoSecretManager) listSecretsInternal() []demoSecretItem {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var list []demoSecretItem
+	for _, s := range m.secrets {
+		list = append(list, s)
+	}
+	return list
+}
+
+func (m *demoSecretManager) ListSecrets(ctx context.Context) ([]vault.SecretMetadata, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var list []vault.SecretMetadata
+	for _, s := range m.secrets {
+		list = append(list, vault.SecretMetadata{
+			Key:       s.Key,
+			Provider:  "keychain",
+			UpdatedAt: time.Now().Add(-2 * time.Hour).Format(time.RFC3339),
+		})
+	}
+	return list, nil
+}
+
+func (m *demoSecretManager) SetSecret(ctx context.Context, key, val, scope string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.secrets[key] = demoSecretItem{
+		Key:   key,
+		Value: val,
+		Scope: scope,
+	}
+	return nil
+}
+
+func (m *demoSecretManager) DeleteSecret(ctx context.Context, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.secrets[key]; !ok {
+		return vault.ErrSecretNotFound
+	}
+	delete(m.secrets, key)
+	return nil
+}
+
+// demoRunnerProvider satisfies web.RunnerProvider with representative runner topology.
+type demoRunnerProvider struct{}
+
+var _ web.RunnerProvider = (*demoRunnerProvider)(nil)
+
+func (d *demoRunnerProvider) GetRunners(ctx context.Context) ([]web.RunnerInfo, error) {
+	return []web.RunnerInfo{
+		{
+			Repo:           "adrijshikhar/actr",
+			Name:           "actr-runner-darwin-01",
+			Labels:         []string{"self-hosted", "macOS", "ARM64", "actr"},
+			MaxConcurrency: 4,
+			ActiveSlots:    2,
+			Status:         "online",
+		},
+		{
+			Repo:           "adrijshikhar/aim",
+			Name:           "aim-runner-linux-02",
+			Labels:         []string{"self-hosted", "Linux", "X64", "docker"},
+			MaxConcurrency: 4,
+			ActiveSlots:    1,
+			Status:         "online",
+		},
+	}, nil
+}
+
+// demoDaemonController satisfies web.DaemonController with interactive state toggle.
+type demoDaemonController struct {
+	mu     sync.Mutex
+	status string
+}
+
+var _ web.DaemonController = (*demoDaemonController)(nil)
+
+func (d *demoDaemonController) Status() (string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.status == "" {
+		d.status = "running"
+	}
+	return d.status, nil
+}
+
+func (d *demoDaemonController) Start() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.status = "running"
+	return nil
+}
+
+func (d *demoDaemonController) Stop() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.status = "stopped"
+	return nil
 }
