@@ -271,7 +271,7 @@ export function HostVitalsView({
               <Badge
                 variant="outline"
                 className={cn(
-                  'text-[10px] font-mono px-1.5 py-0.5 gap-1 whitespace-nowrap transition-colors',
+                  'text-[11px] font-sans font-medium px-2 py-0.5 gap-1.5 whitespace-nowrap transition-colors',
                   isPaused
                     ? 'text-status-warning-text border-status-warning-border bg-status-warning-bg/20'
                     : streamActive
@@ -315,10 +315,10 @@ export function HostVitalsView({
           </div>
 
           {/* Right: Consolidated Grafana-Style Toolbar (Single Row, Never Wraps) */}
-          <div className="flex items-center gap-1.5 text-xs font-mono flex-shrink-0">
+          <div className="flex items-center gap-1.5 text-xs font-sans flex-shrink-0">
             {/* 1. Time Range / Window Control */}
-            <div className="flex items-center gap-1 bg-geist-canvas border border-geist-hairline rounded px-2 py-1 text-[11px] font-mono tracking-tight text-geist-secondary hover:border-geist-borderHover transition-colors">
-              <Clock className="w-3 h-3 text-geist-faint flex-shrink-0" />
+            <div className="flex items-center gap-1.5 bg-geist-canvas border border-geist-hairline rounded px-2.5 py-1 text-xs font-sans tracking-tight text-geist-secondary hover:border-geist-borderHover transition-colors">
+              <Clock className="w-3.5 h-3.5 text-geist-faint flex-shrink-0" />
               <label htmlFor="time-window-select" className="sr-only">
                 Time Window Range
               </label>
@@ -326,11 +326,11 @@ export function HostVitalsView({
                 id="time-window-select"
                 value={timeWindow}
                 onChange={(e) => setTimeWindow(Number(e.target.value))}
-                className="bg-transparent text-white font-medium text-[11px] font-mono focus:outline-none cursor-pointer pr-0.5"
+                className="bg-transparent text-white font-medium text-xs font-sans focus:outline-none cursor-pointer pr-0.5 tracking-tight"
                 title="Select rolling time window"
               >
                 {TIME_WINDOWS.map((w) => (
-                  <option key={w.value} value={w.value} className="bg-geist-surface text-white">
+                  <option key={w.value} value={w.value} className="bg-geist-surface text-white font-sans text-xs">
                     {w.label}
                   </option>
                 ))}
@@ -345,7 +345,7 @@ export function HostVitalsView({
                 onClick={togglePause}
                 aria-label={isPaused ? 'Resume live metrics stream' : 'Pause metrics stream'}
                 className={cn(
-                  'flex items-center justify-center h-[26px] px-2 border-r border-geist-hairline transition-colors cursor-pointer select-none',
+                  'flex items-center justify-center h-7 px-2.5 border-r border-geist-hairline transition-colors cursor-pointer select-none',
                   isPaused
                     ? 'bg-status-warning-bg/30 text-status-warning-text hover:bg-status-warning-bg/50'
                     : 'text-geist-secondary hover:text-white hover:bg-geist-hover'
@@ -353,14 +353,14 @@ export function HostVitalsView({
                 title={isPaused ? 'Click to resume live stream' : 'Click to freeze graph to inspect points'}
               >
                 {isPaused ? (
-                  <Play className="w-3 h-3 fill-status-warning-text text-status-warning-text" />
+                  <Play className="w-3.5 h-3.5 fill-status-warning-text text-status-warning-text" />
                 ) : (
-                  <Pause className="w-3 h-3 text-geist-secondary" />
+                  <Pause className="w-3.5 h-3.5 text-geist-secondary" />
                 )}
               </button>
 
               {/* Cadence Selector */}
-              <div className="flex items-center px-1.5 h-[26px] text-[11px] font-mono tracking-tight text-geist-secondary hover:border-geist-borderHover transition-colors">
+              <div className="flex items-center px-2 h-7 text-xs font-sans tracking-tight text-geist-secondary hover:border-geist-borderHover transition-colors">
                 <label htmlFor="refresh-cadence-select" className="sr-only">
                   Auto-Refresh Cadence
                 </label>
@@ -369,13 +369,13 @@ export function HostVitalsView({
                   value={refreshCadence}
                   onChange={(e) => handleCadenceChange(e.target.value)}
                   className={cn(
-                    'bg-transparent font-medium text-[11px] font-mono focus:outline-none cursor-pointer pr-0.5',
+                    'bg-transparent font-medium text-xs font-sans focus:outline-none cursor-pointer pr-0.5 tracking-tight',
                     isPaused ? 'text-status-warning-text font-semibold' : 'text-white'
                   )}
                   title="Select auto-refresh interval"
                 >
                   {REFRESH_INTERVALS.map((r) => (
-                    <option key={r.value} value={r.value} className="bg-geist-surface text-white">
+                    <option key={r.value} value={r.value} className="bg-geist-surface text-white font-sans text-xs">
                       {r.label}
                     </option>
                   ))}
@@ -387,11 +387,11 @@ export function HostVitalsView({
                 type="button"
                 onClick={handleManualPoll}
                 disabled={isPolling}
-                className="flex items-center justify-center h-[26px] px-2 border-l border-geist-hairline text-geist-secondary hover:text-white hover:bg-geist-hover transition-colors cursor-pointer disabled:opacity-50"
+                className="flex items-center justify-center h-7 px-2.5 border-l border-geist-hairline text-geist-secondary hover:text-white hover:bg-geist-hover transition-colors cursor-pointer disabled:opacity-50"
                 title="Fetch instantaneous telemetry snapshot"
                 aria-label="Poll metrics snapshot"
               >
-                <RefreshCw className={cn('w-3 h-3', isPolling && 'animate-spin text-geist-blue')} />
+                <RefreshCw className={cn('w-3.5 h-3.5', isPolling && 'animate-spin text-geist-blue')} />
               </button>
             </div>
 
