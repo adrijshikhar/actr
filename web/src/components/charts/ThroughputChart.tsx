@@ -68,7 +68,7 @@ function ThroughputTooltip({ active, payload }: CustomTooltipProps) {
         <div className="flex items-center gap-1.5 truncate max-w-[130px]">
           <span className="w-1.5 h-1.5 rounded-full bg-geist-warning flex-shrink-0" />
           <span className="font-semibold text-white truncate text-[11px]">
-            {point.stepName || 'active-step'}
+            {point.stepName || 'Host Node'}
           </span>
         </div>
         <div className="text-[10px] text-geist-faint flex items-center gap-1">
@@ -127,10 +127,13 @@ export function ThroughputChart({
   const netGradientId = `throughput-net-${reactId}`;
   const heightClass = height <= 200 ? 'h-52' : 'h-60';
 
+  const hasElapsed = useMemo(() => {
+    return Boolean(data && data.some((d) => (d.step_elapsed_sec ?? 0) > 0));
+  }, [data]);
+
   const chartData = useMemo<ProcessedThroughputPoint[]>(() => {
     if (!data || data.length === 0) return [];
 
-    const hasElapsed = data.some((d) => (d.step_elapsed_sec ?? 0) > 0);
     const startMs = data[0]?.timestamp ? new Date(data[0].timestamp).getTime() : 0;
 
     return data.map((d) => {
@@ -223,12 +226,13 @@ export function ThroughputChart({
               />
 
               <XAxis
-                dataKey="elapsedLabel"
+                dataKey={hasElapsed ? "elapsedLabel" : "timeFormatted"}
                 stroke="#666666"
                 fontSize={11}
                 fontFamily="Geist Mono, monospace"
                 tickLine={false}
                 axisLine={{ stroke: '#262626' }}
+                minTickGap={50}
               />
 
               {/* Left Y-Axis: Disk Write Rate */}

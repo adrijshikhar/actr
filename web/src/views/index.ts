@@ -1,6 +1,9 @@
 export { DashboardView } from './DashboardView';
 export type { DashboardViewProps } from './DashboardView';
 
+export { HostVitalsView } from './HostVitalsView';
+export type { HostVitalsViewProps } from './HostVitalsView';
+
 export { RunnersView } from './RunnersView';
 export type { RunnersViewProps } from './RunnersView';
 

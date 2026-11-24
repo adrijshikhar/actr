@@ -1,4 +1,3 @@
-import { useState, useEffect } from 'react';
 import {
   Power,
   Server,
@@ -13,10 +12,8 @@ import {
   Boxes,
   RotateCcw,
 } from 'lucide-react';
-import type { StatusResponse, RunnerInfo, RunRecord, TelemetrySample } from '@/lib/api';
+import type { StatusResponse, RunnerInfo, RunRecord } from '@/lib/api';
 import { SlotGauge } from '@/components/charts/SlotGauge';
-import { VitalsAreaChart } from '@/components/charts/VitalsAreaChart';
-import { subscribeMetrics } from '@/lib/sse';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { cn, formatBytes, formatDuration, formatRelativeTime, formatAppVersion, getProgressWidthClass } from '@/lib/utils';
@@ -26,6 +23,7 @@ export interface DashboardViewProps {
   runs: RunRecord[];
   runners: RunnerInfo[];
   onSelectRun: (id: string) => void;
+  onNavigateTab?: (tab: string) => void;
   onToggleService?: () => void;
   serviceActionLoading?: boolean;
   onRefresh?: () => void;
@@ -36,6 +34,7 @@ export function DashboardView({
   runs = [],
   runners = [],
   onSelectRun,
+  onNavigateTab,
   onToggleService: _onToggleService,
   serviceActionLoading: _serviceActionLoading = false,
   onRefresh,
@@ -52,59 +51,6 @@ export function DashboardView({
 
   const activeRuns = runs.filter((r) => r.status === 'running' || r.status === 'in_progress');
   const recentRuns = runs.slice(0, 10);
-
-  const [liveMetrics, setLiveMetrics] = useState<TelemetrySample[]>([]);
-
-  useEffect(() => {
-    function createHostSample(sample: { timestamp: string; host_cpu: number; host_mem_used: number; host_mem_total: number }): TelemetrySample {
-      return {
-        timestamp: sample.timestamp,
-        pid: 0,
-        pgid: 0,
-        process_count: 0,
-        step_cpu: sample.host_cpu,
-        step_rss_bytes: sample.host_mem_used,
-        step_elapsed_sec: 0,
-        disk_used_bytes: 0,
-        disk_free_bytes: 0,
-        disk_total_bytes: 0,
-        disk_used_ratio: 0,
-        disk_write_rate: 0,
-        disk_inodes_free: 0,
-        net_rx_rate: 0,
-        net_tx_rate: 0,
-        host_cpu: sample.host_cpu,
-        host_mem_used: sample.host_mem_used,
-        host_mem_total: sample.host_mem_total,
-        host_load_1m: 0,
-      };
-    }
-
-    if (status) {
-      const initialSample = createHostSample({
-        timestamp: new Date().toISOString(),
-        host_cpu: status.host_cpu || 0,
-        host_mem_used: status.host_mem_used || 0,
-        host_mem_total: status.host_mem_total || 0,
-      });
-      setLiveMetrics((prev) => (prev.length === 0 ? [initialSample] : prev));
-    }
-
-    const unsub = subscribeMetrics((m) => {
-      const s = createHostSample({
-        timestamp: m.timestamp || new Date().toISOString(),
-        host_cpu: m.host_cpu ?? 0,
-        host_mem_used: m.host_mem_used ?? 0,
-        host_mem_total: m.host_mem_total ?? 0,
-      });
-      setLiveMetrics((prev) => {
-        const next = [...prev, s];
-        return next.length > 30 ? next.slice(-30) : next;
-      });
-    });
-
-    return () => unsub();
-  }, [status?.daemon_connected]);
 
   return (
     <div className="space-y-6">
@@ -201,7 +147,17 @@ export function DashboardView({
             </div>
             <div className="flex items-center justify-between text-[11px] font-mono text-geist-faint">
               <span>Idle: {Math.max(100 - (status?.host_cpu || 0), 0).toFixed(1)}%</span>
-              <span>Active: {status?.host_cpu?.toFixed(1) ?? '0.0'}%</span>
+              {onNavigateTab ? (
+                <button
+                  type="button"
+                  onClick={() => onNavigateTab('vitals')}
+                  className="text-geist-blue hover:text-white transition-colors duration-150 cursor-pointer flex items-center gap-1"
+                >
+                  Live Graph →
+                </button>
+              ) : (
+                <span>Active: {status?.host_cpu?.toFixed(1) ?? '0.0'}%</span>
+              )}
             </div>
           </div>
         </div>
@@ -235,19 +191,21 @@ export function DashboardView({
             </div>
             <div className="flex items-center justify-between text-[11px] font-mono text-geist-faint">
               <span>{memPercent}% used</span>
-              <span>{formatBytes(Math.max(memTotal - memUsed, 0))} free</span>
+              {onNavigateTab ? (
+                <button
+                  type="button"
+                  onClick={() => onNavigateTab('vitals')}
+                  className="text-geist-blue hover:text-white transition-colors duration-150 cursor-pointer flex items-center gap-1"
+                >
+                  Live Graph →
+                </button>
+              ) : (
+                <span>{formatBytes(Math.max(memTotal - memUsed, 0))} free</span>
+              )}
             </div>
           </div>
         </div>
       </div>
-
-      {/* Live Host Vitals Real-Time Area Chart */}
-      <VitalsAreaChart
-        data={liveMetrics}
-        height={200}
-        title="Live Host Node Vitals"
-        description="Streaming real-time host telemetry via 1s Server-Sent Events"
-      />
 
       {/* Summary KPI Strip */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">

@@ -5,6 +5,7 @@ import {
   History,
   KeyRound,
   Terminal,
+  Activity,
   Cpu,
   HardDrive,
   RefreshCw,
@@ -31,13 +32,14 @@ import { Badge } from '@/components/ui/badge';
 import { cn, formatBytes, formatDuration, formatAppVersion } from '@/lib/utils';
 import {
   DashboardView,
+  HostVitalsView,
   RunnersView,
   HistoryView,
   SecretsView,
   RunDetailView,
 } from '@/views';
 
-type NavTab = 'dashboard' | 'runners' | 'history' | 'secrets' | 'run-detail';
+type NavTab = 'dashboard' | 'vitals' | 'runners' | 'history' | 'secrets' | 'run-detail';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<NavTab>('dashboard');
@@ -207,6 +209,27 @@ export default function App() {
 
             <button
               onClick={() => {
+                setActiveTab('vitals');
+                setMobileNavOpen(false);
+              }}
+              className={cn(
+                'w-full flex items-center justify-between px-3 py-2 rounded-geist text-xs font-medium transition-colors duration-150 cursor-pointer',
+                activeTab === 'vitals'
+                  ? 'bg-geist-elevated text-white border border-geist-hairline shadow-sm'
+                  : 'text-geist-body hover:text-white hover:bg-geist-hover border border-transparent'
+              )}
+            >
+              <div className="flex items-center gap-2.5">
+                <Activity className="w-4 h-4 text-geist-secondary" />
+                <span>Host Vitals</span>
+              </div>
+              {status?.daemon_connected && (
+                <span className="w-1.5 h-1.5 rounded-full bg-status-success-solid animate-pulse" />
+              )}
+            </button>
+
+            <button
+              onClick={() => {
                 setActiveTab('runners');
                 setMobileNavOpen(false);
               }}
@@ -345,9 +368,13 @@ export default function App() {
               <Menu className="w-5 h-5" />
             </button>
             <h1 className="text-sm font-semibold capitalize text-white">
-              {activeTab === 'run-detail' ? `Run Detail (${activeRunId?.slice(0, 8)})` : activeTab}
+              {activeTab === 'run-detail'
+                ? `Run Detail (${activeRunId?.slice(0, 8)})`
+                : activeTab === 'vitals'
+                ? 'Host Node Vitals'
+                : activeTab}
             </h1>
-            {activeTab === 'dashboard' && (
+            {(activeTab === 'dashboard' || activeTab === 'vitals') && (
               <Badge variant="outline" className="text-[11px] gap-1.5 font-mono text-status-success-solid border-status-success-border bg-status-success-bg/20">
                 <span className="w-1.5 h-1.5 rounded-full bg-status-success-solid animate-pulse" />
                 Live Vitals (1s)
@@ -384,8 +411,17 @@ export default function App() {
               runs={runs}
               runners={runners}
               onSelectRun={handleSelectRun}
+              onNavigateTab={(tab) => setActiveTab(tab as NavTab)}
               onToggleService={handleToggleService}
               serviceActionLoading={serviceActionLoading}
+              onRefresh={loadStatus}
+            />
+          )}
+
+          {activeTab === 'vitals' && (
+            <HostVitalsView
+              status={status}
+              runners={runners}
               onRefresh={loadStatus}
             />
           )}
