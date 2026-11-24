@@ -14,6 +14,7 @@ import {
   fetchRun,
   fetchLogs,
   fetchRunMetrics,
+  fetchCurrentMetrics,
   type RunRecord,
   type StepMetadata,
   type TelemetrySample,
@@ -48,6 +49,11 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
 
   const unsubscribeRef = useRef<(() => void) | null>(null);
   const stepLogsCacheRef = useRef<Record<string, string[]>>({});
+  const selectedStepIdRef = useRef<string | null>(selectedStepId);
+
+  useEffect(() => {
+    selectedStepIdRef.current = selectedStepId;
+  }, [selectedStepId]);
 
   // Load run details, initial steps, and telemetry metrics (isolated from step selection)
   const loadRunData = useCallback(async () => {
@@ -63,26 +69,31 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
       // Load metrics
       try {
         const m = await fetchRunMetrics(runId);
-        setMetrics(m || []);
+        if (m && m.length > 0) {
+          setMetrics(m);
+        } else if (
+          runData.status === 'running' ||
+          runData.status === 'in_progress' ||
+          runData.status === 'pending'
+        ) {
+          const cur = await fetchCurrentMetrics();
+          if (cur) {
+            setMetrics([cur]);
+          }
+        }
       } catch (e) {
         console.warn('Failed to fetch run metrics:', e);
       }
 
-      // If run already completed, fetch historical full logs
-      const isFinished =
-        runData.status === 'completed' ||
-        runData.status === 'success' ||
-        runData.status === 'failed';
-      if (isFinished) {
-        try {
-          const res = await fetchLogs(runId);
-          const lines = (res.logs || []).map((l) => ({
-            line: l,
-          }));
-          setLogLines(lines);
-        } catch (e) {
-          console.warn('Failed to fetch historical logs:', e);
-        }
+      // Always fetch existing logs on initial load or refresh
+      try {
+        const res = await fetchLogs(runId);
+        const lines = (res.logs || []).map((l) => ({
+          line: l,
+        }));
+        setLogLines(lines);
+      } catch (e) {
+        console.warn('Failed to fetch existing logs:', e);
       }
     } catch (err) {
       console.error('Failed to load run:', err);
@@ -95,7 +106,7 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
     loadRunData();
   }, [loadRunData]);
 
-  // Isolate step log loading: does not touch loading = true or reload run/metrics
+  // Isolate step log loading: always fetch for selected step, caching completed ones
   useEffect(() => {
     let active = true;
 
@@ -108,27 +119,21 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
       run?.status === 'completed' ||
       run?.status === 'success' ||
       run?.status === 'failed';
-    if (!isFinished) {
-      // During active run, client-side filtering by stepId handles it
-      setStepLogs(null);
-      return;
-    }
 
-    // Check in-memory step cache
-    if (stepLogsCacheRef.current[selectedStepId]) {
+    // Check in-memory step cache for finished runs
+    if (isFinished && stepLogsCacheRef.current[selectedStepId]) {
       setStepLogs(stepLogsCacheRef.current[selectedStepId]);
       return;
     }
 
-    // Clear previous step logs while fetching new step logs
-    setStepLogs(null);
-
-    // Fetch step-specific logs in background without setting global loading
+    // Fetch step-specific logs
     fetchLogs(runId, selectedStepId)
       .then((res) => {
         if (active) {
           const fetched = res.logs || [];
-          stepLogsCacheRef.current[selectedStepId] = fetched;
+          if (isFinished) {
+            stepLogsCacheRef.current[selectedStepId] = fetched;
+          }
           setStepLogs(fetched);
         }
       })
@@ -158,6 +163,9 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
           const text = evt.log_line || evt.line;
           if (text) {
             setLogLines((prev) => [...prev, { line: text, stepId: evt.step_id }]);
+            if (evt.step_id && evt.step_id === selectedStepIdRef.current) {
+              setStepLogs((prev) => (prev !== null ? [...prev, text] : [text]));
+            }
           }
 
           // Handle step updates
@@ -194,6 +202,11 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
           const m = await fetchRunMetrics(runId);
           if (m && m.length > 0) {
             setMetrics(m);
+          } else {
+            const cur = await fetchCurrentMetrics();
+            if (cur) {
+              setMetrics((prev) => [...prev, cur].slice(-30));
+            }
           }
         } catch {
           // Ignore polling errors
@@ -206,6 +219,47 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
       };
     }
   }, [runId, run?.status]);
+
+  // Compute live peaks and totals for metrics cards
+  const livePeakCPU = useMemo(() => {
+    let peak = run?.metrics_summary?.peak_cpu_percent || 0;
+    if (metrics.length > 0) {
+      const maxSample = Math.max(...metrics.map((m) => Math.max(m.step_cpu || 0, m.host_cpu || 0)));
+      if (maxSample > peak) peak = maxSample;
+    }
+    return peak;
+  }, [metrics, run?.metrics_summary]);
+
+  const livePeakRSS = useMemo(() => {
+    let peak = run?.metrics_summary?.peak_rss_bytes || 0;
+    if (metrics.length > 0) {
+      const maxSample = Math.max(...metrics.map((m) => Math.max(m.step_rss_bytes || 0, m.host_mem_used || 0)));
+      if (maxSample > peak) peak = maxSample;
+    }
+    return peak;
+  }, [metrics, run?.metrics_summary]);
+
+  const liveDiskWritten = useMemo(() => {
+    if (run?.metrics_summary?.total_disk_written_bytes) {
+      return run.metrics_summary.total_disk_written_bytes;
+    }
+    if (metrics.length > 0) {
+      return metrics[metrics.length - 1].disk_write_rate || 0;
+    }
+    return 0;
+  }, [metrics, run?.metrics_summary]);
+
+  const liveNetworkIO = useMemo(() => {
+    if (run?.metrics_summary) {
+      const total = (run.metrics_summary.total_net_rx_bytes || 0) + (run.metrics_summary.total_net_tx_bytes || 0);
+      if (total > 0) return total;
+    }
+    if (metrics.length > 0) {
+      const latest = metrics[metrics.length - 1];
+      return (latest.net_rx_rate || 0) + (latest.net_tx_rate || 0);
+    }
+    return 0;
+  }, [metrics, run?.metrics_summary]);
 
   // Filter logs by selected step if one is selected
   const displayedLogs = useMemo(() => {
@@ -487,49 +541,44 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
 
             {/* Telemetry Tab */}
             <TabsContent value="telemetry" className="flex-1 mt-0 space-y-4">
-              {/* Summary KPIs from run metrics_summary */}
-              {run?.metrics_summary && (
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                  <div className="p-3 rounded-geist bg-geist-surface border border-geist-hairline">
-                    <div className="text-[10px] font-mono text-geist-faint uppercase">
-                      Peak CPU
-                    </div>
-                    <div className="text-lg font-bold font-mono text-white mt-0.5">
-                      {run.metrics_summary.peak_cpu_percent?.toFixed(1) ?? '0.0'}%
-                    </div>
+              {/* Summary KPIs */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <div className="p-3 rounded-geist bg-geist-surface border border-geist-hairline">
+                  <div className="text-[10px] font-mono text-geist-faint uppercase">
+                    Peak CPU
                   </div>
-
-                  <div className="p-3 rounded-geist bg-geist-surface border border-geist-hairline">
-                    <div className="text-[10px] font-mono text-geist-faint uppercase">
-                      Peak RSS
-                    </div>
-                    <div className="text-lg font-bold font-mono text-white mt-0.5">
-                      {formatBytes(run.metrics_summary.peak_rss_bytes || 0)}
-                    </div>
-                  </div>
-
-                  <div className="p-3 rounded-geist bg-geist-surface border border-geist-hairline">
-                    <div className="text-[10px] font-mono text-geist-faint uppercase">
-                      Disk Written
-                    </div>
-                    <div className="text-lg font-bold font-mono text-white mt-0.5">
-                      {formatBytes(run.metrics_summary.total_disk_written_bytes || 0)}
-                    </div>
-                  </div>
-
-                  <div className="p-3 rounded-geist bg-geist-surface border border-geist-hairline">
-                    <div className="text-[10px] font-mono text-geist-faint uppercase">
-                      Network I/O
-                    </div>
-                    <div className="text-lg font-bold font-mono text-white mt-0.5">
-                      {formatBytes(
-                        (run.metrics_summary.total_net_rx_bytes || 0) +
-                          (run.metrics_summary.total_net_tx_bytes || 0)
-                      )}
-                    </div>
+                  <div className="text-lg font-bold font-mono text-white mt-0.5">
+                    {livePeakCPU.toFixed(1)}%
                   </div>
                 </div>
-              )}
+
+                <div className="p-3 rounded-geist bg-geist-surface border border-geist-hairline">
+                  <div className="text-[10px] font-mono text-geist-faint uppercase">
+                    Peak RSS
+                  </div>
+                  <div className="text-lg font-bold font-mono text-white mt-0.5">
+                    {formatBytes(livePeakRSS)}
+                  </div>
+                </div>
+
+                <div className="p-3 rounded-geist bg-geist-surface border border-geist-hairline">
+                  <div className="text-[10px] font-mono text-geist-faint uppercase">
+                    Disk Written
+                  </div>
+                  <div className="text-lg font-bold font-mono text-white mt-0.5">
+                    {formatBytes(liveDiskWritten)}
+                  </div>
+                </div>
+
+                <div className="p-3 rounded-geist bg-geist-surface border border-geist-hairline">
+                  <div className="text-[10px] font-mono text-geist-faint uppercase">
+                    Network I/O
+                  </div>
+                  <div className="text-lg font-bold font-mono text-white mt-0.5">
+                    {formatBytes(liveNetworkIO)}
+                  </div>
+                </div>
+              </div>
 
               {/* Charts Grid: Side-by-side on wide screens */}
               <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">

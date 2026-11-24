@@ -41,6 +41,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// If daemon controller is not reporting active (e.g. CLI runner or manual daemon run),
+	// check if MetricsProvider (daemon socket) is reachable.
+	if !resp.DaemonConnected && s.cfg.MetricsProvider != nil {
+		if _, err := s.cfg.MetricsProvider.GetCurrentMetrics(r.Context()); err == nil {
+			resp.DaemonConnected = true
+		}
+	}
+
 	// Query RunStore for active and queued job counts
 	if s.cfg.RunStore != nil {
 		if _, queuedTotal, err := s.cfg.RunStore.GetRuns(r.Context(), 1, 0, "", "queued", ""); err == nil {

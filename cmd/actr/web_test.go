@@ -606,7 +606,7 @@ func TestWebCmd_UnboundedStepLogsLookup(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	adapter := newHistoryRunStoreAdapter(store)
+	adapter := newHistoryRunStoreAdapter(store, nil)
 
 	// Step from oldest run (step-unbounded-00) must be retrievable even though there are 60 runs
 	logs, err := adapter.GetStepLogs(ctx, "run-unbounded-00", "step-unbounded-00")

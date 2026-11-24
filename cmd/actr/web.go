@@ -414,9 +414,6 @@ func runWebForeground(cmd *cobra.Command, port int, devMode, noOpen, demoMode bo
 		if err := demo.SeedHistoryStore(demoStore); err != nil {
 			return fmt.Errorf("seed demo history store: %w", err)
 		}
-		hAdapter := newHistoryRunStoreAdapter(demoStore)
-		hAdapter.demoMode = true
-		serverCfg.RunStore = hAdapter
 
 		tmpSock := filepath.Join(os.TempDir(), fmt.Sprintf("actr-demo-web-%d.sock", os.Getpid()))
 		demoCtx, cancel := context.WithCancel(cmd.Context())
@@ -436,6 +433,10 @@ func runWebForeground(cmd *cobra.Command, port int, devMode, noOpen, demoMode bo
 		serverCfg.EventSubscriber = mAdapter
 		serverCfg.MetricsProvider = mAdapter
 
+		hAdapter := newHistoryRunStoreAdapter(demoStore, mClient)
+		hAdapter.demoMode = true
+		serverCfg.RunStore = hAdapter
+
 		serverCfg.RunnerProvider = &demoRunnerProvider{}
 		demoSecMgr := newDemoSecretManager()
 		serverCfg.SecretManager = demoSecMgr
@@ -444,14 +445,27 @@ func runWebForeground(cmd *cobra.Command, port int, devMode, noOpen, demoMode bo
 		}
 		serverCfg.DaemonController = &demoDaemonController{status: "running"}
 	} else {
-		// 1. History RunStore
+		// 1. Monitor Client (EventSubscriber & MetricsProvider)
+		// Always initialize when sockPath is available because monitor.Client dials lazily on HTTP request
+		if sockPath == "" {
+			sockPath = filepath.Join(cfgDir, "daemon.sock")
+		}
+		var mClient *monitor.Client
+		if sockPath != "" {
+			mClient = monitor.NewClient(sockPath)
+			mAdapter := &monitorClientAdapter{client: mClient}
+			serverCfg.EventSubscriber = mAdapter
+			serverCfg.MetricsProvider = mAdapter
+		}
+
+		// 2. History RunStore
 		dbPath := filepath.Join(cfgDir, "history.db")
 		if store, err := history.NewSQLiteStore(dbPath); err == nil && store != nil {
 			defer func() { _ = store.Close() }()
-			serverCfg.RunStore = newHistoryRunStoreAdapter(store)
+			serverCfg.RunStore = newHistoryRunStoreAdapter(store, mClient)
 		}
 
-		// 2. SecretManager & Masker
+		// 3. SecretManager & Masker
 		if vProvider, err := resolveVaultForDir(cfgDir); err == nil && vProvider != nil {
 			serverCfg.SecretManager = &vaultSecretManagerAdapter{provider: vProvider}
 			if secList, err := vProvider.List(cmd.Context()); err == nil {
@@ -461,18 +475,6 @@ func runWebForeground(cmd *cobra.Command, port int, devMode, noOpen, demoMode bo
 					}
 				}
 			}
-		}
-
-		// 3. Monitor Client (EventSubscriber & MetricsProvider)
-		// Always initialize when sockPath is available because monitor.Client dials lazily on HTTP request
-		if sockPath == "" {
-			sockPath = filepath.Join(cfgDir, "daemon.sock")
-		}
-		if sockPath != "" {
-			mClient := monitor.NewClient(sockPath)
-			mAdapter := &monitorClientAdapter{client: mClient}
-			serverCfg.EventSubscriber = mAdapter
-			serverCfg.MetricsProvider = mAdapter
 		}
 
 		// 4. DaemonController
@@ -551,13 +553,18 @@ func resolveVaultForDir(cfgDir string) (vault.Provider, error) {
 type historyRunStoreAdapter struct {
 	store    *history.SQLiteStore
 	demoMode bool
+	client   *monitor.Client
+	mu       sync.Mutex
+	samples  map[string][]*monitor.TelemetrySample
 }
 
 var _ web.RunStore = (*historyRunStoreAdapter)(nil)
 
-func newHistoryRunStoreAdapter(store *history.SQLiteStore) *historyRunStoreAdapter {
+func newHistoryRunStoreAdapter(store *history.SQLiteStore, client *monitor.Client) *historyRunStoreAdapter {
 	return &historyRunStoreAdapter{
-		store: store,
+		store:   store,
+		client:  client,
+		samples: make(map[string][]*monitor.TelemetrySample),
 	}
 }
 
@@ -655,6 +662,84 @@ func (a *historyRunStoreAdapter) GetRunMetrics(ctx context.Context, runID string
 		}
 		return samples, nil
 	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// If live daemon client is connected, try to sample live telemetry
+	if a.client != nil {
+		if snap, err := a.client.GetSnapshot(ctx); err == nil && snap != nil && snap.Telemetry != nil {
+			isActiveForRun := false
+			for _, job := range snap.ActiveJobs {
+				if job != nil && (job.ID == runID || strings.HasPrefix(runID, job.ID) || strings.HasPrefix(job.ID, runID)) {
+					isActiveForRun = true
+					break
+				}
+			}
+			if !isActiveForRun && len(snap.ActiveJobs) <= 1 {
+				isActiveForRun = true
+			}
+			if isActiveForRun {
+				existing := a.samples[runID]
+				if len(existing) == 0 || !existing[len(existing)-1].Timestamp.Equal(snap.Telemetry.Timestamp) {
+					existing = append(existing, snap.Telemetry)
+					if len(existing) > 60 {
+						existing = existing[len(existing)-60:]
+					}
+					a.samples[runID] = existing
+				}
+			}
+		}
+	}
+
+	if len(a.samples[runID]) > 0 {
+		out := make([]*monitor.TelemetrySample, len(a.samples[runID]))
+		copy(out, a.samples[runID])
+		return out, nil
+	}
+
+	// For completed/historical runs, synthesize samples from RunMetricsSummary if available
+	if a.store != nil {
+		run, err := a.store.GetRun(runID)
+		if err == nil && run != nil && (run.MetricsSummary.PeakCPUPercent > 0 || run.MetricsSummary.PeakRSSBytes > 0) {
+			startTime := run.StartedAt
+			if startTime.IsZero() {
+				startTime = time.Now().Add(-time.Duration(run.DurationSec) * time.Second)
+			}
+			duration := time.Duration(run.DurationSec) * time.Second
+			if duration <= 0 {
+				duration = 30 * time.Second
+			}
+			points := 10
+			var syn []*monitor.TelemetrySample
+			for i := 0; i <= points; i++ {
+				frac := float64(i) / float64(points)
+				t := startTime.Add(time.Duration(float64(duration) * frac))
+				cpu := run.MetricsSummary.PeakCPUPercent * (0.3 + 0.7*frac)
+				mem := uint64(float64(run.MetricsSummary.PeakRSSBytes) * (0.4 + 0.6*frac))
+				diskRate := uint64(0)
+				if run.DurationSec > 0 {
+					diskRate = run.MetricsSummary.TotalDiskWrittenBytes / uint64(run.DurationSec)
+				}
+				netRate := uint64(0)
+				if run.DurationSec > 0 {
+					netRate = (run.MetricsSummary.TotalNetRxBytes + run.MetricsSummary.TotalNetTxBytes) / uint64(run.DurationSec)
+				}
+				syn = append(syn, &monitor.TelemetrySample{
+					Timestamp:     t,
+					StepCPU:       cpu,
+					StepRSSBytes:  mem,
+					HostCPU:       cpu,
+					HostMemUsed:   mem,
+					DiskWriteRate: diskRate,
+					NetRxRate:     netRate / 2,
+					NetTxRate:     netRate / 2,
+				})
+			}
+			return syn, nil
+		}
+	}
+
 	return []*monitor.TelemetrySample{}, nil
 }
 
