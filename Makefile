@@ -10,7 +10,7 @@ INSTALL_DIR ?= $(HOME)/.local/bin
 COMPLETION_SHELL ?= zsh
 
 web-build:
-	cd web && npm install && npm run build
+	cd web && (npm ci 2>/dev/null || npm install) && npm run build
 
 build: web-build
 	CGO_ENABLED=0 go build -trimpath $(LDFLAGS) -o bin/$(BINARY_NAME) ./cmd/actr

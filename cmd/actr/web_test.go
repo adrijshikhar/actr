@@ -461,12 +461,12 @@ func TestWebCmd_Adapters(t *testing.T) {
 	assert.Equal(t, "step-1", steps[0].ID)
 
 	// 4. GetStepLogs
-	logs, err := adapter.GetStepLogs(ctx, "step-1")
+	logs, err := adapter.GetStepLogs(ctx, "run-web-adapter-1", "step-1")
 	require.NoError(t, err)
 	assert.Equal(t, []string{"log line 1", "log line 2"}, logs)
 
 	// Non-existent step logs
-	nonLogs, err := adapter.GetStepLogs(ctx, "non-existent")
+	nonLogs, err := adapter.GetStepLogs(ctx, "run-web-adapter-1", "non-existent")
 	require.NoError(t, err)
 	assert.Empty(t, nonLogs)
 
@@ -604,12 +604,12 @@ func TestWebCmd_UnboundedStepLogsLookup(t *testing.T) {
 	adapter := newHistoryRunStoreAdapter(store)
 
 	// Step from oldest run (step-unbounded-00) must be retrievable even though there are 60 runs
-	logs, err := adapter.GetStepLogs(ctx, "step-unbounded-00")
+	logs, err := adapter.GetStepLogs(ctx, "run-unbounded-00", "step-unbounded-00")
 	require.NoError(t, err)
 	assert.Equal(t, []string{"log line for step 0"}, logs)
 
 	// Step from newest run (step-unbounded-59) must also be retrievable
-	logsNewest, err := adapter.GetStepLogs(ctx, "step-unbounded-59")
+	logsNewest, err := adapter.GetStepLogs(ctx, "run-unbounded-59", "step-unbounded-59")
 	require.NoError(t, err)
 	assert.Equal(t, []string{"log line for step 59"}, logsNewest)
 }

@@ -12,11 +12,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/adrijshikhar/actr/internal/config"
+	"github.com/adrijshikhar/actr/internal/engine"
 	"github.com/adrijshikhar/actr/internal/history"
 	"github.com/adrijshikhar/actr/internal/logger"
 	"github.com/adrijshikhar/actr/internal/monitor"
@@ -387,10 +387,19 @@ func runWebForeground(cmd *cobra.Command, port int, devMode, noOpen bool, cfgDir
 		serverCfg.RunStore = newHistoryRunStoreAdapter(store)
 	}
 
-	// 2. SecretManager
+	// 2. SecretManager & Masker
+	masker := engine.NewSecretMasker()
 	if vProvider, err := resolveVaultForDir(cfgDir); err == nil && vProvider != nil {
 		serverCfg.SecretManager = &vaultSecretManagerAdapter{provider: vProvider}
+		if secList, err := vProvider.List(cmd.Context()); err == nil {
+			for _, sec := range secList {
+				if val, err := vProvider.Get(cmd.Context(), sec.Key); err == nil && val != "" {
+					masker.AddMask(val)
+				}
+			}
+		}
 	}
+	serverCfg.Masker = masker
 
 	// 3. Monitor Client (EventSubscriber & MetricsProvider)
 	// Always initialize when sockPath is available because monitor.Client dials lazily on HTTP request
@@ -476,23 +485,14 @@ func resolveVaultForDir(cfgDir string) (vault.Provider, error) {
 
 // historyRunStoreAdapter adapts *history.SQLiteStore to satisfy web.RunStore.
 type historyRunStoreAdapter struct {
-	store      *history.SQLiteStore
-	mu         sync.RWMutex
-	stepRunMap map[string]string
+	store *history.SQLiteStore
 }
 
 var _ web.RunStore = (*historyRunStoreAdapter)(nil)
 
 func newHistoryRunStoreAdapter(store *history.SQLiteStore) *historyRunStoreAdapter {
 	return &historyRunStoreAdapter{
-		store:      store,
-		stepRunMap: make(map[string]string),
-	}
-}
-
-func (a *historyRunStoreAdapter) ensureMapLocked() {
-	if a.stepRunMap == nil {
-		a.stepRunMap = make(map[string]string)
+		store: store,
 	}
 }
 
@@ -541,35 +541,13 @@ func (a *historyRunStoreAdapter) GetRuns(ctx context.Context, limit, offset int,
 			}
 		} else {
 			records[i] = rec
-			a.mu.Lock()
-			a.ensureMapLocked()
-			for _, st := range rec.Steps {
-				if st != nil {
-					a.stepRunMap[st.ID] = rec.ID
-				}
-			}
-			a.mu.Unlock()
 		}
 	}
 	return records, total, nil
 }
 
 func (a *historyRunStoreAdapter) GetRun(ctx context.Context, id string) (*history.RunRecord, error) {
-	rec, err := a.store.GetRun(id)
-	if err != nil {
-		return nil, err
-	}
-	if rec != nil {
-		a.mu.Lock()
-		a.ensureMapLocked()
-		for _, st := range rec.Steps {
-			if st != nil {
-				a.stepRunMap[st.ID] = rec.ID
-			}
-		}
-		a.mu.Unlock()
-	}
-	return rec, nil
+	return a.store.GetRun(id)
 }
 
 func (a *historyRunStoreAdapter) GetRunSteps(ctx context.Context, runID string) ([]*history.StepRecord, error) {
@@ -578,55 +556,13 @@ func (a *historyRunStoreAdapter) GetRunSteps(ctx context.Context, runID string) 
 		return nil, err
 	}
 	if run != nil {
-		a.mu.Lock()
-		a.ensureMapLocked()
-		for _, st := range run.Steps {
-			if st != nil {
-				a.stepRunMap[st.ID] = runID
-			}
-		}
-		a.mu.Unlock()
 		return run.Steps, nil
 	}
 	return nil, nil
 }
 
-func (a *historyRunStoreAdapter) GetStepLogs(ctx context.Context, stepID string) ([]string, error) {
-	a.mu.RLock()
-	var runID string
-	var cached bool
-	if a.stepRunMap != nil {
-		runID, cached = a.stepRunMap[stepID]
-	}
-	a.mu.RUnlock()
-	if cached {
-		return a.store.GetStepLogs(runID, stepID)
-	}
-
-	summaries, err := a.store.ListRuns(0)
-	if err == nil {
-		for _, s := range summaries {
-			run, err := a.store.GetRun(s.ID)
-			if err != nil {
-				continue
-			}
-			a.mu.Lock()
-			a.ensureMapLocked()
-			for _, st := range run.Steps {
-				if st != nil {
-					a.stepRunMap[st.ID] = run.ID
-				}
-			}
-			a.mu.Unlock()
-
-			for _, st := range run.Steps {
-				if st != nil && st.ID == stepID {
-					return a.store.GetStepLogs(run.ID, stepID)
-				}
-			}
-		}
-	}
-	return []string{}, nil
+func (a *historyRunStoreAdapter) GetStepLogs(ctx context.Context, runID, stepID string) ([]string, error) {
+	return a.store.GetStepLogs(runID, stepID)
 }
 
 func (a *historyRunStoreAdapter) GetRunMetrics(ctx context.Context, runID string) ([]*monitor.TelemetrySample, error) {

@@ -84,6 +84,24 @@ func TestServer_SPAFallback(t *testing.T) {
 			wantStatus: http.StatusNotFound,
 			wantBody:   `"error"`,
 		},
+		{
+			name:       "assets directory listing rejected",
+			path:       "/assets",
+			wantStatus: http.StatusNotFound,
+			wantBody:   `"error"`,
+		},
+		{
+			name:       "assets slash directory listing rejected",
+			path:       "/assets/",
+			wantStatus: http.StatusNotFound,
+			wantBody:   `"error"`,
+		},
+		{
+			name:       "missing asset returns 404 json not spa",
+			path:       "/assets/non-existent-bundle.js",
+			wantStatus: http.StatusNotFound,
+			wantBody:   `"error"`,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -101,6 +119,21 @@ func TestServer_SPAFallback(t *testing.T) {
 			}
 		})
 	}
+
+	// Test gzip compression negotiation
+	t.Run("gzip accept-encoding serves gzipped response", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("Accept-Encoding", "gzip, deflate")
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+		if rec.Header().Get("Content-Encoding") != "gzip" {
+			t.Fatalf("expected Content-Encoding: gzip, got %q", rec.Header().Get("Content-Encoding"))
+		}
+	})
 }
 
 func TestServer_DevProxy(t *testing.T) {
@@ -295,7 +328,7 @@ func (m *mockRunStore) GetRunSteps(ctx context.Context, runID string) ([]*histor
 	return nil, nil
 }
 
-func (m *mockRunStore) GetStepLogs(ctx context.Context, stepID string) ([]string, error) {
+func (m *mockRunStore) GetStepLogs(ctx context.Context, runID, stepID string) ([]string, error) {
 	if m.getLogsErr != nil {
 		return nil, m.getLogsErr
 	}
@@ -825,6 +858,17 @@ func TestServer_RunLogs_Masking(t *testing.T) {
 
 		if rec.Code != http.StatusServiceUnavailable {
 			t.Fatalf("expected 503 Service Unavailable, got %d", rec.Code)
+		}
+	}
+
+	// 5. Non-existent run returns 404
+	{
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/runs/non-existent-run-999/logs", nil)
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 Not Found, got %d", rec.Code)
 		}
 	}
 }
@@ -1502,6 +1546,42 @@ func TestServer_Secrets(t *testing.T) {
 		}
 	})
 
+	// 5b. Set secret body exceeds 1MB limit returns 400
+	t.Run("set secret body exceeds 1MB limit returns 400", func(t *testing.T) {
+		sm := newMockSecretManager()
+		srv := NewServer(ServerConfig{SecretManager: sm})
+
+		largeVal := strings.Repeat("A", (1<<20)+1024)
+		payload := fmt.Sprintf(`{"key": "LARGE_SECRET", "value": %q}`, largeVal)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/secrets", strings.NewReader(payload))
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request for body > 1MB, got %d", rec.Code)
+		}
+	})
+
+	// 5c. Set secret updates configured Masker
+	t.Run("set secret updates configured Masker", func(t *testing.T) {
+		sm := newMockSecretManager()
+		masker := engine.NewSecretMasker()
+		srv := NewServer(ServerConfig{SecretManager: sm, Masker: masker})
+
+		payload := `{"key": "NEW_TOKEN", "value": "dyn_secret_token_12345"}`
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/secrets", strings.NewReader(payload))
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("expected 201 Created, got %d", rec.Code)
+		}
+		masked := masker.Mask("authorization: dyn_secret_token_12345")
+		if strings.Contains(masked, "dyn_secret_token_12345") {
+			t.Fatalf("expected secret to be masked after set, got %q", masked)
+		}
+	})
+
 	// 6. List secrets with data excludes sensitive values
 	t.Run("list secrets excludes secret values", func(t *testing.T) {
 		sm := newMockSecretManager()
@@ -1780,4 +1860,14 @@ func TestServer_Service(t *testing.T) {
 			t.Fatalf("expected 200 or 500, got %d (body: %s)", rec.Code, rec.Body.String())
 		}
 	})
+}
+
+func TestServer_FallbackHostMetrics_PanicRecovery(t *testing.T) {
+	m := fallbackHostMetrics()
+	if m == nil {
+		t.Fatal("expected non-nil metrics from fallbackHostMetrics")
+	}
+	if m.Timestamp.IsZero() {
+		t.Fatal("expected non-zero timestamp")
+	}
 }

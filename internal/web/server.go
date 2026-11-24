@@ -1,11 +1,15 @@
 package web
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -26,7 +30,7 @@ type RunStore interface {
 	GetRuns(ctx context.Context, limit, offset int, repo, status, q string) ([]*history.RunRecord, int, error)
 	GetRun(ctx context.Context, id string) (*history.RunRecord, error)
 	GetRunSteps(ctx context.Context, runID string) ([]*history.StepRecord, error)
-	GetStepLogs(ctx context.Context, stepID string) ([]string, error)
+	GetStepLogs(ctx context.Context, runID, stepID string) ([]string, error)
 	GetRunMetrics(ctx context.Context, runID string) ([]*monitor.TelemetrySample, error)
 }
 
@@ -61,6 +65,7 @@ type RunnerProvider interface {
 
 type Masker interface {
 	Mask(string) string
+	AddMask(string)
 }
 
 type MetricsProvider interface {
@@ -182,15 +187,45 @@ func (s *Server) routes() {
 		return
 	}
 
-	indexHTML, err := fs.ReadFile(subFS, "index.html")
-	if err != nil {
+	var indexHTMLGz []byte
+	var indexHTMLRaw []byte
+
+	if gzData, err := fs.ReadFile(subFS, "index.html.gz"); err == nil {
+		indexHTMLGz = gzData
+		gr, err := gzip.NewReader(bytes.NewReader(gzData))
+		if err == nil {
+			indexHTMLRaw, _ = io.ReadAll(gr)
+			_ = gr.Close()
+		}
+	} else if rawData, err := fs.ReadFile(subFS, "index.html"); err == nil {
+		indexHTMLRaw = rawData
+		var buf bytes.Buffer
+		gw, _ := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+		_, _ = gw.Write(rawData)
+		_ = gw.Close()
+		indexHTMLGz = buf.Bytes()
+	}
+
+	if len(indexHTMLRaw) == 0 && len(indexHTMLGz) == 0 {
 		s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "index.html not found", http.StatusInternalServerError)
 		})
 		return
 	}
 
-	fileServer := http.FileServer(http.FS(subFS))
+	serveIndex := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Vary", "Accept-Encoding")
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") && len(indexHTMLGz) > 0 {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(indexHTMLGz)
+		} else {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(indexHTMLRaw)
+		}
+	}
+
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api" {
 			writeJSONError(w, http.StatusNotFound, "api endpoint not found")
@@ -199,24 +234,97 @@ func (s *Server) routes() {
 
 		cleanPath := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
 		if cleanPath == "" || cleanPath == "." || cleanPath == "index.html" {
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(indexHTML)
+			serveIndex(w, r)
 			return
 		}
 
-		// Check if requested file exists in embedded dist
-		f, err := subFS.Open(cleanPath)
-		if err != nil {
-			// Fallback to index.html for client-side SPA routing
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(indexHTML)
+		// Reject directory listing requests (e.g. /assets or /assets/)
+		if cleanPath == "assets" {
+			writeJSONError(w, http.StatusNotFound, "not found")
 			return
 		}
-		_ = f.Close()
 
-		fileServer.ServeHTTP(w, r)
+		// Check if requested file exists in embedded dist (try .gz first, then uncompressed)
+		var gzBytes []byte
+		var rawBytes []byte
+
+		if data, err := fs.ReadFile(subFS, cleanPath+".gz"); err == nil {
+			gzBytes = data
+		} else if f, err := subFS.Open(cleanPath); err == nil {
+			stat, sErr := f.Stat()
+			if sErr == nil && stat.IsDir() {
+				_ = f.Close()
+				writeJSONError(w, http.StatusNotFound, "not found")
+				return
+			}
+			data, rErr := io.ReadAll(f)
+			_ = f.Close()
+			if rErr == nil {
+				rawBytes = data
+			}
+		}
+
+		if len(gzBytes) > 0 {
+			ext := path.Ext(cleanPath)
+			mimeType := mime.TypeByExtension(ext)
+			if mimeType == "" {
+				switch ext {
+				case ".js":
+					mimeType = "application/javascript; charset=utf-8"
+				case ".css":
+					mimeType = "text/css; charset=utf-8"
+				case ".html":
+					mimeType = "text/html; charset=utf-8"
+				case ".svg":
+					mimeType = "image/svg+xml"
+				case ".json":
+					mimeType = "application/json"
+				default:
+					mimeType = "application/octet-stream"
+				}
+			}
+
+			w.Header().Set("Content-Type", mimeType)
+			w.Header().Set("Vary", "Accept-Encoding")
+
+			if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+				w.Header().Set("Content-Encoding", "gzip")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(gzBytes)
+				return
+			}
+
+			// Client does not accept gzip: decompress on the fly
+			gr, err := gzip.NewReader(bytes.NewReader(gzBytes))
+			if err != nil {
+				http.Error(w, "decompression error", http.StatusInternalServerError)
+				return
+			}
+			defer func() { _ = gr.Close() }()
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.Copy(w, gr)
+			return
+		}
+
+		if rawBytes != nil {
+			ext := path.Ext(cleanPath)
+			mimeType := mime.TypeByExtension(ext)
+			if mimeType != "" {
+				w.Header().Set("Content-Type", mimeType)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(rawBytes)
+			return
+		}
+
+		// File not found. If under /assets/, reject with 404 rather than SPA fallback
+		if strings.HasPrefix(cleanPath, "assets/") {
+			writeJSONError(w, http.StatusNotFound, "asset not found")
+			return
+		}
+
+		// Fallback to index.html for client-side SPA routing
+		serveIndex(w, r)
 	})
 }
 

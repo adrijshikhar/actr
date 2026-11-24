@@ -139,10 +139,10 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
 
   // Set up SSE live subscription if run is active
   useEffect(() => {
-    if (!runId) return;
+    if (!runId || !run) return;
 
     const isRunning =
-      !run || run.status === 'running' || run.status === 'in_progress' || run.status === 'pending';
+      run.status === 'running' || run.status === 'in_progress' || run.status === 'pending';
 
     if (isRunning) {
       // Connect to SSE stream

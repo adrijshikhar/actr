@@ -49,6 +49,8 @@ func (s *Server) handleSecretSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+
 	var req setSecretRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
@@ -64,10 +66,15 @@ func (s *Server) handleSecretSet(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "secret value is required")
 		return
 	}
+	req.Scope = strings.TrimSpace(req.Scope)
 
 	if err := s.cfg.SecretManager.SetSecret(r.Context(), req.Key, req.Value, req.Scope); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+
+	if s.cfg.Masker != nil {
+		s.cfg.Masker.AddMask(req.Value)
 	}
 
 	writeJSON(w, http.StatusCreated, secretResponse{

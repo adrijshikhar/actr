@@ -1,7 +1,6 @@
 package web
 
 import (
-	"context"
 	"net/http"
 	"path/filepath"
 	"sort"
@@ -25,14 +24,14 @@ func (s *Server) handleRunners(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	runners := s.fallbackRunners(r.Context())
+	runners := s.fallbackRunners()
 	if runners == nil {
 		runners = []RunnerInfo{}
 	}
 	writeJSON(w, http.StatusOK, runners)
 }
 
-func (s *Server) fallbackRunners(ctx context.Context) []RunnerInfo {
+func (s *Server) fallbackRunners() []RunnerInfo {
 	cfgDir := s.cfg.ConfigDir
 	if cfgDir == "" {
 		cfgDir = config.DefaultConfigDir()

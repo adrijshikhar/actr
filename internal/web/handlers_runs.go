@@ -117,11 +117,17 @@ func (s *Server) handleRunLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	run, err := s.cfg.RunStore.GetRun(r.Context(), id)
+	if err != nil || run == nil {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
 	stepID := r.URL.Query().Get("step_id")
 	var rawLogs []string
 
 	if stepID != "" {
-		lines, err := s.cfg.RunStore.GetStepLogs(r.Context(), stepID)
+		lines, err := s.cfg.RunStore.GetStepLogs(r.Context(), id, stepID)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -131,16 +137,14 @@ func (s *Server) handleRunLogs(w http.ResponseWriter, r *http.Request) {
 		// Aggregate logs across all steps
 		steps, err := s.cfg.RunStore.GetRunSteps(r.Context(), id)
 		if err != nil || len(steps) == 0 {
-			if run, rErr := s.cfg.RunStore.GetRun(r.Context(), id); rErr == nil && run != nil {
-				steps = run.Steps
-			}
+			steps = run.Steps
 		}
 
 		for _, st := range steps {
 			if st == nil {
 				continue
 			}
-			lines, err := s.cfg.RunStore.GetStepLogs(r.Context(), st.ID)
+			lines, err := s.cfg.RunStore.GetStepLogs(r.Context(), id, st.ID)
 			if err == nil && len(lines) > 0 {
 				rawLogs = append(rawLogs, lines...)
 			}

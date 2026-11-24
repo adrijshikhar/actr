@@ -32,7 +32,9 @@ func (s *Server) handleRunLogsStream(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	defer unsubscribe()
+	if unsubscribe != nil {
+		defer unsubscribe()
+	}
 
 	// Set SSE response headers
 	w.Header().Set("Content-Type", "text/event-stream")

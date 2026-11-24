@@ -14,8 +14,8 @@ import (
 )
 
 // fallbackHostMetrics samples host-level vitals using gopsutil with panic safety.
-func fallbackHostMetrics() *monitor.RunnerMetrics {
-	metrics := &monitor.RunnerMetrics{
+func fallbackHostMetrics() (metrics *monitor.RunnerMetrics) {
+	metrics = &monitor.RunnerMetrics{
 		Timestamp: time.Now().UTC(),
 	}
 	defer func() {
