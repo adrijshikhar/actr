@@ -29,5 +29,6 @@ go.work
 .idea/
 .superpowers/
 .openqodex/
+.impeccable/
 .worktrees/
 .worktrees
