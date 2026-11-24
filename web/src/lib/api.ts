@@ -41,6 +41,7 @@ export interface StatusResponse {
   version: string;
   daemon_connected: boolean;
   active_jobs: number;
+  queued_jobs?: number;
   total_runners: number;
   host_cpu: number;
   host_mem_used: number;
@@ -54,6 +55,7 @@ export interface RunnerInfo {
   labels: string[];
   max_concurrency: number;
   active_slots: number;
+  queued_jobs?: number;
   status: string;
 }
 

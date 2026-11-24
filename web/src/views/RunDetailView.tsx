@@ -239,6 +239,7 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
   const isCompleted = run?.status === 'completed' || run?.status === 'success';
   const isFailed = run?.status === 'failed';
   const isRunning = run?.status === 'running' || run?.status === 'in_progress';
+  const isQueued = run?.status === 'queued';
 
   return (
     <div className="space-y-5">
@@ -273,9 +274,14 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
                   ? 'destructive'
                   : isRunning
                   ? 'warning'
+                  : isQueued
+                  ? 'outline'
                   : 'outline'
               }
-              className="text-xs uppercase font-mono px-2 py-0.5 gap-1.5"
+              className={cn(
+                'text-xs uppercase font-mono px-2 py-0.5 gap-1.5',
+                isQueued && 'text-status-warning-text border-status-warning-border/60 bg-status-warning-bg/40'
+              )}
             >
               {isCompleted ? (
                 <CheckCircle2 className="w-3.5 h-3.5 text-status-success-solid" />
@@ -284,7 +290,12 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
               ) : isRunning ? (
                 <Activity className="w-3.5 h-3.5 text-status-warning-solid animate-pulse" />
               ) : (
-                <Clock className="w-3.5 h-3.5 text-geist-faint" />
+                <Clock
+                  className={cn(
+                    'w-3.5 h-3.5',
+                    isQueued ? 'text-status-warning-text' : 'text-geist-faint'
+                  )}
+                />
               )}
               <span>{run?.status || 'loading'}</span>
             </Badge>

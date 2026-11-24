@@ -50,6 +50,7 @@ export function DashboardView({
   const memPercent = Math.min(Math.round((memUsed / memTotal) * 100), 100);
 
   const activeRuns = runs.filter((r) => r.status === 'running' || r.status === 'in_progress');
+  const queuedRunsCount = status?.queued_jobs ?? runs.filter((r) => r.status === 'queued').length;
   const recentRuns = runs.slice(0, 10);
 
   return (
@@ -208,7 +209,7 @@ export function DashboardView({
       </div>
 
       {/* Summary KPI Strip */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
         <div className="p-3 rounded-geist bg-geist-surface/70 border border-geist-hairline flex items-center justify-between">
           <div className="space-y-0.5">
             <div className="text-[11px] font-medium text-geist-faint uppercase tracking-wider">
@@ -219,6 +220,28 @@ export function DashboardView({
             </div>
           </div>
           <Activity className="w-5 h-5 text-status-warning-text opacity-70" />
+        </div>
+
+        <div className="p-3 rounded-geist bg-geist-surface/70 border border-geist-hairline flex items-center justify-between">
+          <div className="space-y-0.5">
+            <div className="text-[11px] font-medium text-geist-faint uppercase tracking-wider">
+              Queued Tasks
+            </div>
+            <div
+              className={cn(
+                'text-xl font-bold font-mono',
+                queuedRunsCount > 0 ? 'text-status-warning-text' : 'text-white'
+              )}
+            >
+              {queuedRunsCount}
+            </div>
+          </div>
+          <Clock
+            className={cn(
+              'w-5 h-5 opacity-70',
+              queuedRunsCount > 0 ? 'text-status-warning-text' : 'text-geist-secondary'
+            )}
+          />
         </div>
 
         <div className="p-3 rounded-geist bg-geist-surface/70 border border-geist-hairline flex items-center justify-between">
@@ -243,7 +266,7 @@ export function DashboardView({
           <History className="w-5 h-5 text-geist-secondary opacity-70" />
         </div>
 
-        <div className="p-3 rounded-geist bg-geist-surface/70 border border-geist-hairline flex items-center justify-between">
+        <div className="p-3 rounded-geist bg-geist-surface/70 border border-geist-hairline flex items-center justify-between col-span-2 sm:col-span-1">
           <div className="space-y-0.5">
             <div className="text-[11px] font-medium text-geist-faint uppercase tracking-wider">
               Available Slots
@@ -304,6 +327,7 @@ export function DashboardView({
                   const isCompleted = r.status === 'completed' || r.status === 'success';
                   const isFailed = r.status === 'failed';
                   const isRunning = r.status === 'running' || r.status === 'in_progress';
+                  const isQueued = r.status === 'queued';
 
                   return (
                     <tr
@@ -320,7 +344,12 @@ export function DashboardView({
                           ) : isRunning ? (
                             <Activity className="w-3.5 h-3.5 text-status-warning-solid animate-pulse flex-shrink-0" />
                           ) : (
-                            <Clock className="w-3.5 h-3.5 text-geist-faint flex-shrink-0" />
+                            <Clock
+                              className={cn(
+                                'w-3.5 h-3.5 flex-shrink-0',
+                                isQueued ? 'text-status-warning-text' : 'text-geist-faint'
+                              )}
+                            />
                           )}
                           <Badge
                             variant={
@@ -330,9 +359,14 @@ export function DashboardView({
                                 ? 'destructive'
                                 : isRunning
                                 ? 'warning'
+                                : isQueued
+                                ? 'outline'
                                 : 'outline'
                             }
-                            className="text-[10px] uppercase font-mono px-1.5 py-0"
+                            className={cn(
+                              'text-[10px] uppercase font-mono px-1.5 py-0',
+                              isQueued && 'text-status-warning-text border-status-warning-border/60 bg-status-warning-bg/40'
+                            )}
                           >
                             {r.status}
                           </Badge>

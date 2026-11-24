@@ -47,6 +47,52 @@ func TestServer_StatusEndpoint(t *testing.T) {
 	if _, ok := res["daemon_connected"]; !ok {
 		t.Fatalf("expected daemon_connected field in response: %v", res)
 	}
+	if _, ok := res["queued_jobs"]; !ok {
+		t.Fatalf("expected queued_jobs field in response: %v", res)
+	}
+}
+
+func TestServer_StatusEndpoint_QueuedAndActiveJobs(t *testing.T) {
+	mockStore := &mockRunStore{
+		runs: []*history.RunRecord{
+			{ID: "run-q1", Repo: "adrijshikhar/actr", Status: "queued"},
+			{ID: "run-q2", Repo: "adrijshikhar/aim", Status: "queued"},
+			{ID: "run-a1", Repo: "adrijshikhar/actr", Status: "running"},
+			{ID: "run-c1", Repo: "adrijshikhar/actr", Status: "completed"},
+		},
+	}
+	mockProv := &mockRunnerProvider{
+		runners: []RunnerInfo{
+			{Repo: "adrijshikhar/actr", Name: "runner-1", MaxConcurrency: 2, ActiveSlots: 1},
+			{Repo: "adrijshikhar/aim", Name: "runner-2", MaxConcurrency: 2, ActiveSlots: 0},
+		},
+	}
+
+	srv := NewServer(ServerConfig{
+		Version:        "v0.2.0",
+		RunStore:       mockStore,
+		RunnerProvider: mockProv,
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+	var res StatusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("unmarshal status error: %v", err)
+	}
+	if res.QueuedJobs != 2 {
+		t.Fatalf("expected 2 queued jobs, got %d", res.QueuedJobs)
+	}
+	if res.ActiveJobs != 1 {
+		t.Fatalf("expected 1 active job, got %d", res.ActiveJobs)
+	}
+	if res.TotalRunners != 2 {
+		t.Fatalf("expected 2 total runners, got %d", res.TotalRunners)
+	}
 }
 
 func TestServer_SPAFallback(t *testing.T) {
@@ -413,6 +459,55 @@ func TestServer_Runners(t *testing.T) {
 	srvErr.ServeHTTP(recErr, reqErr)
 	if recErr.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 error, got %d", recErr.Code)
+	}
+}
+
+func TestServer_Runners_AugmentFromRunStore(t *testing.T) {
+	mockRunners := []RunnerInfo{
+		{
+			Repo:           "adrijshikhar/actr",
+			Name:           "actr-runner",
+			Labels:         []string{"self-hosted"},
+			MaxConcurrency: 2,
+			ActiveSlots:    0,
+			Status:         "idle",
+		},
+	}
+	mockProv := &mockRunnerProvider{runners: mockRunners}
+	mockStore := &mockRunStore{
+		runs: []*history.RunRecord{
+			{ID: "run-q1", Repo: "adrijshikhar/actr", Status: "queued"},
+			{ID: "run-q2", Repo: "adrijshikhar/actr", Status: "queued"},
+			{ID: "run-r1", Repo: "adrijshikhar/actr", Status: "running"},
+		},
+	}
+
+	srv := NewServer(ServerConfig{
+		RunnerProvider: mockProv,
+		RunStore:       mockStore,
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/runners", nil)
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+	var res []RunnerInfo
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("unmarshal runners error: %v", err)
+	}
+	if len(res) != 1 {
+		t.Fatalf("expected 1 runner, got %d", len(res))
+	}
+	if res[0].QueuedJobs != 2 {
+		t.Fatalf("expected 2 queued jobs, got %d", res[0].QueuedJobs)
+	}
+	if res[0].ActiveSlots != 1 {
+		t.Fatalf("expected 1 active slot, got %d", res[0].ActiveSlots)
+	}
+	if res[0].Status != "busy" {
+		t.Fatalf("expected runner status busy, got %s", res[0].Status)
 	}
 }
 

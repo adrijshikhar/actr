@@ -5,6 +5,7 @@ import {
   GitBranch,
   Cpu,
   CheckCircle2,
+  Clock,
 } from 'lucide-react';
 import type { RunnerInfo } from '@/lib/api';
 import { SlotGauge } from '@/components/charts/SlotGauge';
@@ -25,6 +26,7 @@ export function RunnersView({
 }: RunnersViewProps) {
   const totalSlots = runners.reduce((acc, r) => acc + (r.max_concurrency || 0), 0);
   const activeSlots = runners.reduce((acc, r) => acc + (r.active_slots || 0), 0);
+  const totalQueued = runners.reduce((acc, r) => acc + (r.queued_jobs || 0), 0);
 
   return (
     <div className="space-y-6">
@@ -46,10 +48,18 @@ export function RunnersView({
         </div>
 
         <div className="flex items-center gap-3">
-          <div className="text-right hidden sm:block font-mono text-xs">
-            <span className="text-geist-faint">Total Slots: </span>
-            <span className="text-white font-semibold">{activeSlots}</span>
-            <span className="text-geist-faint"> / {totalSlots}</span>
+          <div className="text-right hidden sm:block font-mono text-xs space-y-0.5">
+            <div>
+              <span className="text-geist-faint">Slots: </span>
+              <span className="text-white font-semibold">{activeSlots}</span>
+              <span className="text-geist-faint"> / {totalSlots}</span>
+            </div>
+            {totalQueued > 0 && (
+              <div className="text-[11px] text-status-warning-text flex items-center justify-end gap-1">
+                <Clock className="w-3 h-3" />
+                <span>{totalQueued} waiting in queue</span>
+              </div>
+            )}
           </div>
 
           <Button
@@ -105,18 +115,29 @@ export function RunnersView({
                       </div>
                     </div>
 
-                    <Badge
-                      variant={isBusy ? 'warning' : 'success'}
-                      className="text-[10px] font-mono uppercase px-2 py-0.5 flex-shrink-0 gap-1"
-                    >
-                      <span
-                        className={cn(
-                          'w-1.5 h-1.5 rounded-full',
-                          isBusy ? 'bg-status-warning-solid animate-pulse' : 'bg-status-success-solid'
-                        )}
-                      />
-                      {r.status || (isBusy ? 'busy' : 'idle')}
-                    </Badge>
+                    <div className="flex items-center gap-1.5 flex-shrink-0">
+                      {r.queued_jobs !== undefined && r.queued_jobs > 0 && (
+                        <Badge
+                          variant="outline"
+                          className="text-[10px] font-mono px-1.5 py-0.5 text-status-warning-text border-status-warning-border/60 bg-status-warning-bg/40 gap-1"
+                        >
+                          <Clock className="w-2.5 h-2.5" />
+                          <span>{r.queued_jobs} queued</span>
+                        </Badge>
+                      )}
+                      <Badge
+                        variant={isBusy ? 'warning' : 'success'}
+                        className="text-[10px] font-mono uppercase px-2 py-0.5 flex-shrink-0 gap-1"
+                      >
+                        <span
+                          className={cn(
+                            'w-1.5 h-1.5 rounded-full',
+                            isBusy ? 'bg-status-warning-solid animate-pulse' : 'bg-status-success-solid'
+                          )}
+                        />
+                        {r.status || (isBusy ? 'busy' : 'idle')}
+                      </Badge>
+                    </div>
                   </div>
                 </div>
 
@@ -163,10 +184,17 @@ export function RunnersView({
                     <Cpu className="w-3 h-3 text-geist-faint" />
                     <span>Max: {r.max_concurrency}</span>
                   </div>
-                  <div className="flex items-center gap-1">
-                    <CheckCircle2 className="w-3 h-3 text-status-success-text" />
-                    <span>{availableSlots} available</span>
-                  </div>
+                  {r.queued_jobs !== undefined && r.queued_jobs > 0 ? (
+                    <div className="flex items-center gap-1 text-status-warning-text font-medium">
+                      <Clock className="w-3 h-3" />
+                      <span>{r.queued_jobs} queued</span>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-1">
+                      <CheckCircle2 className="w-3 h-3 text-status-success-text" />
+                      <span>{availableSlots} available</span>
+                    </div>
+                  )}
                 </div>
               </div>
             );

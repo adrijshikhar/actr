@@ -11,23 +11,39 @@ import (
 
 // handleRunners returns the list of registered runner configurations.
 func (s *Server) handleRunners(w http.ResponseWriter, r *http.Request) {
+	var runners []RunnerInfo
 	if s.cfg.RunnerProvider != nil {
-		runners, err := s.cfg.RunnerProvider.GetRunners(r.Context())
+		var err error
+		runners, err = s.cfg.RunnerProvider.GetRunners(r.Context())
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		if runners == nil {
-			runners = []RunnerInfo{}
-		}
-		writeJSON(w, http.StatusOK, runners)
-		return
+	} else {
+		runners = s.fallbackRunners()
 	}
 
-	runners := s.fallbackRunners()
 	if runners == nil {
 		runners = []RunnerInfo{}
 	}
+
+	// Augment runners with queue depth and active slots from RunStore if available
+	if s.cfg.RunStore != nil {
+		for i := range runners {
+			if runners[i].QueuedJobs == 0 {
+				if _, queuedTotal, err := s.cfg.RunStore.GetRuns(r.Context(), 1, 0, runners[i].Repo, "queued", ""); err == nil && queuedTotal > 0 {
+					runners[i].QueuedJobs = queuedTotal
+				}
+			}
+			if runners[i].ActiveSlots == 0 {
+				if _, activeTotal, err := s.cfg.RunStore.GetRuns(r.Context(), 1, 0, runners[i].Repo, "running", ""); err == nil && activeTotal > 0 {
+					runners[i].ActiveSlots = activeTotal
+					runners[i].Status = "busy"
+				}
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, runners)
 }
 

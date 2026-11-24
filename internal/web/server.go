@@ -56,6 +56,7 @@ type RunnerInfo struct {
 	Labels         []string `json:"labels"`
 	MaxConcurrency int      `json:"max_concurrency"`
 	ActiveSlots    int      `json:"active_slots"`
+	QueuedJobs     int      `json:"queued_jobs,omitempty"`
 	Status         string   `json:"status"`
 }
 

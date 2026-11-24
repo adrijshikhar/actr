@@ -155,9 +155,10 @@ export function HistoryView({
               className="w-full h-8 px-2.5 rounded-geist bg-geist-elevated border border-geist-hairline text-xs text-white focus:outline-none focus:border-geist-blue transition-colors font-mono cursor-pointer"
             >
               <option value="all">Status: All</option>
+              <option value="queued">Status: Queued / Waiting</option>
+              <option value="running">Status: Running / Active</option>
               <option value="completed">Status: Completed / Success</option>
               <option value="failed">Status: Failed</option>
-              <option value="running">Status: Running / Active</option>
               <option value="interrupted">Status: Interrupted</option>
             </select>
           </div>
@@ -213,6 +214,7 @@ export function HistoryView({
                   const isCompleted = r.status === 'completed' || r.status === 'success';
                   const isFailed = r.status === 'failed';
                   const isRunning = r.status === 'running' || r.status === 'in_progress';
+                  const isQueued = r.status === 'queued';
 
                   return (
                     <tr
@@ -229,7 +231,12 @@ export function HistoryView({
                           ) : isRunning ? (
                             <Activity className="w-3.5 h-3.5 text-status-warning-solid animate-pulse flex-shrink-0" />
                           ) : (
-                            <Clock className="w-3.5 h-3.5 text-geist-faint flex-shrink-0" />
+                            <Clock
+                              className={cn(
+                                'w-3.5 h-3.5 flex-shrink-0',
+                                isQueued ? 'text-status-warning-text' : 'text-geist-faint'
+                              )}
+                            />
                           )}
                           <Badge
                             variant={
@@ -241,7 +248,10 @@ export function HistoryView({
                                 ? 'warning'
                                 : 'outline'
                             }
-                            className="text-[10px] uppercase font-mono px-1.5 py-0"
+                            className={cn(
+                              'text-[10px] uppercase font-mono px-1.5 py-0',
+                              isQueued && 'text-status-warning-text border-status-warning-border/60 bg-status-warning-bg/40'
+                            )}
                           >
                             {r.status}
                           </Badge>
