@@ -1,4 +1,4 @@
-.PHONY: build test test-install lint clean install release-snapshot
+.PHONY: build test test-install lint clean install release-snapshot web-build
 
 BINARY_NAME=actr
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "v0.1.0")
@@ -9,8 +9,11 @@ LDFLAGS=-ldflags "-s -w -X main.Version=$(VERSION) -X main.Commit=$(COMMIT) -X m
 INSTALL_DIR ?= $(HOME)/.local/bin
 COMPLETION_SHELL ?= zsh
 
-build:
-	CGO_ENABLED=0 go build $(LDFLAGS) -o bin/$(BINARY_NAME) ./cmd/actr
+web-build:
+	cd web && (npm ci 2>/dev/null || npm install) && npm run build
+
+build: web-build
+	CGO_ENABLED=0 go build -trimpath $(LDFLAGS) -o bin/$(BINARY_NAME) ./cmd/actr
 
 install: build
 	mkdir -p $(INSTALL_DIR)

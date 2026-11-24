@@ -111,12 +111,19 @@ func TestSeedHistoryStore(t *testing.T) {
 
 	runs, err := store.ListRuns(10)
 	require.NoError(t, err)
-	require.Len(t, runs, 3)
+	require.Len(t, runs, 4)
 
 	runMap := make(map[string]*history.RunSummary)
 	for _, r := range runs {
 		runMap[r.ID] = r
 	}
+
+	// Verify job-queued-1
+	qRun, ok := runMap["job-queued-1"]
+	require.True(t, ok, "missing job-queued-1")
+	assert.Equal(t, monitor.StatusQueued, qRun.Status)
+	assert.Equal(t, "actr", qRun.RepoAlias)
+	assert.Equal(t, 2, qRun.StepCount)
 
 	// Verify release-v0.1.0
 	rel, ok := runMap["release-v0.1.0"]

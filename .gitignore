@@ -1,6 +1,11 @@
 # Binaries
 bin/
-dist/
+/dist/
+!internal/web/dist/
+
+# Frontend dependencies
+node_modules/
+web/node_modules/
 
 # Test artifacts & logs
 *.log
@@ -24,5 +29,6 @@ go.work
 .idea/
 .superpowers/
 .openqodex/
+.impeccable/
 .worktrees/
 .worktrees
