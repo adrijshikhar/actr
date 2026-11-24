@@ -44,6 +44,9 @@ func (s *Server) handleSecretsList(w http.ResponseWriter, r *http.Request) {
 // handleSecretSet creates or updates a secret in the vault.
 // Validates key and value non-empty, and returns 201 on success.
 func (s *Server) handleSecretSet(w http.ResponseWriter, r *http.Request) {
+	if !s.requireLocalOrigin(w, r) {
+		return
+	}
 	if s.cfg.SecretManager == nil {
 		writeJSONError(w, http.StatusServiceUnavailable, "secret manager not configured")
 		return
@@ -86,6 +89,9 @@ func (s *Server) handleSecretSet(w http.ResponseWriter, r *http.Request) {
 // handleSecretDelete removes a secret by key from the vault.
 // Returns 200 on success, 404 if not found, 400 if key is empty.
 func (s *Server) handleSecretDelete(w http.ResponseWriter, r *http.Request) {
+	if !s.requireLocalOrigin(w, r) {
+		return
+	}
 	if s.cfg.SecretManager == nil {
 		writeJSONError(w, http.StatusServiceUnavailable, "secret manager not configured")
 		return

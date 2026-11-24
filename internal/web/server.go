@@ -105,6 +105,33 @@ type Server struct {
 // Compile-time interface verification
 var _ http.Handler = (*Server)(nil)
 
+// requireLocalOrigin validates that mutating requests do not originate from external cross-origin browser contexts.
+func (s *Server) requireLocalOrigin(w http.ResponseWriter, r *http.Request) bool {
+	// Block explicit cross-site browser requests via Fetch Metadata
+	if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+		writeJSONError(w, http.StatusForbidden, "cross-origin requests are forbidden")
+		return false
+	}
+
+	// Validate Origin header if present
+	if origin := r.Header.Get("Origin"); origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil {
+			writeJSONError(w, http.StatusForbidden, "invalid origin")
+			return false
+		}
+		hostname := u.Hostname()
+		if hostname != "127.0.0.1" && hostname != "localhost" && hostname != "::1" && hostname != r.Host {
+			if h, _, err := net.SplitHostPort(r.Host); err == nil && hostname == h {
+				return true
+			}
+			writeJSONError(w, http.StatusForbidden, "cross-origin requests are forbidden")
+			return false
+		}
+	}
+	return true
+}
+
 // NewServer initializes and routes a new web dashboard Server.
 func NewServer(cfg ServerConfig) *Server {
 	if cfg.Host == "" {

@@ -41,6 +41,9 @@ func (s *Server) handleServiceStatus(w http.ResponseWriter, r *http.Request) {
 // handleServiceStart starts the actr background daemon service.
 // Uses DaemonController if configured, otherwise falls back to service.Start().
 func (s *Server) handleServiceStart(w http.ResponseWriter, r *http.Request) {
+	if !s.requireLocalOrigin(w, r) {
+		return
+	}
 	var err error
 	if s.cfg.DaemonController != nil {
 		err = s.cfg.DaemonController.Start()
@@ -61,6 +64,9 @@ func (s *Server) handleServiceStart(w http.ResponseWriter, r *http.Request) {
 // handleServiceStop stops the actr background daemon service.
 // Uses DaemonController if configured, otherwise falls back to service.Stop().
 func (s *Server) handleServiceStop(w http.ResponseWriter, r *http.Request) {
+	if !s.requireLocalOrigin(w, r) {
+		return
+	}
 	var err error
 	if s.cfg.DaemonController != nil {
 		err = s.cfg.DaemonController.Stop()

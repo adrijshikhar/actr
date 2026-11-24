@@ -90,6 +90,27 @@ function parseAnsiLine(rawLine: string): AnsiSegment[] {
     47: '#333333',
   };
 
+  /**
+   * Converts an ANSI 256-color index (0-255) to an RGB string.
+   */
+  const ansi256ToColor = (code: number): string => {
+    if (code < 16) {
+      return colorMap[code < 8 ? 30 + code : 90 + (code - 8)] || '#ededed';
+    }
+    if (code >= 16 && code <= 231) {
+      const idx = code - 16;
+      const r = Math.floor(idx / 36);
+      const g = Math.floor((idx % 36) / 6);
+      const b = idx % 6;
+      return `rgb(${r ? r * 40 + 55 : 0}, ${g ? g * 40 + 55 : 0}, ${b ? b * 40 + 55 : 0})`;
+    }
+    if (code >= 232 && code <= 255) {
+      const gray = (code - 232) * 10 + 8;
+      return `rgb(${gray}, ${gray}, ${gray})`;
+    }
+    return '#ededed';
+  };
+
   let match: RegExpExecArray | null;
   while ((match = regex.exec(line)) !== null) {
     // Push preceding text segment if any
@@ -145,10 +166,18 @@ function parseAnsiLine(rawLine: string): AnsiSegment[] {
           // 24-bit Truecolor foreground
           color = `rgb(${codes[i + 2]}, ${codes[i + 3]}, ${codes[i + 4]})`;
           i += 4;
+        } else if (code === 38 && codes[i + 1] === 5 && i + 2 < codes.length) {
+          // 256-color foreground
+          color = ansi256ToColor(codes[i + 2]);
+          i += 2;
         } else if (code === 48 && codes[i + 1] === 2 && i + 4 < codes.length) {
           // 24-bit Truecolor background
           bgColor = `rgb(${codes[i + 2]}, ${codes[i + 3]}, ${codes[i + 4]})`;
           i += 4;
+        } else if (code === 48 && codes[i + 1] === 5 && i + 2 < codes.length) {
+          // 256-color background
+          bgColor = ansi256ToColor(codes[i + 2]);
+          i += 2;
         } else if (code >= 30 && code <= 37) {
           color = colorMap[code];
         } else if (code === 39) {
@@ -248,11 +277,22 @@ export function LogViewer({
     return parsedCacheRef.current;
   }, [logs]);
 
-  // Synchronize container height on mount/resize/fullscreen
+  // Synchronize container height on mount/resize/fullscreen using ResizeObserver
   useEffect(() => {
-    if (containerRef.current) {
-      setContainerHeight(containerRef.current.clientHeight || 480);
-    }
+    const el = containerRef.current;
+    if (!el) return;
+    setContainerHeight(el.clientHeight || 480);
+
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.contentRect.height > 0) {
+          setContainerHeight(entry.contentRect.height);
+        }
+      }
+    });
+    ro.observe(el);
+
+    return () => ro.disconnect();
   }, [isFullscreen, height]);
 
   // Search match positions: line indices matching the query

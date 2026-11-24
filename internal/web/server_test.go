@@ -1871,3 +1871,56 @@ func TestServer_FallbackHostMetrics_PanicRecovery(t *testing.T) {
 		t.Fatal("expected non-zero timestamp")
 	}
 }
+
+func TestServer_CrossOriginProtection(t *testing.T) {
+	mgr := newMockSecretManager()
+	daemon := &mockDaemonController{statusStr: "running"}
+	srv := NewServer(ServerConfig{
+		SecretManager:    mgr,
+		DaemonController: daemon,
+	})
+
+	t.Run("external origin blocked with 403", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/service/stop", nil)
+		req.Header.Set("Origin", "https://malicious-website.com")
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden, got %d", rec.Code)
+		}
+	})
+
+	t.Run("cross-site fetch site blocked with 403", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/service/start", nil)
+		req.Header.Set("Sec-Fetch-Site", "cross-site")
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden, got %d", rec.Code)
+		}
+	})
+
+	t.Run("local 127.0.0.1 origin allowed", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/service/start", nil)
+		req.Header.Set("Origin", "http://127.0.0.1:18490")
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+	})
+
+	t.Run("localhost origin allowed", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/service/stop", nil)
+		req.Header.Set("Origin", "http://localhost:5174")
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+	})
+}

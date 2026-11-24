@@ -16,6 +16,7 @@ async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
     ...options,
     headers: {
       'Content-Type': 'application/json',
+      'X-Actr-Web': '1',
       ...options?.headers,
     },
   });
