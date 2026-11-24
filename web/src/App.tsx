@@ -29,6 +29,7 @@ import {
 } from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
+import { ActrLogo } from '@/components/ui/ActrLogo';
 import { cn, formatBytes, formatDuration, formatAppVersion } from '@/lib/utils';
 import {
   DashboardView,
@@ -170,9 +171,7 @@ export default function App() {
         <div>
           <div className="h-14 flex items-center justify-between px-4 border-b border-geist-hairline">
             <div className="flex items-center gap-2.5 min-w-0">
-              <div className="w-7 h-7 rounded-[6px] bg-gradient-to-b from-[#242424] to-[#121212] border border-geist-borderHover/80 flex items-center justify-center shadow-sm flex-shrink-0">
-                <Terminal className="w-3.5 h-3.5 text-white" />
-              </div>
+              <ActrLogo size={28} showGlow />
               <div className="flex items-center gap-1.5 min-w-0">
                 <span className="font-semibold text-sm tracking-tight text-white">actr</span>
                 <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-geist-hover text-geist-secondary border border-geist-hairline flex-shrink-0">
