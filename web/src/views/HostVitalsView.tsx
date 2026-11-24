@@ -9,7 +9,6 @@ import {
   LayoutGrid,
   Rows,
   Clock,
-  RotateCw,
   Pause,
   Play,
 } from 'lucide-react';
@@ -23,7 +22,6 @@ import {
   NetworkAreaChart,
 } from '@/components/charts';
 import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
 
 export interface HostVitalsViewProps {
   status?: StatusResponse | null;
@@ -78,8 +76,19 @@ export function HostVitalsView({
   runners = [],
   onRefresh,
 }: HostVitalsViewProps) {
-  // Visible samples state (frozen when paused, or throttled to cadence)
-  const [metricsHistory, setMetricsHistory] = useState<TelemetrySample[]>([]);
+  // Initialize initial sample synchronously from status to prevent empty-frame layout shift
+  const [metricsHistory, setMetricsHistory] = useState<TelemetrySample[]>(() => {
+    if (status) {
+      const initial = createHostSample({
+        timestamp: new Date().toISOString(),
+        host_cpu: status.host_cpu || 0,
+        host_mem_used: status.host_mem_used || 0,
+        host_mem_total: status.host_mem_total || 0,
+      });
+      return [initial];
+    }
+    return [];
+  });
   const [streamActive, setStreamActive] = useState(false);
   const [lastTick, setLastTick] = useState<string | null>(null);
   const [layoutMode, setLayoutMode] = useState<'grid' | 'stacked'>('grid');
@@ -93,22 +102,14 @@ export function HostVitalsView({
   const [isPolling, setIsPolling] = useState<boolean>(false);
 
   // High-frequency mutable refs to retain full telemetry stream without dropping samples during inspection
-  const allSamplesRef = useRef<TelemetrySample[]>([]);
+  const allSamplesRef = useRef<TelemetrySample[]>(metricsHistory);
   const isPausedRef = useRef<boolean>(false);
   const cadenceRef = useRef<'1' | '2' | '5' | '10' | 'off'>('1');
   const lastRenderMsRef = useRef<number>(0);
+  const statusRef = useRef<StatusResponse | null | undefined>(status);
 
   useEffect(() => {
-    isPausedRef.current = isPaused;
-  }, [isPaused]);
-
-  useEffect(() => {
-    cadenceRef.current = refreshCadence;
-  }, [refreshCadence]);
-
-  // Subscribe to real-time 1s SSE metrics stream
-  useEffect(() => {
-    // Prime initial baseline from status if available
+    statusRef.current = status;
     if (status && allSamplesRef.current.length === 0) {
       const initial = createHostSample({
         timestamp: new Date().toISOString(),
@@ -119,7 +120,18 @@ export function HostVitalsView({
       allSamplesRef.current = [initial];
       setMetricsHistory([initial]);
     }
+  }, [status]);
 
+  useEffect(() => {
+    isPausedRef.current = isPaused;
+  }, [isPaused]);
+
+  useEffect(() => {
+    cadenceRef.current = refreshCadence;
+  }, [refreshCadence]);
+
+  // Subscribe to real-time 1s SSE metrics stream ONCE on mount (prevents 5s polling teardown/reconnect flicker)
+  useEffect(() => {
     const unsub = subscribeMetrics(
       (m: RunnerMetrics) => {
         setStreamActive(true);
@@ -174,7 +186,7 @@ export function HostVitalsView({
       unsub();
       setStreamActive(false);
     };
-  }, [status]);
+  }, []); // Run ONCE on mount! Zero periodic reconnection or badge flickers!
 
   // Pause / Resume toggle handler
   const togglePause = useCallback(() => {
@@ -325,65 +337,63 @@ export function HostVitalsView({
               </select>
             </div>
 
-            {/* 2. Play / Pause Freeze Toggle */}
-            <button
-              type="button"
-              onClick={togglePause}
-              aria-label={isPaused ? 'Resume live metrics stream' : 'Pause metrics stream'}
-              className={cn(
-                'flex items-center gap-1 px-2 py-1 rounded text-[11px] font-mono tracking-tight transition-colors border cursor-pointer select-none',
-                isPaused
-                  ? 'border-status-warning-border bg-status-warning-bg/30 text-status-warning-text hover:bg-status-warning-bg/50'
-                  : 'border-geist-hairline bg-geist-canvas text-geist-secondary hover:text-white hover:bg-geist-hover'
-              )}
-              title={isPaused ? 'Resume live streaming' : 'Freeze graph to inspect data points'}
-            >
-              {isPaused ? (
-                <>
-                  <Play className="w-3 h-3 fill-status-warning-text text-status-warning-text" />
-                  <span>Resume</span>
-                </>
-              ) : (
-                <>
-                  <Pause className="w-3 h-3" />
-                  <span>Pause</span>
-                </>
-              )}
-            </button>
-
-            {/* 3. Auto-Refresh Cadence Selector */}
-            <div className="flex items-center gap-1 bg-geist-canvas border border-geist-hairline rounded px-2 py-1 text-[11px] font-mono tracking-tight text-geist-secondary hover:border-geist-borderHover transition-colors">
-              <RotateCw className="w-3 h-3 text-geist-faint flex-shrink-0" />
-              <label htmlFor="refresh-cadence-select" className="sr-only">
-                Auto-Refresh Cadence
-              </label>
-              <select
-                id="refresh-cadence-select"
-                value={refreshCadence}
-                onChange={(e) => handleCadenceChange(e.target.value)}
-                className="bg-transparent text-white font-medium text-[11px] font-mono focus:outline-none cursor-pointer pr-0.5"
-                title="Select auto-refresh interval"
+            {/* 2. Merged Grafana-Style Stream & Auto-Refresh Compound Control */}
+            <div className="flex items-center border border-geist-hairline rounded bg-geist-canvas overflow-hidden">
+              {/* Play / Pause Toggle Button */}
+              <button
+                type="button"
+                onClick={togglePause}
+                aria-label={isPaused ? 'Resume live metrics stream' : 'Pause metrics stream'}
+                className={cn(
+                  'flex items-center justify-center h-[26px] px-2 border-r border-geist-hairline transition-colors cursor-pointer select-none',
+                  isPaused
+                    ? 'bg-status-warning-bg/30 text-status-warning-text hover:bg-status-warning-bg/50'
+                    : 'text-geist-secondary hover:text-white hover:bg-geist-hover'
+                )}
+                title={isPaused ? 'Click to resume live stream' : 'Click to freeze graph to inspect points'}
               >
-                {REFRESH_INTERVALS.map((r) => (
-                  <option key={r.value} value={r.value} className="bg-geist-surface text-white">
-                    {r.label}
-                  </option>
-                ))}
-              </select>
-            </div>
+                {isPaused ? (
+                  <Play className="w-3 h-3 fill-status-warning-text text-status-warning-text" />
+                ) : (
+                  <Pause className="w-3 h-3 text-geist-secondary" />
+                )}
+              </button>
 
-            {/* 4. Manual Poll Button */}
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleManualPoll}
-              disabled={isPolling}
-              className="h-[26px] text-[11px] font-mono tracking-tight px-2 gap-1 border-geist-hairline bg-geist-canvas hover:bg-geist-hover text-geist-secondary hover:text-white"
-              title="Fetch instantaneous telemetry snapshot"
-            >
-              <RefreshCw className={cn('w-3 h-3', isPolling && 'animate-spin text-geist-blue')} />
-              <span>Poll</span>
-            </Button>
+              {/* Cadence Selector */}
+              <div className="flex items-center px-1.5 h-[26px] text-[11px] font-mono tracking-tight text-geist-secondary hover:border-geist-borderHover transition-colors">
+                <label htmlFor="refresh-cadence-select" className="sr-only">
+                  Auto-Refresh Cadence
+                </label>
+                <select
+                  id="refresh-cadence-select"
+                  value={refreshCadence}
+                  onChange={(e) => handleCadenceChange(e.target.value)}
+                  className={cn(
+                    'bg-transparent font-medium text-[11px] font-mono focus:outline-none cursor-pointer pr-0.5',
+                    isPaused ? 'text-status-warning-text font-semibold' : 'text-white'
+                  )}
+                  title="Select auto-refresh interval"
+                >
+                  {REFRESH_INTERVALS.map((r) => (
+                    <option key={r.value} value={r.value} className="bg-geist-surface text-white">
+                      {r.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Instantaneous Poll Snapshot */}
+              <button
+                type="button"
+                onClick={handleManualPoll}
+                disabled={isPolling}
+                className="flex items-center justify-center h-[26px] px-2 border-l border-geist-hairline text-geist-secondary hover:text-white hover:bg-geist-hover transition-colors cursor-pointer disabled:opacity-50"
+                title="Fetch instantaneous telemetry snapshot"
+                aria-label="Poll metrics snapshot"
+              >
+                <RefreshCw className={cn('w-3 h-3', isPolling && 'animate-spin text-geist-blue')} />
+              </button>
+            </div>
 
             {/* 5. Layout Mode Switcher (Icon-only compact segmented button) */}
             <div className="flex items-center border border-geist-hairline rounded bg-geist-canvas p-0.5 ml-0.5">

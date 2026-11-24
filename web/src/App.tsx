@@ -66,9 +66,9 @@ export default function App() {
   );
   const versionInfo = formatAppVersion(status?.version);
 
-  const loadStatus = useCallback(async () => {
+  const loadStatus = useCallback(async (isManual = false) => {
     try {
-      setStatusLoading(true);
+      if (isManual) setStatusLoading(true);
       const s = await fetchStatus();
       setStatus(s);
       setStatusError(null);
@@ -77,7 +77,7 @@ export default function App() {
       const msg = err instanceof Error ? err.message : 'Failed to fetch status';
       setStatusError(msg);
     } finally {
-      setStatusLoading(false);
+      if (isManual) setStatusLoading(false);
     }
   }, []);
 
@@ -108,13 +108,13 @@ export default function App() {
     }
   }, []);
 
-  // Poll status every 5 seconds
+  // Poll status every 5 seconds (background poll does not flash loading spinners)
   useEffect(() => {
-    loadStatus();
+    loadStatus(true);
     loadRunners();
     loadRuns();
     const interval = setInterval(() => {
-      loadStatus();
+      loadStatus(false);
     }, 5000);
     return () => clearInterval(interval);
   }, [loadStatus, loadRunners, loadRuns]);
@@ -386,7 +386,7 @@ export default function App() {
             <Button
               variant="ghost"
               size="sm"
-              onClick={loadStatus}
+              onClick={() => loadStatus(true)}
               disabled={statusLoading}
               className="h-8 gap-1.5 text-xs text-geist-secondary hover:text-white"
             >
