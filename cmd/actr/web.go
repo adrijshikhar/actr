@@ -392,14 +392,8 @@ func runWebForeground(cmd *cobra.Command, port int, devMode, noOpen, demoMode bo
 
 	masker := engine.NewSecretMasker()
 
-	var (
-		tmpDemoDir string
-		demoCancel context.CancelFunc
-	)
+	var tmpDemoDir string
 	defer func() {
-		if demoCancel != nil {
-			demoCancel()
-		}
 		if tmpDemoDir != "" {
 			_ = os.RemoveAll(tmpDemoDir)
 		}
@@ -425,8 +419,8 @@ func runWebForeground(cmd *cobra.Command, port int, devMode, noOpen, demoMode bo
 		serverCfg.RunStore = hAdapter
 
 		tmpSock := filepath.Join(os.TempDir(), fmt.Sprintf("actr-demo-web-%d.sock", os.Getpid()))
-		var demoCtx context.Context
-		demoCtx, demoCancel = context.WithCancel(cmd.Context())
+		demoCtx, cancel := context.WithCancel(cmd.Context())
+		defer cancel()
 
 		demoServer, err := demo.StartServerWithStore(demoCtx, tmpSock, demoStore)
 		if err != nil {

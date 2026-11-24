@@ -69,7 +69,10 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
       }
 
       // If run already completed, fetch historical full logs
-      const isFinished = runData.status === 'completed' || runData.status === 'failed';
+      const isFinished =
+        runData.status === 'completed' ||
+        runData.status === 'success' ||
+        runData.status === 'failed';
       if (isFinished) {
         try {
           const res = await fetchLogs(runId);
@@ -101,7 +104,10 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
       return;
     }
 
-    const isFinished = run?.status === 'completed' || run?.status === 'failed';
+    const isFinished =
+      run?.status === 'completed' ||
+      run?.status === 'success' ||
+      run?.status === 'failed';
     if (!isFinished) {
       // During active run, client-side filtering by stepId handles it
       setStepLogs(null);
