@@ -141,5 +141,28 @@ func SeedHistoryStore(store history.Store) error {
 		return err
 	}
 
+	// 4. job-queued-1 (queued task waiting for available runner slot)
+	runQueued := &monitor.JobInfo{
+		ID:        "job-queued-1",
+		Name:      "test-matrix-concurrent",
+		Workflow:  "E2E Integration Matrix (#43589210)",
+		Repo:      "actr",
+		RepoAlias: "actr",
+		RepoURL:   "https://github.com/adrijshikhar/actr",
+		Owner:     "adrijshikhar",
+		Driver:    "docker",
+		Status:    monitor.StatusQueued,
+		StartedAt: now.Add(-30 * time.Second),
+		Steps: []*monitor.StepInfo{
+			{ID: "q-1", Number: 1, Name: "Provision runner container sandbox", Status: monitor.StatusQueued},
+			{ID: "q-2", Number: 2, Name: "Run multi-platform integration tests", Status: monitor.StatusQueued},
+		},
+	}
+	if err := store.StartRun(runQueued, nil, "docker"); err != nil {
+		return err
+	}
+	_ = store.AppendStepLog(runQueued.ID, "q-1", "\x1b[38;5;244m2026-11-24T22:40:00Z\x1b[0m \x1b[1;33m⏳ Queued:\x1b[0m Job is waiting in queue for runner 'actr-runner-darwin-01' (max concurrency: 4, occupied: 2)")
+	_ = store.AppendStepLog(runQueued.ID, "q-1", "\x1b[38;5;244m2026-11-24T22:40:01Z\x1b[0m Waiting for workflow slot allocation...")
+
 	return nil
 }
