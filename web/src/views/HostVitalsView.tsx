@@ -6,12 +6,18 @@ import {
   Network,
   Server,
   RefreshCw,
+  LayoutGrid,
+  Rows,
 } from 'lucide-react';
 import type { StatusResponse, RunnerInfo, TelemetrySample, RunnerMetrics } from '@/lib/api';
 import { subscribeMetrics } from '@/lib/sse';
-import { formatBytes, formatDuration, getProgressWidthClass, cn } from '@/lib/utils';
-import { VitalsAreaChart } from '@/components/charts/VitalsAreaChart';
-import { ThroughputChart } from '@/components/charts/ThroughputChart';
+import { formatBytes, formatDuration, formatRate, getProgressWidthClass, cn } from '@/lib/utils';
+import {
+  CpuAreaChart,
+  MemoryAreaChart,
+  DiskAreaChart,
+  NetworkAreaChart,
+} from '@/components/charts';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 
@@ -19,11 +25,6 @@ export interface HostVitalsViewProps {
   status?: StatusResponse | null;
   runners?: RunnerInfo[];
   onRefresh?: () => void;
-}
-
-function formatRate(bytesPerSec?: number): string {
-  if (!bytesPerSec || bytesPerSec <= 0) return '0 B/s';
-  return `${formatBytes(bytesPerSec)}/s`;
 }
 
 function createHostSample(partial: Partial<TelemetrySample> & { timestamp: string }): TelemetrySample {
@@ -58,6 +59,7 @@ export function HostVitalsView({
   const [metricsHistory, setMetricsHistory] = useState<TelemetrySample[]>([]);
   const [streamActive, setStreamActive] = useState(false);
   const [lastTick, setLastTick] = useState<string | null>(null);
+  const [layoutMode, setLayoutMode] = useState<'grid' | 'stacked'>('grid');
 
   // Subscribe to real-time 1s SSE metrics stream
   useEffect(() => {
@@ -159,11 +161,44 @@ export function HostVitalsView({
           </p>
         </div>
 
-        <div className="flex items-center gap-3 text-xs font-mono text-geist-faint">
+        <div className="flex items-center gap-2 sm:gap-3 text-xs font-mono text-geist-faint flex-wrap">
           {lastTick && (
-            <span>Last sample: <span className="text-geist-secondary">{lastTick}</span></span>
+            <span className="hidden md:inline">Last: <span className="text-geist-secondary">{lastTick}</span></span>
           )}
           <span>Buffer: <span className="text-geist-secondary">{metricsHistory.length}s</span></span>
+
+          {/* Layout Mode Switcher */}
+          <div className="flex items-center border border-geist-hairline rounded bg-geist-canvas p-0.5">
+            <button
+              type="button"
+              onClick={() => setLayoutMode('grid')}
+              className={cn(
+                'flex items-center gap-1 px-2 py-1 rounded text-[11px] font-sans transition-colors cursor-pointer',
+                layoutMode === 'grid'
+                  ? 'bg-geist-elevated text-white font-medium shadow-sm'
+                  : 'text-geist-faint hover:text-white'
+              )}
+              title="2x2 Grid View"
+            >
+              <LayoutGrid className="w-3 h-3" />
+              <span>Grid</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setLayoutMode('stacked')}
+              className={cn(
+                'flex items-center gap-1 px-2 py-1 rounded text-[11px] font-sans transition-colors cursor-pointer',
+                layoutMode === 'stacked'
+                  ? 'bg-geist-elevated text-white font-medium shadow-sm'
+                  : 'text-geist-faint hover:text-white'
+              )}
+              title="Stacked Full-Width View"
+            >
+              <Rows className="w-3 h-3" />
+              <span>Stacked</span>
+            </button>
+          </div>
+
           {onRefresh && (
             <Button
               variant="outline"
@@ -172,32 +207,30 @@ export function HostVitalsView({
               className="h-7 text-xs px-2.5 gap-1.5"
             >
               <RefreshCw className="w-3 h-3" />
-              <span>Poll Now</span>
+              <span className="hidden sm:inline">Poll</span>
             </Button>
           )}
         </div>
       </div>
 
       {/* Top 4 Vitals Gauges */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
         {/* Host CPU Card */}
-        <div className="rounded-geist bg-geist-surface border border-geist-hairline p-4 flex flex-col justify-between min-h-[170px]">
-          <div>
-            <div className="flex items-center justify-between text-xs text-geist-secondary pb-2 border-b border-geist-hairline/60">
-              <span className="font-semibold text-white">CPU Utilization</span>
-              <Cpu className="w-3.5 h-3.5 text-geist-blue" />
-            </div>
-            <div className="mt-3 space-y-1">
-              <div className="text-3xl font-bold font-mono tracking-tight text-white">
-                {currentCpu.toFixed(1)}%
-              </div>
-              <p className="text-xs text-geist-secondary">
-                Load 1m: {latest?.host_load_1m ? latest.host_load_1m.toFixed(2) : '0.00'}
-              </p>
-            </div>
+        <div className="rounded-geist bg-geist-surface border border-geist-hairline p-3 flex flex-col justify-between">
+          <div className="flex items-center justify-between text-xs text-geist-secondary pb-1.5 border-b border-geist-hairline/60">
+            <span className="font-semibold text-white">CPU Utilization</span>
+            <Cpu className="w-3.5 h-3.5 text-geist-blue" />
           </div>
-          <div className="space-y-1.5 pt-3 border-t border-geist-hairline/60">
-            <div className="w-full bg-geist-elevated h-2 rounded-full overflow-hidden border border-geist-hairline">
+          <div className="my-2">
+            <div className="text-2xl font-bold font-mono tracking-tight text-white">
+              {currentCpu.toFixed(1)}%
+            </div>
+            <p className="text-[11px] text-geist-secondary">
+              Load 1m: {latest?.host_load_1m ? latest.host_load_1m.toFixed(2) : '0.00'}
+            </p>
+          </div>
+          <div className="space-y-1 pt-1.5 border-t border-geist-hairline/60">
+            <div className="w-full bg-geist-elevated h-1.5 rounded-full overflow-hidden border border-geist-hairline">
               <div
                 className={cn(
                   'bg-geist-blue h-full transition-all duration-500 rounded-full',
@@ -205,7 +238,7 @@ export function HostVitalsView({
                 )}
               />
             </div>
-            <div className="flex items-center justify-between text-[11px] font-mono text-geist-faint">
+            <div className="flex items-center justify-between text-[10px] font-mono text-geist-faint">
               <span>Idle: {Math.max(100 - currentCpu, 0).toFixed(1)}%</span>
               <span>Active: {currentCpu.toFixed(1)}%</span>
             </div>
@@ -213,23 +246,21 @@ export function HostVitalsView({
         </div>
 
         {/* Host Memory Card */}
-        <div className="rounded-geist bg-geist-surface border border-geist-hairline p-4 flex flex-col justify-between min-h-[170px]">
-          <div>
-            <div className="flex items-center justify-between text-xs text-geist-secondary pb-2 border-b border-geist-hairline/60">
-              <span className="font-semibold text-white">Host Memory</span>
-              <HardDrive className="w-3.5 h-3.5 text-status-success-solid" />
-            </div>
-            <div className="mt-3 space-y-1">
-              <div className="text-3xl font-bold font-mono tracking-tight text-white">
-                {formatBytes(currentMemUsed)}
-              </div>
-              <p className="text-xs text-geist-secondary">
-                of {formatBytes(currentMemTotal)} allocated
-              </p>
-            </div>
+        <div className="rounded-geist bg-geist-surface border border-geist-hairline p-3 flex flex-col justify-between">
+          <div className="flex items-center justify-between text-xs text-geist-secondary pb-1.5 border-b border-geist-hairline/60">
+            <span className="font-semibold text-white">Host Memory</span>
+            <HardDrive className="w-3.5 h-3.5 text-status-success-solid" />
           </div>
-          <div className="space-y-1.5 pt-3 border-t border-geist-hairline/60">
-            <div className="w-full bg-geist-elevated h-2 rounded-full overflow-hidden border border-geist-hairline">
+          <div className="my-2">
+            <div className="text-2xl font-bold font-mono tracking-tight text-white">
+              {formatBytes(currentMemUsed)}
+            </div>
+            <p className="text-[11px] text-geist-secondary">
+              of {formatBytes(currentMemTotal)} ({memPercent}%)
+            </p>
+          </div>
+          <div className="space-y-1 pt-1.5 border-t border-geist-hairline/60">
+            <div className="w-full bg-geist-elevated h-1.5 rounded-full overflow-hidden border border-geist-hairline">
               <div
                 className={cn(
                   'bg-status-success-solid h-full transition-all duration-500 rounded-full',
@@ -237,7 +268,7 @@ export function HostVitalsView({
                 )}
               />
             </div>
-            <div className="flex items-center justify-between text-[11px] font-mono text-geist-faint">
+            <div className="flex items-center justify-between text-[10px] font-mono text-geist-faint">
               <span>{memPercent}% used</span>
               <span>{formatBytes(Math.max(currentMemTotal - currentMemUsed, 0))} free</span>
             </div>
@@ -245,67 +276,88 @@ export function HostVitalsView({
         </div>
 
         {/* Disk Write Activity */}
-        <div className="rounded-geist bg-geist-surface border border-geist-hairline p-4 flex flex-col justify-between min-h-[170px]">
-          <div>
-            <div className="flex items-center justify-between text-xs text-geist-secondary pb-2 border-b border-geist-hairline/60">
-              <span className="font-semibold text-white">Disk Write I/O</span>
-              <HardDrive className="w-3.5 h-3.5 text-status-warning-text" />
-            </div>
-            <div className="mt-3 space-y-1">
-              <div className="text-3xl font-bold font-mono tracking-tight text-white">
-                {formatRate(diskWriteRate)}
-              </div>
-              <p className="text-xs text-geist-secondary">
-                Real-time disk commit throughput
-              </p>
-            </div>
+        <div className="rounded-geist bg-geist-surface border border-geist-hairline p-3 flex flex-col justify-between">
+          <div className="flex items-center justify-between text-xs text-geist-secondary pb-1.5 border-b border-geist-hairline/60">
+            <span className="font-semibold text-white">Disk Write I/O</span>
+            <HardDrive className="w-3.5 h-3.5 text-status-warning-text" />
           </div>
-          <div className="pt-3 border-t border-geist-hairline/60 flex items-center justify-between text-[11px] font-mono text-geist-faint">
-            <span>Storage: {formatBytes(latest?.disk_used_bytes || 0)} used</span>
+          <div className="my-2">
+            <div className="text-2xl font-bold font-mono tracking-tight text-white">
+              {formatRate(diskWriteRate)}
+            </div>
+            <p className="text-[11px] text-geist-secondary">
+              Used: {formatBytes(latest?.disk_used_bytes || 0)}
+            </p>
+          </div>
+          <div className="pt-1.5 border-t border-geist-hairline/60 flex items-center justify-between text-[10px] font-mono text-geist-faint">
+            <span>Storage: {formatBytes(latest?.disk_used_bytes || 0)}</span>
             <span>Ratio: {Math.round((latest?.disk_used_ratio || 0) * 100)}%</span>
           </div>
         </div>
 
         {/* Network Transfer */}
-        <div className="rounded-geist bg-geist-surface border border-geist-hairline p-4 flex flex-col justify-between min-h-[170px]">
-          <div>
-            <div className="flex items-center justify-between text-xs text-geist-secondary pb-2 border-b border-geist-hairline/60">
-              <span className="font-semibold text-white">Network Bandwidth</span>
-              <Network className="w-3.5 h-3.5 text-geist-blue" />
-            </div>
-            <div className="mt-3 space-y-1">
-              <div className="text-3xl font-bold font-mono tracking-tight text-white">
-                {formatRate(totalIoRate)}
-              </div>
-              <p className="text-xs text-geist-secondary">
-                RX {formatRate(netRxRate)} · TX {formatRate(netTxRate)}
-              </p>
-            </div>
+        <div className="rounded-geist bg-geist-surface border border-geist-hairline p-3 flex flex-col justify-between">
+          <div className="flex items-center justify-between text-xs text-geist-secondary pb-1.5 border-b border-geist-hairline/60">
+            <span className="font-semibold text-white">Network Bandwidth</span>
+            <Network className="w-3.5 h-3.5 text-geist-blue" />
           </div>
-          <div className="pt-3 border-t border-geist-hairline/60 flex items-center justify-between text-[11px] font-mono text-geist-faint">
+          <div className="my-2">
+            <div className="text-2xl font-bold font-mono tracking-tight text-white">
+              {formatRate(totalIoRate)}
+            </div>
+            <p className="text-[11px] text-geist-secondary">
+              RX {formatRate(netRxRate)} · TX {formatRate(netTxRate)}
+            </p>
+          </div>
+          <div className="pt-1.5 border-t border-geist-hairline/60 flex items-center justify-between text-[10px] font-mono text-geist-faint">
             <span>Sockets: Active</span>
             <span>Cadence: 1.0 Hz</span>
           </div>
         </div>
       </div>
 
-      {/* Primary Telemetry Area Charts */}
-      <div className="space-y-6">
-        {/* Real-time CPU & Memory Dual Area Chart */}
-        <VitalsAreaChart
+      {/* 4 Dedicated Telemetry Area Charts (Split into CPU, Memory, Disk, Network) */}
+      <div
+        className={cn(
+          layoutMode === 'grid'
+            ? 'grid grid-cols-1 xl:grid-cols-2 gap-4'
+            : 'space-y-4'
+        )}
+      >
+        {/* 1. CPU Utilization Graph */}
+        <CpuAreaChart
           data={metricsHistory}
-          height={280}
-          title="Host CPU & Memory Allocation Over Time"
-          description="Continuous real-time dual-series plot streaming at 1s intervals via SSE (60s buffer)"
+          height={layoutMode === 'grid' ? 200 : 240}
+          title="CPU Utilization"
+          description="Physical processor core execution load over time (1s resolution)"
           showCard={true}
         />
 
-        {/* Real-time Disk & Network Throughput Chart */}
-        <ThroughputChart
+        {/* 2. Memory Allocation Graph */}
+        <MemoryAreaChart
           data={metricsHistory}
-          height={260}
-          title="Host Node Storage & Network Throughput"
-          description="Live disk commit rates and network interface I/O bandwidth"
+          height={layoutMode === 'grid' ? 200 : 240}
+          totalMemoryBytes={status?.host_mem_total}
+          title="Memory Allocation"
+          description="Physical RAM resident set size and host allocation over time"
+          showCard={true}
+        />
+
+        {/* 3. Disk Write Activity Graph */}
+        <DiskAreaChart
+          data={metricsHistory}
+          height={layoutMode === 'grid' ? 200 : 240}
+          title="Disk Write Activity"
+          description="Real-time storage controller commit rate over time"
+          showCard={true}
+        />
+
+        {/* 4. Network Bandwidth Graph */}
+        <NetworkAreaChart
+          data={metricsHistory}
+          height={layoutMode === 'grid' ? 200 : 240}
+          title="Network Bandwidth"
+          description="Interface socket throughput (Ingress RX / Egress TX) over time"
           showCard={true}
         />
       </div>

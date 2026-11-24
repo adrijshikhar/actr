@@ -15,6 +15,16 @@ export function formatBytes(bytes: number, decimals = 1): string {
   return `${parseFloat((bytes / Math.pow(k, safeI)).toFixed(dm))} ${sizes[safeI]}`;
 }
 
+export function formatRate(bytesPerSec?: number, decimals = 1): string {
+  if (!bytesPerSec || bytesPerSec <= 0) return '0 B/s';
+  const k = 1024;
+  const dm = decimals < 0 ? 0 : decimals;
+  const sizes = ['B/s', 'KB/s', 'MB/s', 'GB/s', 'TB/s'];
+  const i = Math.floor(Math.log(bytesPerSec) / Math.log(k));
+  const safeI = Math.max(0, Math.min(i, sizes.length - 1));
+  return `${parseFloat((bytesPerSec / Math.pow(k, safeI)).toFixed(dm))} ${sizes[safeI]}`;
+}
+
 export function formatDuration(seconds: number): string {
   if (!seconds || seconds <= 0) return '0s';
   const h = Math.floor(seconds / 3600);
