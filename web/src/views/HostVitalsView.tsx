@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
   Activity,
   Cpu,
@@ -8,6 +8,10 @@ import {
   RefreshCw,
   LayoutGrid,
   Rows,
+  Clock,
+  RotateCw,
+  Pause,
+  Play,
 } from 'lucide-react';
 import type { StatusResponse, RunnerInfo, TelemetrySample, RunnerMetrics } from '@/lib/api';
 import { subscribeMetrics } from '@/lib/sse';
@@ -26,6 +30,24 @@ export interface HostVitalsViewProps {
   runners?: RunnerInfo[];
   onRefresh?: () => void;
 }
+
+const MAX_BUFFER_CAPACITY = 900; // 15 minutes of 1-second samples
+
+const TIME_WINDOWS = [
+  { value: 30, label: 'Last 30s' },
+  { value: 60, label: 'Last 1m' },
+  { value: 120, label: 'Last 2m' },
+  { value: 300, label: 'Last 5m' },
+  { value: 900, label: 'Last 15m' },
+];
+
+const REFRESH_INTERVALS = [
+  { value: '1', label: '1s (Live)' },
+  { value: '2', label: '2s' },
+  { value: '5', label: '5s' },
+  { value: '10', label: '10s' },
+  { value: 'off', label: 'Off (Paused)' },
+];
 
 function createHostSample(partial: Partial<TelemetrySample> & { timestamp: string }): TelemetrySample {
   return {
@@ -56,28 +78,54 @@ export function HostVitalsView({
   runners = [],
   onRefresh,
 }: HostVitalsViewProps) {
+  // Visible samples state (frozen when paused, or throttled to cadence)
   const [metricsHistory, setMetricsHistory] = useState<TelemetrySample[]>([]);
   const [streamActive, setStreamActive] = useState(false);
   const [lastTick, setLastTick] = useState<string | null>(null);
   const [layoutMode, setLayoutMode] = useState<'grid' | 'stacked'>('grid');
 
+  // Grafana-style Time Window control: 30s, 60s (default 1m), 120s (2m), 300s (5m), 900s (15m)
+  const [timeWindow, setTimeWindow] = useState<number>(60);
+
+  // Grafana-style Auto-Refresh control: '1' (live), '2', '5', '10', 'off' (paused)
+  const [refreshCadence, setRefreshCadence] = useState<'1' | '2' | '5' | '10' | 'off'>('1');
+  const [isPaused, setIsPaused] = useState<boolean>(false);
+  const [isPolling, setIsPolling] = useState<boolean>(false);
+
+  // High-frequency mutable refs to retain full telemetry stream without dropping samples during inspection
+  const allSamplesRef = useRef<TelemetrySample[]>([]);
+  const isPausedRef = useRef<boolean>(false);
+  const cadenceRef = useRef<'1' | '2' | '5' | '10' | 'off'>('1');
+  const lastRenderMsRef = useRef<number>(0);
+
+  useEffect(() => {
+    isPausedRef.current = isPaused;
+  }, [isPaused]);
+
+  useEffect(() => {
+    cadenceRef.current = refreshCadence;
+  }, [refreshCadence]);
+
   // Subscribe to real-time 1s SSE metrics stream
   useEffect(() => {
     // Prime initial baseline from status if available
-    if (status) {
+    if (status && allSamplesRef.current.length === 0) {
       const initial = createHostSample({
         timestamp: new Date().toISOString(),
         host_cpu: status.host_cpu || 0,
         host_mem_used: status.host_mem_used || 0,
         host_mem_total: status.host_mem_total || 0,
       });
-      setMetricsHistory((prev) => (prev.length === 0 ? [initial] : prev));
+      allSamplesRef.current = [initial];
+      setMetricsHistory([initial]);
     }
 
     const unsub = subscribeMetrics(
       (m: RunnerMetrics) => {
         setStreamActive(true);
-        setLastTick(new Date().toLocaleTimeString());
+        const tickTime = new Date().toLocaleTimeString();
+        setLastTick(tickTime);
+
         const sample = createHostSample({
           timestamp: m.timestamp || new Date().toISOString(),
           pid: m.pid,
@@ -95,11 +143,26 @@ export function HostVitalsView({
           process_count: m.process_count ?? 0,
         });
 
-        setMetricsHistory((prev) => {
-          const next = [...prev, sample];
-          // Keep rolling window of 60 seconds
-          return next.length > 60 ? next.slice(-60) : next;
-        });
+        // Push to retained background buffer (up to 15m)
+        allSamplesRef.current.push(sample);
+        if (allSamplesRef.current.length > MAX_BUFFER_CAPACITY) {
+          allSamplesRef.current = allSamplesRef.current.slice(-MAX_BUFFER_CAPACITY);
+        }
+
+        // When paused: freeze chart updates completely so user can inspect without layout shift
+        if (isPausedRef.current) {
+          return;
+        }
+
+        // Apply selected auto-refresh cadence
+        const currentCadence = cadenceRef.current;
+        const now = Date.now();
+        const cadenceSeconds = currentCadence === 'off' ? 1 : Number(currentCadence);
+
+        if (cadenceSeconds <= 1 || now - lastRenderMsRef.current >= cadenceSeconds * 1000 - 100) {
+          lastRenderMsRef.current = now;
+          setMetricsHistory([...allSamplesRef.current]);
+        }
       },
       {
         onOpen: () => setStreamActive(true),
@@ -112,6 +175,59 @@ export function HostVitalsView({
       setStreamActive(false);
     };
   }, [status]);
+
+  // Pause / Resume toggle handler
+  const togglePause = useCallback(() => {
+    setIsPaused((prev) => {
+      const nextPaused = !prev;
+      isPausedRef.current = nextPaused;
+      if (nextPaused) {
+        setRefreshCadence('off');
+      } else {
+        setRefreshCadence('1');
+        cadenceRef.current = '1';
+        lastRenderMsRef.current = Date.now();
+        setMetricsHistory([...allSamplesRef.current]);
+      }
+      return nextPaused;
+    });
+  }, []);
+
+  // Cadence selector change handler
+  const handleCadenceChange = useCallback((value: string) => {
+    const val = value as '1' | '2' | '5' | '10' | 'off';
+    setRefreshCadence(val);
+    cadenceRef.current = val;
+    if (val === 'off') {
+      setIsPaused(true);
+      isPausedRef.current = true;
+    } else {
+      setIsPaused(false);
+      isPausedRef.current = false;
+      lastRenderMsRef.current = Date.now();
+      setMetricsHistory([...allSamplesRef.current]);
+    }
+  }, []);
+
+  // Manual Poll / Instantaneous Snapshot handler
+  const handleManualPoll = useCallback(async () => {
+    setIsPolling(true);
+    try {
+      if (onRefresh) {
+        await onRefresh();
+      }
+      lastRenderMsRef.current = Date.now();
+      setMetricsHistory([...allSamplesRef.current]);
+    } finally {
+      setTimeout(() => setIsPolling(false), 400);
+    }
+  }, [onRefresh]);
+
+  // Sliced time-series data matching the selected time window (30s, 1m, 2m, 5m, 15m)
+  const visibleMetrics = useMemo(() => {
+    if (metricsHistory.length === 0) return [];
+    return metricsHistory.slice(-timeWindow);
+  }, [metricsHistory, timeWindow]);
 
   const latest = metricsHistory[metricsHistory.length - 1];
 
@@ -133,16 +249,18 @@ export function HostVitalsView({
   return (
     <div className="space-y-6">
       {/* View Header & Stream State Bar */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 rounded-geist bg-geist-surface border border-geist-hairline">
-        <div className="space-y-1">
-          <div className="flex items-center gap-2.5">
-            <Activity className="w-5 h-5 text-geist-blue" />
+      <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4 p-4 rounded-geist bg-geist-surface border border-geist-hairline">
+        <div className="space-y-1.5 min-w-0">
+          <div className="flex items-center gap-2.5 flex-wrap">
+            <Activity className="w-5 h-5 text-geist-blue flex-shrink-0" />
             <h2 className="text-base font-semibold text-white tracking-tight">Host Node Telemetry</h2>
             <Badge
               variant="outline"
               className={cn(
-                'text-[10px] font-mono gap-1.5',
-                streamActive
+                'text-[10px] font-mono gap-1.5 transition-colors',
+                isPaused
+                  ? 'text-status-warning-text border-status-warning-border bg-status-warning-bg/20'
+                  : streamActive
                   ? 'text-status-success-solid border-status-success-border bg-status-success-bg/20'
                   : 'text-geist-faint border-geist-hairline bg-geist-hover'
               )}
@@ -150,30 +268,126 @@ export function HostVitalsView({
               <span
                 className={cn(
                   'w-1.5 h-1.5 rounded-full',
-                  streamActive ? 'bg-status-success-solid animate-pulse' : 'bg-geist-faint'
+                  isPaused
+                    ? 'bg-status-warning-text'
+                    : streamActive
+                    ? 'bg-status-success-solid animate-pulse'
+                    : 'bg-geist-faint'
                 )}
               />
-              {streamActive ? '1s SSE Stream (Active)' : 'Connecting...'}
+              {isPaused
+                ? 'Frozen (Paused)'
+                : streamActive
+                ? refreshCadence === '1'
+                  ? '1s SSE Stream (Active)'
+                  : `${refreshCadence}s Refresh Cadence`
+                : 'Connecting...'}
             </Badge>
+
+            <span className="text-[11px] font-mono text-geist-faint">
+              Buffer: <span className="text-geist-secondary font-medium">{visibleMetrics.length}s</span> / {allSamplesRef.current.length}s retained
+            </span>
+            {lastTick && (
+              <span className="text-[11px] font-mono text-geist-faint">
+                · Last: <span className="text-geist-secondary font-medium">{lastTick}</span>
+              </span>
+            )}
           </div>
-          <p className="text-xs text-geist-secondary">
+          <p className="text-xs text-geist-secondary truncate">
             Continuous real-time hardware telemetry and kernel I/O sampled at 1,000ms cadence.
           </p>
         </div>
 
-        <div className="flex items-center gap-2 sm:gap-3 text-xs font-mono text-geist-faint flex-wrap">
-          {lastTick && (
-            <span className="hidden md:inline">Last: <span className="text-geist-secondary">{lastTick}</span></span>
-          )}
-          <span>Buffer: <span className="text-geist-secondary">{metricsHistory.length}s</span></span>
+        {/* Grafana-Style Window, Auto-Refresh, and Layout Controls */}
+        <div className="flex items-center gap-1.5 sm:gap-2 text-xs font-mono text-geist-faint flex-wrap xl:flex-nowrap flex-shrink-0">
+          {/* 1. Time Range / Window Control */}
+          <div className="flex items-center gap-1.5 bg-geist-canvas border border-geist-hairline rounded px-2 py-1 text-xs font-mono text-geist-secondary hover:border-geist-borderHover transition-colors">
+            <Clock className="w-3.5 h-3.5 text-geist-faint flex-shrink-0" />
+            <label htmlFor="time-window-select" className="sr-only">
+              Time Window Range
+            </label>
+            <select
+              id="time-window-select"
+              value={timeWindow}
+              onChange={(e) => setTimeWindow(Number(e.target.value))}
+              className="bg-transparent text-white font-medium text-xs focus:outline-none cursor-pointer pr-1"
+              title="Select rolling time window"
+            >
+              {TIME_WINDOWS.map((w) => (
+                <option key={w.value} value={w.value} className="bg-geist-surface text-white">
+                  {w.label}
+                </option>
+              ))}
+            </select>
+          </div>
 
-          {/* Layout Mode Switcher */}
+          {/* 2. Play / Pause Freeze Toggle */}
+          <button
+            type="button"
+            onClick={togglePause}
+            aria-label={isPaused ? 'Resume live metrics stream' : 'Pause metrics stream'}
+            className={cn(
+              'flex items-center gap-1.5 px-2 py-1 rounded text-xs font-mono transition-colors border cursor-pointer select-none',
+              isPaused
+                ? 'border-status-warning-border bg-status-warning-bg/30 text-status-warning-text hover:bg-status-warning-bg/50'
+                : 'border-geist-hairline bg-geist-canvas text-geist-secondary hover:text-white hover:bg-geist-hover'
+            )}
+            title={isPaused ? 'Resume live streaming' : 'Freeze graph to inspect data points'}
+          >
+            {isPaused ? (
+              <>
+                <Play className="w-3 h-3 fill-status-warning-text text-status-warning-text" />
+                <span>Resume</span>
+              </>
+            ) : (
+              <>
+                <Pause className="w-3 h-3" />
+                <span>Pause</span>
+              </>
+            )}
+          </button>
+
+          {/* 3. Auto-Refresh Cadence Selector */}
+          <div className="flex items-center gap-1.5 bg-geist-canvas border border-geist-hairline rounded px-2 py-1 text-xs font-mono text-geist-secondary hover:border-geist-borderHover transition-colors">
+            <RotateCw className="w-3.5 h-3.5 text-geist-faint flex-shrink-0" />
+            <label htmlFor="refresh-cadence-select" className="sr-only">
+              Auto-Refresh Cadence
+            </label>
+            <select
+              id="refresh-cadence-select"
+              value={refreshCadence}
+              onChange={(e) => handleCadenceChange(e.target.value)}
+              className="bg-transparent text-white font-medium text-xs focus:outline-none cursor-pointer pr-1"
+              title="Select auto-refresh interval"
+            >
+              {REFRESH_INTERVALS.map((r) => (
+                <option key={r.value} value={r.value} className="bg-geist-surface text-white">
+                  {r.label}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* 4. Manual Poll Button */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleManualPoll}
+            disabled={isPolling}
+            className="h-7 text-xs px-2 gap-1.5 border-geist-hairline bg-geist-canvas hover:bg-geist-hover text-geist-secondary hover:text-white"
+            title="Fetch instantaneous telemetry snapshot"
+          >
+            <RefreshCw className={cn('w-3 h-3', isPolling && 'animate-spin text-geist-blue')} />
+            <span className="hidden sm:inline">Poll</span>
+          </Button>
+
+          {/* 5. Layout Mode Switcher */}
           <div className="flex items-center border border-geist-hairline rounded bg-geist-canvas p-0.5">
             <button
               type="button"
               onClick={() => setLayoutMode('grid')}
               className={cn(
-                'flex items-center gap-1 px-2 py-1 rounded text-[11px] font-sans transition-colors cursor-pointer',
+                'flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-sans transition-colors cursor-pointer',
                 layoutMode === 'grid'
                   ? 'bg-geist-elevated text-white font-medium shadow-sm'
                   : 'text-geist-faint hover:text-white'
@@ -187,7 +401,7 @@ export function HostVitalsView({
               type="button"
               onClick={() => setLayoutMode('stacked')}
               className={cn(
-                'flex items-center gap-1 px-2 py-1 rounded text-[11px] font-sans transition-colors cursor-pointer',
+                'flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-sans transition-colors cursor-pointer',
                 layoutMode === 'stacked'
                   ? 'bg-geist-elevated text-white font-medium shadow-sm'
                   : 'text-geist-faint hover:text-white'
@@ -198,18 +412,6 @@ export function HostVitalsView({
               <span>Stacked</span>
             </button>
           </div>
-
-          {onRefresh && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={onRefresh}
-              className="h-7 text-xs px-2.5 gap-1.5"
-            >
-              <RefreshCw className="w-3 h-3" />
-              <span className="hidden sm:inline">Poll</span>
-            </Button>
-          )}
         </div>
       </div>
 
@@ -326,16 +528,16 @@ export function HostVitalsView({
       >
         {/* 1. CPU Utilization Graph */}
         <CpuAreaChart
-          data={metricsHistory}
+          data={visibleMetrics}
           height={layoutMode === 'grid' ? 200 : 240}
           title="CPU Utilization"
-          description="Physical processor core execution load over time (1s resolution)"
+          description="Physical processor core execution load over time"
           showCard={true}
         />
 
         {/* 2. Memory Allocation Graph */}
         <MemoryAreaChart
-          data={metricsHistory}
+          data={visibleMetrics}
           height={layoutMode === 'grid' ? 200 : 240}
           totalMemoryBytes={status?.host_mem_total}
           title="Memory Allocation"
@@ -345,7 +547,7 @@ export function HostVitalsView({
 
         {/* 3. Disk Write Activity Graph */}
         <DiskAreaChart
-          data={metricsHistory}
+          data={visibleMetrics}
           height={layoutMode === 'grid' ? 200 : 240}
           title="Disk Write Activity"
           description="Real-time storage controller commit rate over time"
@@ -354,7 +556,7 @@ export function HostVitalsView({
 
         {/* 4. Network Bandwidth Graph */}
         <NetworkAreaChart
-          data={metricsHistory}
+          data={visibleMetrics}
           height={layoutMode === 'grid' ? 200 : 240}
           title="Network Bandwidth"
           description="Interface socket throughput (Ingress RX / Egress TX) over time"
@@ -409,7 +611,9 @@ export function HostVitalsView({
             <span className="font-semibold text-status-success-solid block">
               /api/metrics/stream
             </span>
-            <span className="text-[11px] text-geist-faint block">Cadence 1s · Rolling 60s</span>
+            <span className="text-[11px] text-geist-faint block">
+              Cadence {isPaused ? 'Paused' : `${refreshCadence}s`} · Window {timeWindow}s
+            </span>
           </div>
         </div>
       </div>

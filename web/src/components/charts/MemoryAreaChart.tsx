@@ -172,7 +172,7 @@ export function MemoryAreaChart({
       ) : (
         <div className={cn('w-full', heightClass)}>
           <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
-            <AreaChart data={chartData} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+            <AreaChart data={chartData} margin={{ top: 8, right: 28, left: 0, bottom: 0 }}>
               <defs>
                 <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
                   <stop offset="5%" stopColor="#30a46c" stopOpacity={0.35} />
