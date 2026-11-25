@@ -527,6 +527,8 @@ vault:
   providers:
     - type: encrypted-file
       path: secrets.enc
+      auth:
+        passphrase: "test-passphrase"
 `
 	err = os.WriteFile(filepath.Join(tmpDir, "config.yaml"), []byte(cfgContent), 0600)
 	require.NoError(t, err)

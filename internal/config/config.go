@@ -35,10 +35,14 @@ func (cd *CredentialsData) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	if cid, ok := raw["clientId"]; ok {
-		_ = json.Unmarshal(cid, &cd.ClientID)
+		if err := json.Unmarshal(cid, &cd.ClientID); err != nil {
+			return fmt.Errorf("unmarshal clientId: %w", err)
+		}
 	}
 	if auth, ok := raw["authorizationUrl"]; ok {
-		_ = json.Unmarshal(auth, &cd.AuthorizationURL)
+		if err := json.Unmarshal(auth, &cd.AuthorizationURL); err != nil {
+			return fmt.Errorf("unmarshal authorizationUrl: %w", err)
+		}
 	}
 	if fips, ok := raw["requireFipsCryptography"]; ok {
 		var b bool
@@ -46,9 +50,10 @@ func (cd *CredentialsData) UnmarshalJSON(data []byte) error {
 			cd.RequireFipsCryptography = b
 		} else {
 			var s string
-			if err := json.Unmarshal(fips, &s); err == nil {
-				cd.RequireFipsCryptography = strings.EqualFold(s, "true")
+			if err := json.Unmarshal(fips, &s); err != nil {
+				return fmt.Errorf("unmarshal requireFipsCryptography: %w", err)
 			}
+			cd.RequireFipsCryptography = strings.EqualFold(s, "true")
 		}
 	}
 	return nil
@@ -64,6 +69,48 @@ type Credentials struct {
 	RequireFipsCryptography bool             `json:"requireFipsCryptography,omitempty"`
 }
 
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	targetPath := path
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		targetPath = resolved
+	}
+	dir := filepath.Dir(targetPath)
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	closed := false
+	cleanup := true
+	defer func() {
+		if cleanup {
+			if !closed {
+				_ = tmp.Close()
+			}
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if err := tmp.Chmod(mode); err != nil {
+		return fmt.Errorf("chmod temp file: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("write temp file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("sync temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	closed = true
+	if err := os.Rename(tmpName, targetPath); err != nil {
+		return fmt.Errorf("rename temp file: %w", err)
+	}
+	cleanup = false
+	return nil
+}
+
 func SaveRunnerConfig(dir string, cfg *RunnerConfig) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
@@ -73,7 +120,10 @@ func SaveRunnerConfig(dir string, cfg *RunnerConfig) error {
 	if err != nil {
 		return fmt.Errorf("marshal runner config: %w", err)
 	}
-	return os.WriteFile(path, data, 0644)
+	if err := writeFileAtomic(path, data, 0600); err != nil {
+		return fmt.Errorf("write runner config: %w", err)
+	}
+	return nil
 }
 
 func LoadRunnerConfig(dir string) (*RunnerConfig, error) {
@@ -98,11 +148,8 @@ func SaveCredentials(dir string, creds *Credentials) error {
 	if err != nil {
 		return fmt.Errorf("marshal credentials: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	if err := writeFileAtomic(path, data, 0600); err != nil {
 		return fmt.Errorf("write credentials: %w", err)
-	}
-	if err := os.Chmod(path, 0600); err != nil {
-		return fmt.Errorf("chmod credentials: %w", err)
 	}
 	return nil
 }

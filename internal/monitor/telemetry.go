@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"os/exec"
 	"runtime"
 	"strconv"
@@ -43,6 +44,7 @@ type TelemetrySampler struct {
 	containerID     string
 	dockerCli       DockerStatsClient
 	containerCancel context.CancelFunc
+	containerGen    uint64
 	cStatsMu        sync.RWMutex
 	containerStats  *containerMetrics
 }
@@ -67,6 +69,8 @@ func (s *TelemetrySampler) SetTargetContainer(containerID string, cli DockerStat
 		s.containerCancel = nil
 	}
 
+	s.containerGen++
+	gen := s.containerGen
 	s.containerID = containerID
 	s.dockerCli = cli
 
@@ -81,24 +85,28 @@ func (s *TelemetrySampler) SetTargetContainer(containerID string, cli DockerStat
 	ctx, cancel := context.WithCancel(context.Background())
 	s.containerCancel = cancel
 
-	go s.streamContainerStats(ctx, containerID, cli)
+	go s.streamContainerStats(ctx, gen, containerID, cli)
 }
 
-func (s *TelemetrySampler) streamContainerStats(ctx context.Context, containerID string, cli DockerStatsClient) {
+func (s *TelemetrySampler) streamContainerStats(ctx context.Context, gen uint64, containerID string, cli DockerStatsClient) {
 	resp, err := cli.ContainerStats(ctx, containerID, true)
-	if err != nil {
+	if err != nil || resp.Body == nil {
 		return
 	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
+	var closeOnce sync.Once
+	closeBody := func() {
+		closeOnce.Do(func() {
+			_ = resp.Body.Close()
+		})
+	}
+	defer closeBody()
 
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = resp.Body.Close()
+			closeBody()
 		case <-done:
 		}
 	}()
@@ -109,6 +117,9 @@ func (s *TelemetrySampler) streamContainerStats(ctx context.Context, containerID
 	var lastNetTime time.Time
 
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		var v container.StatsResponse
 		if err := dec.Decode(&v); err != nil {
 			return
@@ -146,24 +157,41 @@ func (s *TelemetrySampler) streamContainerStats(ctx context.Context, containerID
 		prevRx = rx
 		prevTx = tx
 
-		procs := int(v.PidsStats.Current)
+		var procs int
+		if v.PidsStats.Current > math.MaxInt32 {
+			procs = math.MaxInt32
+		} else {
+			procs = int(v.PidsStats.Current) // #nosec G115 -- bounded above
+		}
 		if procs <= 0 && v.NumProcs > 0 {
-			procs = int(v.NumProcs)
+			if uint64(v.NumProcs) > math.MaxInt32 {
+				procs = math.MaxInt32
+			} else {
+				procs = int(v.NumProcs)
+			}
 		}
 		if procs <= 0 {
 			procs = 1
 		}
 
-		s.cStatsMu.Lock()
-		s.containerStats = &containerMetrics{
-			cpu:    cpu,
-			rss:    rss,
-			procs:  procs,
-			rxRate: rxRate,
-			txRate: txRate,
-			readAt: sampleTime,
+		s.mu.RLock()
+		active := s.containerGen == gen && ctx.Err() == nil
+		if active {
+			s.cStatsMu.Lock()
+			s.containerStats = &containerMetrics{
+				cpu:    cpu,
+				rss:    rss,
+				procs:  procs,
+				rxRate: rxRate,
+				txRate: txRate,
+				readAt: sampleTime,
+			}
+			s.cStatsMu.Unlock()
 		}
-		s.cStatsMu.Unlock()
+		s.mu.RUnlock()
+		if !active {
+			return
+		}
 	}
 }
 

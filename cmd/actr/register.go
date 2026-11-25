@@ -223,6 +223,12 @@ func newRegisterCmd() *cobra.Command {
 				}
 			}
 
+			if alias != "" {
+				if err := config.ValidateRepoAlias(alias); err != nil {
+					return fmt.Errorf("invalid repository alias %q: %w", alias, err)
+				}
+			}
+
 			targetDir := configDir
 			if alias != "" {
 				targetDir = filepath.Join(configDir, "repos", alias)

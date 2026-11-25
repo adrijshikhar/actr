@@ -6,6 +6,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestResourceManager_AcquireRelease(t *testing.T) {
@@ -235,4 +238,34 @@ func TestResourceManager_ConcurrentAcquireRelease(t *testing.T) {
 	if atomic.LoadInt64(&maxObserved) > maxJobs {
 		t.Errorf("max observed active jobs %d exceeded ceiling %d", maxObserved, maxJobs)
 	}
+}
+
+func TestResourceManager_ResizeUpAndDownWorks(t *testing.T) {
+	rm, err := NewResourceManager(1)
+	require.NoError(t, err)
+
+	// Scale UP 1 -> 3: must be able to hold 3 permits simultaneously
+	require.NoError(t, rm.Resize(3))
+	p1, err := rm.Acquire(context.Background())
+	require.NoError(t, err)
+	p2, err := rm.Acquire(context.Background())
+	require.NoError(t, err)
+	p3, err := rm.Acquire(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 3, rm.ActiveCount())
+
+	// Scale DOWN 3 -> 1: 4th Acquire must block even after releasing 1 (2 > 1)
+	require.NoError(t, rm.Resize(1))
+	p3.Release()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err = rm.Acquire(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	p2.Release()
+	p1.Release()
+
+	// Now 0 < 1, Acquire succeeds
+	p4, err := rm.Acquire(context.Background())
+	require.NoError(t, err)
+	p4.Release()
 }

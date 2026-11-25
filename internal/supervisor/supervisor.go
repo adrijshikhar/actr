@@ -3,6 +3,7 @@ package supervisor
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sync"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 // IPC monitor server lifecycle, and dynamic configuration hot-reloading.
 type Supervisor struct {
 	mu            sync.RWMutex
+	reloadMu      sync.Mutex
 	cfg           *config.SupervisorConfig
 	sockPath      string
 	resMgr        *ResourceManager
@@ -24,8 +26,10 @@ type Supervisor struct {
 	workers       map[string]*RepoWorker
 	pollingCtx    context.Context
 	pollingCancel context.CancelFunc
-	runCtx        context.Context
-	runCancel     context.CancelFunc
+	jobCtx        context.Context
+	jobCancel     context.CancelFunc
+	drainWg       sync.WaitGroup
+	statusWg      sync.WaitGroup
 	running       bool
 }
 
@@ -118,23 +122,25 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	}
 	s.running = true
 
-	runCtx, runCancel := context.WithCancel(ctx)
-	defer runCancel()
-	s.runCtx = runCtx
-	s.runCancel = runCancel
+	jobCtx, jobCancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer jobCancel()
+	s.jobCtx = jobCtx
+	s.jobCancel = jobCancel
 
-	pollingCtx, pollingCancel := context.WithCancel(runCtx)
+	pollingCtx, pollingCancel := context.WithCancel(ctx)
+	defer pollingCancel()
 	s.pollingCtx = pollingCtx
 	s.pollingCancel = pollingCancel
 
 	if s.monServer != nil {
 		if err := s.monServer.Start(); err != nil {
-			logger.Warn("failed to start monitor server", "error", err)
+			logger.Error("failed to start monitor server", "error", err)
+			s.monServer = nil
 		}
 	}
 
 	for alias, w := range s.workers {
-		if err := w.Start(runCtx, pollingCtx); err != nil {
+		if err := w.Start(jobCtx, pollingCtx); err != nil {
 			logger.Error("failed to start worker", "repo", alias, "error", err)
 		}
 	}
@@ -142,12 +148,14 @@ func (s *Supervisor) Start(ctx context.Context) error {
 
 	s.updateMonitorStatus()
 
+	s.statusWg.Add(1)
 	go func() {
+		defer s.statusWg.Done()
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-runCtx.Done():
+			case <-pollingCtx.Done():
 				return
 			case <-ticker.C:
 				s.updateMonitorStatus()
@@ -155,13 +163,13 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		}
 	}()
 
-	<-runCtx.Done()
+	<-pollingCtx.Done()
 
 	// 1. Immediately halt broker message polling
 	pollingCancel()
 
-	// 2. Concurrently drain all workers with a 30-second deadline
-	drainCtx, drainCancel := context.WithTimeout(context.WithoutCancel(runCtx), 30*time.Second)
+	// 2. Concurrently drain all workers with a 30-second deadline while jobCtx remains alive
+	drainCtx, drainCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer drainCancel()
 
 	s.mu.RLock()
@@ -171,21 +179,38 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	}
 	s.mu.RUnlock()
 
-	var wg sync.WaitGroup
 	for _, w := range workersToDrain {
-		wg.Add(1)
+		s.drainWg.Add(1)
 		go func(worker *RepoWorker) {
-			defer wg.Done()
+			defer s.drainWg.Done()
 			if err := worker.Stop(drainCtx); err != nil {
 				logger.Warn("worker stop encountered error or timed out", "repo", worker.repoAlias, "error", err)
 			}
 		}(w)
 	}
-	wg.Wait()
+	s.drainWg.Wait()
 
-	// 3. Stop monitor server
-	if s.monServer != nil {
-		_ = s.monServer.Stop()
+	// 3. Cancel job context after drain completes or times out
+	jobCancel()
+
+	// Bounded wait for all worker done channels to complete wind-down after job cancellation
+	windDownCtx, windDownCancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	for _, w := range workersToDrain {
+		select {
+		case <-w.doneCh:
+		case <-windDownCtx.Done():
+		}
+	}
+	windDownCancel()
+
+	s.statusWg.Wait()
+
+	// 4. Stop monitor server
+	s.mu.RLock()
+	monServer := s.monServer
+	s.mu.RUnlock()
+	if monServer != nil {
+		_ = monServer.Stop()
 	}
 
 	s.mu.Lock()
@@ -199,39 +224,43 @@ func (s *Supervisor) Start(ctx context.Context) error {
 func (s *Supervisor) Stop() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.running || s.runCancel == nil {
+	if !s.running || s.pollingCancel == nil {
 		return nil
 	}
-	s.runCancel()
+	s.pollingCancel()
 	return nil
 }
 
 // Reload dynamically updates the supervisor configuration: adjusting global concurrency,
-// starting workers for added repositories, and gracefully draining workers for removed repositories.
+// starting workers for added/modified repositories, and gracefully draining removed/replaced workers.
 func (s *Supervisor) Reload(newCfg *config.SupervisorConfig) error {
 	if newCfg == nil {
 		return fmt.Errorf("nil config on reload")
 	}
 
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+
 	s.mu.Lock()
-	if s.running && s.runCtx != nil && s.runCtx.Err() != nil {
+	if s.running && s.pollingCtx != nil && s.pollingCtx.Err() != nil {
 		s.mu.Unlock()
 		return fmt.Errorf("cannot reload supervisor while shutting down")
 	}
 
-	// Pre-instantiate workers for added repositories to fail early before mutations
-	addedWorkers := make(map[string]*RepoWorker)
+	// Pre-instantiate workers for added or modified repositories to fail early before mutations
+	replacementWorkers := make(map[string]*RepoWorker)
 	for alias, repoCfg := range newCfg.Repos {
-		if _, exists := s.workers[alias]; !exists {
+		existing, exists := s.workers[alias]
+		if !exists || !reflect.DeepEqual(existing.repoCfg, repoCfg) {
 			w, err := NewRepoWorker(alias, repoCfg, s.resMgr, s.monServer)
 			if err != nil {
 				s.mu.Unlock()
-				return fmt.Errorf("create worker for added repo %q: %w", alias, err)
+				return fmt.Errorf("create worker for repo %q: %w", alias, err)
 			}
 			if s.tracer != nil {
 				w.WithTracer(s.tracer)
 			}
-			addedWorkers[alias] = w
+			replacementWorkers[alias] = w
 		}
 	}
 
@@ -240,45 +269,63 @@ func (s *Supervisor) Reload(newCfg *config.SupervisorConfig) error {
 		return fmt.Errorf("resize resource manager: %w", err)
 	}
 
-	// Detect removed repositories
-	var removedWorkers []*RepoWorker
+	// Collect removed and replaced workers for drain
+	var workersToRemove []*RepoWorker
+	var replacedOldWorkers []*RepoWorker
 	for alias, w := range s.workers {
 		if _, exists := newCfg.Repos[alias]; !exists {
-			removedWorkers = append(removedWorkers, w)
+			workersToRemove = append(workersToRemove, w)
+			delete(s.workers, alias)
+		} else if _, replaced := replacementWorkers[alias]; replaced {
+			replacedOldWorkers = append(replacedOldWorkers, w)
 			delete(s.workers, alias)
 		}
 	}
 
-	// Apply added workers
-	for alias, w := range addedWorkers {
+	isRunning := s.running
+	baseJobCtx := s.jobCtx
+
+	// For replaced workers, stop the old worker before starting the replacement worker on the same repo
+	if isRunning && len(replacedOldWorkers) > 0 {
+		for _, oldWorker := range replacedOldWorkers {
+			drainCtx, drainCancel := context.WithTimeout(context.WithoutCancel(baseJobCtx), 30*time.Second)
+			_ = oldWorker.Stop(drainCtx)
+			drainCancel()
+		}
+	}
+
+	// Apply added and replacement workers
+	for alias, w := range replacementWorkers {
 		s.workers[alias] = w
-		if s.running {
-			if err := w.Start(s.runCtx, s.pollingCtx); err != nil {
-				logger.Error("failed to start added worker", "repo", alias, "error", err)
+		if isRunning {
+			if err := w.Start(s.jobCtx, s.pollingCtx); err != nil {
+				logger.Error("failed to start worker", "repo", alias, "error", err)
 			}
 		}
 	}
 
 	s.cfg = newCfg
-	isRunning := s.running
+	if isRunning && len(workersToRemove) > 0 {
+		s.drainWg.Add(len(workersToRemove))
+	}
 	s.mu.Unlock()
 
-	// Drain removed workers concurrently
-	if isRunning && len(removedWorkers) > 0 {
-		drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer drainCancel()
-
-		var wg sync.WaitGroup
-		for _, w := range removedWorkers {
-			wg.Add(1)
+	// Drain removed workers concurrently, tracked by drainWg so Start cannot exit prematurely
+	if isRunning && len(workersToRemove) > 0 {
+		parentCtx := context.Background()
+		if baseJobCtx != nil {
+			parentCtx = context.WithoutCancel(baseJobCtx)
+		}
+		for _, w := range workersToRemove {
 			go func(worker *RepoWorker) {
-				defer wg.Done()
+				defer s.drainWg.Done()
+				drainCtx, drainCancel := context.WithTimeout(parentCtx, 30*time.Second)
+				defer drainCancel()
 				if err := worker.Stop(drainCtx); err != nil {
 					logger.Warn("failed to cleanly stop removed worker", "repo", worker.repoAlias, "error", err)
 				}
 			}(w)
 		}
-		wg.Wait()
 	}
 
 	s.updateMonitorStatus()
@@ -288,10 +335,12 @@ func (s *Supervisor) Reload(newCfg *config.SupervisorConfig) error {
 
 // updateMonitorStatus syncs the current global and per-repo capacity into the MonitorServer.
 func (s *Supervisor) updateMonitorStatus() {
-	if s.monServer == nil {
+	s.mu.RLock()
+	monServer := s.monServer
+	if monServer == nil {
+		s.mu.RUnlock()
 		return
 	}
-	s.mu.RLock()
 	globalMax := s.resMgr.MaxConcurrentJobs()
 	globalActive := s.resMgr.ActiveCount()
 	slots := make([]*monitor.RepoSlotInfo, 0, len(s.workers))
@@ -315,7 +364,7 @@ func (s *Supervisor) updateMonitorStatus() {
 	}
 	s.mu.RUnlock()
 
-	s.monServer.SetSupervisorStatus(&monitor.SupervisorStatus{
+	monServer.SetSupervisorStatus(&monitor.SupervisorStatus{
 		GlobalMaxJobs: globalMax,
 		GlobalActive:  globalActive,
 		RepoSlots:     slots,

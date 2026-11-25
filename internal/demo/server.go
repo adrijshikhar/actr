@@ -13,8 +13,7 @@ import (
 // StartServerWithStore initializes and starts a demonstration monitor server on sockPath
 // with an attached history store.
 func StartServerWithStore(ctx context.Context, sockPath string, store monitor.HistoryStore) (*monitor.Server, error) {
-	_ = os.Remove(sockPath)
-	if err := os.MkdirAll(filepath.Dir(sockPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(sockPath), 0o700); err != nil {
 		return nil, fmt.Errorf("create socket dir: %w", err)
 	}
 
@@ -79,7 +78,6 @@ func seedInitialState(server *monitor.Server) {
 		},
 	}
 	server.Publish(monitor.Event{Type: monitor.EventJobStart, JobID: linuxJob.ID, RepoAlias: "actr", Job: linuxJob})
-	server.Publish(monitor.Event{Type: monitor.EventJobFinish, JobID: linuxJob.ID, RepoAlias: "actr", Job: linuxJob})
 
 	server.AppendJobStepLog(linuxJob.ID, "l-1", "\x1b[38;5;244m2026-11-16T14:30:00Z\x1b[0m \x1b[1;32m✓\x1b[0m Host runner environment validated (Linux x86_64)")
 	server.AppendJobStepLog(linuxJob.ID, "l-2", "\x1b[38;5;244m2026-11-16T14:30:10Z\x1b[0m \x1b[1;34m##[group]Git checkout\x1b[0m")
@@ -87,6 +85,8 @@ func seedInitialState(server *monitor.Server) {
 	server.AppendJobStepLog(linuxJob.ID, "l-2", "\x1b[38;5;244m2026-11-16T14:30:25Z\x1b[0m \x1b[1;34m##[endgroup]\x1b[0m")
 	server.AppendJobStepLog(linuxJob.ID, "l-3", "\x1b[38;5;244m2026-11-16T14:30:26Z\x1b[0m === RUN   TestProtocol_Handshake")
 	server.AppendJobStepLog(linuxJob.ID, "l-3", "\x1b[38;5;244m2026-11-16T14:31:00Z\x1b[0m \x1b[1;32mPASS: all 11 packages passed in 4.1s\x1b[0m")
+
+	server.Publish(monitor.Event{Type: monitor.EventJobFinish, JobID: linuxJob.ID, RepoAlias: "actr", Job: linuxJob})
 
 	// 2. Completed macOS Matrix Job
 	macJob := &monitor.JobInfo{
@@ -115,11 +115,12 @@ func seedInitialState(server *monitor.Server) {
 		},
 	}
 	server.Publish(monitor.Event{Type: monitor.EventJobStart, JobID: macJob.ID, RepoAlias: "aim", Job: macJob})
-	server.Publish(monitor.Event{Type: monitor.EventJobFinish, JobID: macJob.ID, RepoAlias: "aim", Job: macJob})
 
 	server.AppendJobStepLog(macJob.ID, "m-1", "\x1b[38;5;244m2026-11-16T14:32:00Z\x1b[0m \x1b[1;32m✓\x1b[0m macOS darwin/arm64 sandbox initialized")
 	server.AppendJobStepLog(macJob.ID, "m-2", "\x1b[38;5;244m2026-11-16T14:32:15Z\x1b[0m Checked out commit 98f6bab (HEAD -> main)")
 	server.AppendJobStepLog(macJob.ID, "m-3", "\x1b[38;5;244m2026-11-16T14:33:00Z\x1b[0m \x1b[1;32mPASS: all 11 packages passed in 3.8s\x1b[0m")
+
+	server.Publish(monitor.Event{Type: monitor.EventJobFinish, JobID: macJob.ID, RepoAlias: "aim", Job: macJob})
 
 	// 3. Active Live Job
 	liveJob := &monitor.JobInfo{
@@ -388,7 +389,11 @@ func runSimulation(ctx context.Context, server *monitor.Server) {
 					})
 
 					// Idle for a few cycles then cycle back or stream heartbeat
-					time.Sleep(3 * time.Second)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(3 * time.Second):
+					}
 					// Start next simulated live run
 					activeStep = "s-2"
 					activeStepName = "Compile binaries"

@@ -278,6 +278,8 @@ func TestSecretsCLI_PipeInput(t *testing.T) {
 vault:
   providers:
     - type: "encrypted-file"
+      auth:
+        passphrase: "test-passphrase"
 `
 	err := os.WriteFile(filepath.Join(tempDir, "config.yaml"), []byte(configContent), 0600)
 	require.NoError(t, err)
@@ -303,6 +305,8 @@ func TestSecretsCLI_PipeInput_NoTrailingNewline(t *testing.T) {
 vault:
   providers:
     - type: "encrypted-file"
+      auth:
+        passphrase: "test-passphrase"
 `
 	err := os.WriteFile(filepath.Join(tempDir, "config.yaml"), []byte(configContent), 0600)
 	require.NoError(t, err)
@@ -327,6 +331,8 @@ func TestSecretsCLI_InteractivePrompt(t *testing.T) {
 vault:
   providers:
     - type: "encrypted-file"
+      auth:
+        passphrase: "test-passphrase"
 `
 	err := os.WriteFile(filepath.Join(tempDir, "config.yaml"), []byte(configContent), 0600)
 	require.NoError(t, err)
@@ -363,6 +369,8 @@ func TestSecretsCLI_InteractivePrompt_ReadError(t *testing.T) {
 vault:
   providers:
     - type: "encrypted-file"
+      auth:
+        passphrase: "test-passphrase"
 `
 	err := os.WriteFile(filepath.Join(tempDir, "config.yaml"), []byte(configContent), 0600)
 	require.NoError(t, err)
@@ -391,6 +399,8 @@ func TestSecretsCLI_GetNotFound(t *testing.T) {
 vault:
   providers:
     - type: "encrypted-file"
+      auth:
+        passphrase: "test-passphrase"
 `
 	err := os.WriteFile(filepath.Join(tempDir, "config.yaml"), []byte(configContent), 0600)
 	require.NoError(t, err)
@@ -407,6 +417,8 @@ func TestSecretsCLI_DeleteNotFound(t *testing.T) {
 vault:
   providers:
     - type: "encrypted-file"
+      auth:
+        passphrase: "test-passphrase"
 `
 	err := os.WriteFile(filepath.Join(tempDir, "config.yaml"), []byte(configContent), 0600)
 	require.NoError(t, err)

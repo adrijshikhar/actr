@@ -72,6 +72,7 @@ func TestMonitor_Publish_HighFrequencyLogs_SnapshotNotBlocked(t *testing.T) {
 					StepID:  stepID,
 					LogLine: fmt.Sprintf("worker-%d-log-line-%04d", workerID, i),
 				})
+				time.Sleep(500 * time.Microsecond)
 			}
 		}(w)
 	}

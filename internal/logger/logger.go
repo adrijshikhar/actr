@@ -17,6 +17,10 @@ func init() {
 }
 
 func Init(debug bool, out io.Writer) {
+	if out == nil {
+		out = io.Discard
+	}
+
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -33,24 +37,36 @@ func Init(debug bool, out io.Writer) {
 
 func Debug(msg string, args ...any) {
 	mu.RLock()
-	defer mu.RUnlock()
-	handler.Debug(msg, args...)
+	h := handler
+	mu.RUnlock()
+	if h != nil {
+		h.Debug(msg, args...)
+	}
 }
 
 func Info(msg string, args ...any) {
 	mu.RLock()
-	defer mu.RUnlock()
-	handler.Info(msg, args...)
+	h := handler
+	mu.RUnlock()
+	if h != nil {
+		h.Info(msg, args...)
+	}
 }
 
 func Warn(msg string, args ...any) {
 	mu.RLock()
-	defer mu.RUnlock()
-	handler.Warn(msg, args...)
+	h := handler
+	mu.RUnlock()
+	if h != nil {
+		h.Warn(msg, args...)
+	}
 }
 
 func Error(msg string, args ...any) {
 	mu.RLock()
-	defer mu.RUnlock()
-	handler.Error(msg, args...)
+	h := handler
+	mu.RUnlock()
+	if h != nil {
+		h.Error(msg, args...)
+	}
 }

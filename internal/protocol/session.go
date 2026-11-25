@@ -1,15 +1,19 @@
 package protocol
 
 import (
-	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 )
+
+func isValidAESKeyLen(n int) bool {
+	return n == 16 || n == 24 || n == 32
+}
 
 // GenerateRSAKeyPair generates an RSA private key with the given bit size.
 func GenerateRSAKeyPair(bits int) (*rsa.PrivateKey, error) {
@@ -21,26 +25,55 @@ func DecryptAESKeyOAEP(priv *rsa.PrivateKey, encKey []byte) ([]byte, error) {
 	if priv == nil {
 		return nil, errors.New("nil private key")
 	}
-	return rsa.DecryptOAEP(sha256.New(), rand.Reader, priv, encKey, nil)
+	if len(encKey) != priv.Size() {
+		return nil, errors.New("invalid encrypted key length")
+	}
+	key, err := rsa.DecryptOAEP(sha256.New(), rand.Reader, priv, encKey, nil)
+	if err != nil {
+		return nil, err
+	}
+	if !isValidAESKeyLen(len(key)) {
+		return nil, fmt.Errorf("invalid AES key length %d: must be 16, 24, or 32", len(key))
+	}
+	return key, nil
 }
 
 // DecryptAESKey decrypts an RSA encrypted AES key using the private key.
-// It attempts RSA-OAEP (SHA-256) first, falling back to PKCS#1 v1.5.
+// It attempts RSA-OAEP (SHA-256) first, falling back to PKCS#1 v1.5 session key decryption.
 func DecryptAESKey(priv *rsa.PrivateKey, encKey []byte) ([]byte, error) {
 	if priv == nil {
 		return nil, errors.New("nil private key")
 	}
+	if len(encKey) != priv.Size() {
+		return nil, errors.New("invalid encrypted key length")
+	}
 	// Try RSA-OAEP SHA-256 first
 	if key, err := rsa.DecryptOAEP(sha256.New(), rand.Reader, priv, encKey, nil); err == nil {
+		if !isValidAESKeyLen(len(key)) {
+			return nil, fmt.Errorf("invalid AES key length %d: must be 16, 24, or 32", len(key))
+		}
 		return key, nil
 	}
+
+	// Try PKCS#1 v1.5 with direct decrypt to verify padding and return true key length
 	//nolint:staticcheck // GitHub Actions broker protocol supports PKCS#1 v1.5 session key exchange
-	return rsa.DecryptPKCS1v15(rand.Reader, priv, encKey)
+	decrypted, err := rsa.DecryptPKCS1v15(rand.Reader, priv, encKey)
+	if err == nil {
+		if !isValidAESKeyLen(len(decrypted)) {
+			return nil, fmt.Errorf("invalid AES key length %d: must be 16, 24, or 32", len(decrypted))
+		}
+		return decrypted, nil
+	}
+
+	return nil, fmt.Errorf("failed to decrypt AES session key with RSA-OAEP or PKCS#1 v1.5: %w", err)
 }
 
 // DecryptPayload decrypts AES-CBC encrypted ciphertext using the provided AES key and IV,
-// then removes PKCS#7 padding.
+// then removes PKCS#7 padding in constant time.
 func DecryptPayload(aesKey, iv, ciphertext []byte) ([]byte, error) {
+	if !isValidAESKeyLen(len(aesKey)) {
+		return nil, fmt.Errorf("invalid AES key length %d: must be 16, 24, or 32", len(aesKey))
+	}
 	block, err := aes.NewCipher(aesKey)
 	if err != nil {
 		return nil, fmt.Errorf("new cipher: %w", err)
@@ -60,23 +93,39 @@ func DecryptPayload(aesKey, iv, ciphertext []byte) ([]byte, error) {
 }
 
 func pkcs7Pad(b []byte, blockSize int) []byte {
+	if blockSize <= 0 || blockSize > 255 {
+		blockSize = 16
+	}
 	padding := blockSize - (len(b) % blockSize)
-	padtext := bytes.Repeat([]byte{byte(padding)}, padding)
-	return append(b, padtext...)
+	padByte := byte(padding & 0xFF)
+	out := make([]byte, len(b)+padding)
+	copy(out, b)
+	for i := len(b); i < len(out); i++ {
+		out[i] = padByte
+	}
+	return out
 }
 
 func pkcs7Unpad(b []byte, blockSize int) ([]byte, error) {
-	if len(b) == 0 {
-		return nil, errors.New("empty buffer")
+	if blockSize <= 0 || blockSize > 255 || len(b) == 0 || len(b)%blockSize != 0 {
+		return nil, errors.New("decryption failed")
 	}
-	padding := int(b[len(b)-1])
-	if padding == 0 || padding > blockSize || padding > len(b) {
-		return nil, errors.New("invalid padding")
+
+	padByte := b[len(b)-1]
+	padLen := int(padByte)
+
+	valid := subtle.ConstantTimeLessOrEq(1, padLen)
+	valid &= subtle.ConstantTimeLessOrEq(padLen, blockSize)
+
+	start := len(b) - blockSize
+	for i := 0; i < blockSize; i++ {
+		inPad := subtle.ConstantTimeLessOrEq(blockSize-i, padLen)
+		byteEq := subtle.ConstantTimeByteEq(b[start+i], padByte)
+		valid &= subtle.ConstantTimeSelect(inPad, byteEq, 1)
 	}
-	for i := len(b) - padding; i < len(b); i++ {
-		if b[i] != byte(padding) {
-			return nil, errors.New("invalid padding byte")
-		}
+
+	if valid != 1 {
+		return nil, errors.New("decryption failed")
 	}
-	return b[:len(b)-padding], nil
+	return b[:len(b)-padLen], nil
 }

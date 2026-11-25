@@ -157,9 +157,17 @@ func TestSeedHistoryStore(t *testing.T) {
 	assert.Contains(t, joined, "FAIL: TestConcurrentTransactions_DeadlockRetry")
 	assert.Contains(t, joined, "\x1b[1;31m")
 
-	// Verify metadata peak vitals
+	// Verify metadata peak vitals and historical duration preservation
 	flkMeta, err := store.GetRun("flaky-integration-test")
 	require.NoError(t, err)
 	assert.Equal(t, 96.8, flkMeta.MetricsSummary.PeakCPUPercent)
 	assert.Equal(t, uint64(512*1024*1024), flkMeta.MetricsSummary.PeakRSSBytes)
+	assert.Equal(t, int64(8*60), flkMeta.DurationSec)
+	require.Len(t, flkMeta.Steps, 3)
+	assert.Equal(t, 1, flkMeta.Steps[2].ExitCode)
+	assert.Equal(t, int64(3*60), flkMeta.Steps[2].DurationSec)
+
+	relMeta, err := store.GetRun("release-v0.1.0")
+	require.NoError(t, err)
+	assert.Equal(t, int64(12*60), relMeta.DurationSec)
 }

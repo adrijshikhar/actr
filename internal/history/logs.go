@@ -22,11 +22,32 @@ type stepStats struct {
 	lines atomic.Int64
 }
 
-// getStepLock returns or initializes the per-step RWMutex for synchronizing concurrent access.
-func (s *DiskStore) getStepLock(jobID, stepID string) *sync.RWMutex {
-	key := jobID + "/" + stepID
-	val, _ := s.stepLocks.LoadOrStore(key, &sync.RWMutex{})
-	return val.(*sync.RWMutex)
+// acquireStepLock returns and locks the active per-step RWMutex for key.
+// It retries if the lock was deleted from s.stepLocks while waiting.
+func (s *DiskStore) acquireStepLock(key string) *sync.RWMutex {
+	for {
+		val, _ := s.stepLocks.LoadOrStore(key, &sync.RWMutex{})
+		lock := val.(*sync.RWMutex)
+		lock.Lock()
+		if cur, ok := s.stepLocks.Load(key); ok && cur == lock {
+			return lock
+		}
+		lock.Unlock()
+	}
+}
+
+// acquireStepRLock returns and read-locks the active per-step RWMutex for key.
+// It retries if the lock was deleted from s.stepLocks while waiting.
+func (s *DiskStore) acquireStepRLock(key string) *sync.RWMutex {
+	for {
+		val, _ := s.stepLocks.LoadOrStore(key, &sync.RWMutex{})
+		lock := val.(*sync.RWMutex)
+		lock.RLock()
+		if cur, ok := s.stepLocks.Load(key); ok && cur == lock {
+			return lock
+		}
+		lock.RUnlock()
+	}
 }
 
 // AppendStepLog appends a log line to <baseDir>/<jobID>/steps/<stepID>.log, ensuring parent directory
@@ -48,39 +69,33 @@ func (s *DiskStore) AppendStepLog(jobID, stepID, line string) error {
 	}
 	byteCount := int64(len(line))
 
-	lock := s.getStepLock(jobID, stepID)
-	lock.Lock()
+	key := jobID + "/" + stepID
+	lock := s.acquireStepLock(key)
+	defer lock.Unlock()
 
 	stepsDir := filepath.Dir(logPath)
 	if err := os.MkdirAll(stepsDir, 0700); err != nil {
-		lock.Unlock()
 		return fmt.Errorf("failed to create steps directory %s: %w", stepsDir, err)
 	}
 
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
-		lock.Unlock()
 		return fmt.Errorf("failed to open step log file %s: %w", logPath, err)
 	}
 
 	if _, err := f.WriteString(line); err != nil {
 		_ = f.Close()
-		lock.Unlock()
 		return fmt.Errorf("failed to write to step log file %s: %w", logPath, err)
 	}
 
 	if err := f.Close(); err != nil {
-		lock.Unlock()
 		return fmt.Errorf("failed to close step log file %s: %w", logPath, err)
 	}
 	// In-memory tracking of step line counts and byte counts during streaming
-	key := jobID + "/" + stepID
 	val, _ := s.stepStats.LoadOrStore(key, &stepStats{})
 	stat := val.(*stepStats)
 	stat.bytes.Add(byteCount)
 	stat.lines.Add(int64(lineCount))
-
-	lock.Unlock()
 
 	return nil
 }
@@ -107,16 +122,16 @@ func (s *DiskStore) FinishStep(jobID, stepID, conclusion string, exitCode int, f
 
 	key := jobID + "/" + cleanStepID
 
-	// Acquire stepLock to ensure any in-flight append completes
-	lock := s.getStepLock(jobID, cleanStepID)
-	lock.Lock()
-	defer func() {
-		lock.Unlock()
-		s.stepLocks.Delete(key)
-	}()
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Acquire stepLock after s.mu to maintain consistent lock order (s.mu -> stepLock)
+	// and ensure any in-flight append completes before flushing stats and deleting the lock.
+	lock := s.acquireStepLock(key)
+	defer func() {
+		s.stepLocks.Delete(key)
+		lock.Unlock()
+	}()
 
 	metaPath := filepath.Join(runDir, "meta.json")
 	data, err := os.ReadFile(metaPath)
@@ -195,8 +210,7 @@ func (s *DiskStore) GetStepLogs(jobID, stepID string) ([]string, error) {
 		return nil, fmt.Errorf("invalid job or step ID: %w", err)
 	}
 
-	lock := s.getStepLock(jobID, stepID)
-	lock.RLock()
+	lock := s.acquireStepRLock(jobID + "/" + stepID)
 	defer lock.RUnlock()
 
 	data, err := os.ReadFile(logPath)

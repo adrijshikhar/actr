@@ -55,7 +55,7 @@ func ParseMemory(s string) (int64, error) {
 	var numParts strings.Builder
 	var unitParts strings.Builder
 	for i, r := range cleaned {
-		if unicode.IsDigit(r) || (r == '.' && i > 0) {
+		if unicode.IsDigit(r) || (r == '.' && i > 0) || ((r == 'e' || r == 'E') && i > 0) {
 			if unitParts.Len() > 0 {
 				return 0, fmt.Errorf("invalid memory string: %s", s)
 			}
@@ -103,9 +103,10 @@ func ParseMemory(s string) (int64, error) {
 		return 0, fmt.Errorf("unknown memory unit %q in %s", unit, s)
 	}
 
-	if val > 0 && multiplier > float64(math.MaxInt64)/val {
+	product := val * multiplier
+	if math.IsInf(product, 0) || math.IsNaN(product) || product < 0 || product >= 9223372036854775808.0 {
 		return 0, fmt.Errorf("memory value exceeds maximum int64: %s", s)
 	}
 
-	return int64(val * multiplier), nil
+	return int64(product), nil
 }

@@ -11,6 +11,14 @@ type Permit interface {
 	Release()
 }
 
+// Reservation represents a pre-flight capacity reservation before polling the broker.
+// Call Activate once a job is received to promote it to an active execution Permit,
+// or Release if polling fails or returns no job.
+type Reservation interface {
+	Activate() Permit
+	Release()
+}
+
 type permit struct {
 	rm   *ResourceManager
 	once sync.Once
@@ -18,18 +26,44 @@ type permit struct {
 
 func (p *permit) Release() {
 	p.once.Do(func() {
-		p.rm.release()
+		if p.rm != nil {
+			p.rm.releaseActive()
+		}
 	})
 }
 
-// ResourceManager limits global host job concurrency using a counting semaphore
-// and non-blocking notification channels to gate worker polling.
+type reservation struct {
+	rm   *ResourceManager
+	once sync.Once
+	p    *permit
+}
+
+func (rv *reservation) Activate() Permit {
+	rv.once.Do(func() {
+		rv.rm.promoteReservation()
+		rv.p = &permit{rm: rv.rm}
+	})
+	if rv.p == nil {
+		return &permit{}
+	}
+	return rv.p
+}
+
+func (rv *reservation) Release() {
+	rv.once.Do(func() {
+		rv.rm.releaseReservation()
+	})
+}
+
+// ResourceManager limits global host job concurrency using mutex-guarded counters
+// and broadcast signaling channels to support dynamic resizing.
 type ResourceManager struct {
-	mu         sync.Mutex
-	maxJobs    int
-	activeJobs int
-	sem        chan struct{}
-	notifyCh   chan struct{}
+	mu           sync.Mutex
+	maxJobs      int
+	activeJobs   int
+	reservedJobs int
+	waitCh       chan struct{}
+	notifyCh     chan struct{}
 }
 
 // NewResourceManager initializes a new concurrency manager with the specified limit.
@@ -39,34 +73,112 @@ func NewResourceManager(maxConcurrentJobs int) (*ResourceManager, error) {
 	}
 	return &ResourceManager{
 		maxJobs:  maxConcurrentJobs,
-		sem:      make(chan struct{}, maxConcurrentJobs),
+		waitCh:   make(chan struct{}),
 		notifyCh: make(chan struct{}, 1),
 	}, nil
 }
 
-// Acquire blocks until a slot is available or ctx is canceled.
+// Acquire blocks until an active execution slot is available or ctx is canceled.
 func (r *ResourceManager) Acquire(ctx context.Context) (Permit, error) {
-	if err := ctx.Err(); err != nil {
+	if err := r.waitAndClaim(ctx, false); err != nil {
 		return nil, err
 	}
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case r.sem <- struct{}{}:
+	return &permit{rm: r}, nil
+}
+
+// Reserve blocks until capacity is available and reserves a slot without counting it
+// as an active executing job until Activate() is called.
+func (r *ResourceManager) Reserve(ctx context.Context) (Reservation, error) {
+	if err := r.waitAndClaim(ctx, true); err != nil {
+		return nil, err
+	}
+	return &reservation{rm: r}, nil
+}
+
+// WaitAvailable blocks until there is unallocated execution capacity without claiming a slot.
+func (r *ResourceManager) WaitAvailable(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		r.mu.Lock()
-		r.activeJobs++
+		if r.activeJobs < r.maxJobs {
+			r.mu.Unlock()
+			return nil
+		}
+		ch := r.waitCh
 		r.mu.Unlock()
-		return &permit{rm: r}, nil
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ch:
+		}
 	}
 }
 
-func (r *ResourceManager) release() {
+func (r *ResourceManager) waitAndClaim(ctx context.Context, asReservation bool) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		r.mu.Lock()
+		if r.activeJobs+r.reservedJobs < r.maxJobs {
+			if asReservation {
+				r.reservedJobs++
+			} else {
+				r.activeJobs++
+			}
+			r.mu.Unlock()
+			return nil
+		}
+		ch := r.waitCh
+		r.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ch:
+		}
+	}
+}
+
+func (r *ResourceManager) promoteReservation() {
 	r.mu.Lock()
-	r.activeJobs--
+	if r.reservedJobs > 0 {
+		r.reservedJobs--
+	}
+	r.activeJobs++
 	r.mu.Unlock()
-	<-r.sem
+}
+
+func (r *ResourceManager) releaseActive() {
+	r.mu.Lock()
+	if r.activeJobs > 0 {
+		r.activeJobs--
+	}
+	close(r.waitCh)
+	r.waitCh = make(chan struct{})
+	r.mu.Unlock()
 
 	// Broadcast slot availability without blocking
+	select {
+	case r.notifyCh <- struct{}{}:
+	default:
+	}
+}
+
+func (r *ResourceManager) releaseReservation() {
+	r.mu.Lock()
+	if r.reservedJobs > 0 {
+		r.reservedJobs--
+	}
+	close(r.waitCh)
+	r.waitCh = make(chan struct{})
+	r.mu.Unlock()
+
 	select {
 	case r.notifyCh <- struct{}{}:
 	default:
@@ -92,14 +204,20 @@ func (r *ResourceManager) SlotAvailable() <-chan struct{} {
 	return r.notifyCh
 }
 
-// Resize dynamically adjusts the logical maximum concurrent jobs.
+// Resize dynamically adjusts the maximum concurrent jobs and wakes waiting acquirers.
 func (r *ResourceManager) Resize(newMax int) error {
 	if newMax <= 0 {
 		return fmt.Errorf("newMax must be >= 1, got %d", newMax)
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	// Channel capacity in Go is fixed; update logical ceiling
 	r.maxJobs = newMax
+	close(r.waitCh)
+	r.waitCh = make(chan struct{})
+	r.mu.Unlock()
+
+	select {
+	case r.notifyCh <- struct{}{}:
+	default:
+	}
 	return nil
 }

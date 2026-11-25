@@ -173,3 +173,28 @@ func TestChainedProvider_List_SkipsFailedProviders(t *testing.T) {
 	require.Len(t, list, 1)
 	assert.Equal(t, "K2", list[0].Key)
 }
+
+type errGetProvider struct {
+	mockProvider
+	getErr error
+}
+
+func (e *errGetProvider) Get(_ context.Context, _ string) (string, error) {
+	return "", e.getErr
+}
+
+func TestChainedProvider_PropagatesBackendErrors(t *testing.T) {
+	ctx := context.Background()
+	backendErr := errors.New("vault HTTP 403 forbidden")
+	p1 := newMock("local", false, map[string]string{})
+	p2 := &errGetProvider{
+		mockProvider: *newMock("remote", true, map[string]string{}),
+		getErr:       backendErr,
+	}
+
+	chain := NewChainedProvider(p1, p2)
+	_, err := chain.Get(ctx, "MISSING_KEY")
+	require.Error(t, err)
+	assert.False(t, errors.Is(err, ErrSecretNotFound), "backend error must not be masked by ErrSecretNotFound")
+	assert.ErrorIs(t, err, backendErr)
+}

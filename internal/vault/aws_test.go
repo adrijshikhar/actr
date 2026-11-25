@@ -70,7 +70,7 @@ func TestAWSSecretsManagerProvider_Get(t *testing.T) {
 	assert.True(t, errors.Is(err, ErrSecretNotFound))
 
 	list, err := provider.List(ctx)
-	assert.NoError(t, err)
+	assert.ErrorIs(t, err, ErrReadOnlyVault)
 	assert.Nil(t, list)
 
 	assert.True(t, errors.Is(provider.Set(ctx, "FOO", "BAR"), ErrReadOnlyVault))
@@ -128,4 +128,62 @@ func TestAWSSecretsManagerProvider_ServerErrorAndBadJSON(t *testing.T) {
 	pBad := newAWSProviderWithEndpoint("us-east-1", "prefix/", serverBad.URL)
 	_, err = pBad.Get(ctx, "KEY")
 	assert.Error(t, err)
+}
+
+func TestAWSSecretsManager_SignsSigV4AndDistinguishesAccessDenied(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+
+	var gotAuth, gotDate string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotDate = r.Header.Get("X-Amz-Date")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"__type":  "AccessDeniedException",
+			"message": "not authorized",
+		})
+	}))
+	defer srv.Close()
+
+	_, err := NewAWSSecretsManagerProvider("evil.com#", "p/").Get(context.Background(), "k")
+	require.Error(t, err) // invalid region rejected before HTTP
+
+	p := newAWSProviderWithEndpoint("us-east-1", "actr/", srv.URL)
+	_, err = p.Get(context.Background(), "KEY")
+	require.Error(t, err)
+	assert.False(t, errors.Is(err, ErrSecretNotFound), "AccessDeniedException must not map to ErrSecretNotFound")
+	assert.Contains(t, gotAuth, "AWS4-HMAC-SHA256")
+	assert.NotEmpty(t, gotDate)
+
+	// Missing credentials on default AWS endpoint must fail before HTTP
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	_, err = NewAWSSecretsManagerProvider("us-east-1", "p/").Get(context.Background(), "k")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "credentials")
+}
+
+func TestAWSSecretsManager_SigV4IncludesSessionToken(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+	t.Setenv("AWS_SESSION_TOKEN", "session-token-xyz")
+
+	var gotAuth, gotToken, gotSha string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotToken = r.Header.Get("X-Amz-Security-Token")
+		gotSha = r.Header.Get("X-Amz-Content-Sha256")
+		_ = json.NewEncoder(w).Encode(map[string]string{"SecretString": "ok"})
+	}))
+	defer srv.Close()
+
+	p := newAWSProviderWithEndpoint("us-west-2", "actr/", srv.URL)
+	val, err := p.Get(context.Background(), "KEY")
+	require.NoError(t, err)
+	assert.Equal(t, "ok", val)
+	assert.Equal(t, "session-token-xyz", gotToken)
+	assert.NotEmpty(t, gotSha)
+	assert.Contains(t, gotAuth, "/us-west-2/secretsmanager/aws4_request")
+	assert.Contains(t, gotAuth, "x-amz-security-token")
 }

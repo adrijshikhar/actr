@@ -52,11 +52,12 @@ func (s *DiskStore) Prune(maxRuns int, maxDiskBytes ...int64) (int, error) {
 	}
 
 	prunedCount := 0
+	var pruneErrs []error
 
 	// 1. Count pruning: remove oldest completed runs beyond maxRuns limit
 	if maxRuns > 0 && len(completedRuns) > maxRuns {
-		toPrune := completedRuns[maxRuns:]
-		completedRuns = completedRuns[:maxRuns]
+		toPrune := append([]*RunSummary(nil), completedRuns[maxRuns:]...)
+		completedRuns = append([]*RunSummary(nil), completedRuns[:maxRuns]...)
 		for _, run := range toPrune {
 			if run == nil || strings.TrimSpace(run.ID) == "" {
 				continue
@@ -65,7 +66,10 @@ func (s *DiskStore) Prune(maxRuns int, maxDiskBytes ...int64) (int, error) {
 			if err != nil {
 				continue
 			}
-			_ = os.RemoveAll(runDir)
+			if err := os.RemoveAll(runDir); err != nil {
+				pruneErrs = append(pruneErrs, fmt.Errorf("remove pruned run %s: %w", run.ID, err))
+				continue
+			}
 			prunedCount++
 		}
 	}
@@ -79,8 +83,12 @@ func (s *DiskStore) Prune(maxRuns int, maxDiskBytes ...int64) (int, error) {
 		runSizes := make(map[string]int64)
 		var totalSize int64
 
+		allRuns := make([]*RunSummary, 0, len(activeRuns)+len(completedRuns))
+		allRuns = append(allRuns, activeRuns...)
+		allRuns = append(allRuns, completedRuns...)
+
 		// Calculate size of all valid runs (both active and completed)
-		for _, r := range append(activeRuns, completedRuns...) {
+		for _, r := range allRuns {
 			if r == nil || strings.TrimSpace(r.ID) == "" {
 				continue
 			}
@@ -88,7 +96,11 @@ func (s *DiskStore) Prune(maxRuns int, maxDiskBytes ...int64) (int, error) {
 			if err != nil {
 				continue
 			}
-			sz := dirSize(runDir)
+			sz, err := dirSize(runDir)
+			if err != nil {
+				pruneErrs = append(pruneErrs, fmt.Errorf("calculate size for run %s: %w", r.ID, err))
+				continue
+			}
 			runSizes[r.ID] = sz
 			totalSize += sz
 		}
@@ -102,7 +114,10 @@ func (s *DiskStore) Prune(maxRuns int, maxDiskBytes ...int64) (int, error) {
 
 				if oldest != nil && strings.TrimSpace(oldest.ID) != "" {
 					if runDir, err := s.runDir(oldest.ID); err == nil {
-						_ = os.RemoveAll(runDir)
+						if err := os.RemoveAll(runDir); err != nil {
+							pruneErrs = append(pruneErrs, fmt.Errorf("remove pruned run %s: %w", oldest.ID, err))
+							continue
+						}
 						totalSize -= runSizes[oldest.ID]
 						prunedCount++
 					}
@@ -112,13 +127,20 @@ func (s *DiskStore) Prune(maxRuns int, maxDiskBytes ...int64) (int, error) {
 	}
 
 	if prunedCount > 0 || len(catalog.Runs) != len(activeRuns)+len(completedRuns) {
-		catalog.Runs = append(activeRuns, completedRuns...)
+		newRuns := make([]*RunSummary, 0, len(activeRuns)+len(completedRuns))
+		newRuns = append(newRuns, activeRuns...)
+		newRuns = append(newRuns, completedRuns...)
+		catalog.Runs = newRuns
 		s.sortRuns(catalog.Runs)
 		catalog.UpdatedAt = time.Now().UTC()
 		indexPath := filepath.Join(s.baseDir, "index.json")
 		if err := writeJSONAtomic(indexPath, catalog); err != nil {
 			return prunedCount, fmt.Errorf("failed to save index catalog after pruning: %w", err)
 		}
+	}
+
+	if len(pruneErrs) > 0 {
+		return prunedCount, errors.Join(pruneErrs...)
 	}
 
 	return prunedCount, nil
@@ -138,9 +160,13 @@ func (s *DiskStore) RecoverInterruptedRuns() (int, error) {
 		}
 		if errors.Is(err, ErrCorruptedIndex) {
 			indexPath := filepath.Join(s.baseDir, "index.json")
-			_ = s.backupCorruptIndex(indexPath)
+			if bErr := s.backupCorruptIndex(indexPath); bErr != nil {
+				return 0, fmt.Errorf("failed to backup corrupt index catalog: %w", bErr)
+			}
 			catalog = &IndexCatalog{Version: 1, Runs: []*RunSummary{}}
-			_ = writeJSONAtomic(indexPath, catalog)
+			if wErr := writeJSONAtomic(indexPath, catalog); wErr != nil {
+				return 0, fmt.Errorf("failed to reset corrupt index catalog: %w", wErr)
+			}
 			return 0, nil
 		}
 		return 0, fmt.Errorf("failed to load index catalog: %w", err)
@@ -153,7 +179,12 @@ func (s *DiskStore) RecoverInterruptedRuns() (int, error) {
 	now := time.Now().UTC()
 	recoveredCount := 0
 
+	cleanedRuns := make([]*RunSummary, 0, len(catalog.Runs))
 	for _, run := range catalog.Runs {
+		if run == nil || strings.TrimSpace(run.ID) == "" {
+			continue
+		}
+		cleanedRuns = append(cleanedRuns, run)
 		if run.Status == monitor.StatusRunning || run.Status == monitor.StatusQueued {
 			run.Status = StatusInterrupted
 			run.EndedAt = now
@@ -166,9 +197,6 @@ func (s *DiskStore) RecoverInterruptedRuns() (int, error) {
 			}
 			recoveredCount++
 
-			if strings.TrimSpace(run.ID) == "" {
-				continue
-			}
 			runDir, err := s.runDir(run.ID)
 			if err != nil {
 				continue
@@ -183,7 +211,7 @@ func (s *DiskStore) RecoverInterruptedRuns() (int, error) {
 					meta.EndedAt = now
 					meta.DurationSec = run.DurationSec
 					for _, step := range meta.Steps {
-						if step != nil && step.Status == monitor.StatusRunning {
+						if step != nil && (step.Status == monitor.StatusRunning || step.Status == monitor.StatusQueued) {
 							step.Status = StatusInterrupted
 							step.EndedAt = now
 							if !step.StartedAt.IsZero() {
@@ -201,7 +229,12 @@ func (s *DiskStore) RecoverInterruptedRuns() (int, error) {
 		}
 	}
 
-	if recoveredCount > 0 {
+	needsSave := recoveredCount > 0 || len(cleanedRuns) != len(catalog.Runs)
+	if len(cleanedRuns) != len(catalog.Runs) {
+		catalog.Runs = cleanedRuns
+	}
+
+	if needsSave {
 		catalog.UpdatedAt = now
 		indexPath := filepath.Join(s.baseDir, "index.json")
 		if err := writeJSONAtomic(indexPath, catalog); err != nil {
@@ -213,16 +246,22 @@ func (s *DiskStore) RecoverInterruptedRuns() (int, error) {
 }
 
 // dirSize computes the total byte size of regular files under path.
-func dirSize(path string) int64 {
+func dirSize(path string) (int64, error) {
 	var total int64
-	_ = filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
 		}
 		if !info.IsDir() {
 			total += info.Size()
 		}
 		return nil
 	})
-	return total
+	if err != nil && !os.IsNotExist(err) {
+		return 0, err
+	}
+	return total, nil
 }

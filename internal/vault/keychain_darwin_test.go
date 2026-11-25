@@ -40,3 +40,22 @@ attributes:
 	assert.Equal(t, "reversed_order_token", res[1].Key)
 	assert.Equal(t, "keychain", res[1].Provider)
 }
+
+func TestBuildDarwinKeychainSetCommand_MultilineUsesHex(t *testing.T) {
+	cmd, err := buildDarwinKeychainSetCommand("com.github.actr.secrets", "MY_KEY", "line1\nline2")
+	assert.NoError(t, err)
+	assert.Contains(t, cmd, "-X \"6c696e65310a6c696e6532\"")
+	assert.NotContains(t, cmd, " -w ")
+	assert.NotContains(t, cmd, "line1\nline2")
+
+	singleCmd, err := buildDarwinKeychainSetCommand("com.github.actr.secrets", "MY_KEY", "singleline")
+	assert.NoError(t, err)
+	assert.Contains(t, singleCmd, "-w \"singleline\"")
+	assert.NotContains(t, singleCmd, " -X ")
+
+	_, err = buildDarwinKeychainSetCommand("com.github.actr.secrets", "BAD\nKEY", "val")
+	assert.Error(t, err)
+
+	_, err = buildDarwinKeychainSetCommand("bad\rsvc", "KEY", "val")
+	assert.Error(t, err)
+}

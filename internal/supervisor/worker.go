@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/adrijshikhar/actr/internal/config"
+	"github.com/adrijshikhar/actr/internal/driver"
+	"github.com/adrijshikhar/actr/internal/driver/docker"
 	"github.com/adrijshikhar/actr/internal/driver/host"
 	"github.com/adrijshikhar/actr/internal/engine"
 	"github.com/adrijshikhar/actr/internal/logger"
@@ -21,14 +23,8 @@ import (
 	"github.com/adrijshikhar/actr/internal/protocol"
 	"github.com/adrijshikhar/actr/internal/telemetry"
 	"github.com/adrijshikhar/actr/internal/vault"
+	dockerclient "github.com/docker/docker/client"
 )
-
-// JobRequestReference holds metadata describing a dispatched job message.
-type JobRequestReference struct {
-	RunnerRequestID string `json:"runner_request_id"`
-	RunServiceURL   string `json:"run_service_url"`
-	BillingOwnerID  string `json:"billing_owner_id"`
-}
 
 // BrokerClientInterface defines the broker messaging contract.
 type BrokerClientInterface interface {
@@ -69,6 +65,7 @@ type RepoWorker struct {
 	agentID          int64
 	poolID           int64
 	running          bool
+	stopping         bool
 	pollCancel       context.CancelFunc
 	jobWg            sync.WaitGroup
 	doneCh           chan struct{}
@@ -98,14 +95,15 @@ func NewRepoWorker(alias string, repoCfg config.RepoConfig, resMgr *ResourceMana
 
 	if repoCfg.ConfigDir != "" {
 		creds, err := config.LoadCredentials(repoCfg.ConfigDir)
-		if err == nil && creds != nil {
+		if err != nil {
+			logger.Warn("failed to load credentials", "repo", alias, "configDir", repoCfg.ConfigDir, "error", err)
+		} else if creds != nil {
 			w.token = creds.IDToken
-			runnerCfg, _ := config.LoadRunnerConfig(repoCfg.ConfigDir)
-			if runnerCfg != nil {
+			runnerCfg, err := config.LoadRunnerConfig(repoCfg.ConfigDir)
+			if err != nil {
+				logger.Warn("failed to load runner config", "repo", alias, "configDir", repoCfg.ConfigDir, "error", err)
+			} else if runnerCfg != nil {
 				w.workFolder = runnerCfg.WorkFolder
-				if !filepath.IsAbs(w.workFolder) && repoCfg.ConfigDir != "" {
-					w.workFolder = filepath.Join(repoCfg.ConfigDir, w.workFolder)
-				}
 				w.serverURL = runnerCfg.ServerURL
 				w.agentName = runnerCfg.AgentName
 				w.agentID = runnerCfg.AgentID
@@ -115,12 +113,17 @@ func NewRepoWorker(alias string, repoCfg config.RepoConfig, resMgr *ResourceMana
 					brokerURL = runnerCfg.ServerURLV2
 				}
 				rsaPath := filepath.Join(repoCfg.ConfigDir, ".credentials_rsaparams")
-				if rsaBytes, err := os.ReadFile(rsaPath); err == nil {
+				rsaBytes, err := os.ReadFile(rsaPath)
+				if err != nil {
+					logger.Warn("failed to read RSA parameters", "repo", alias, "path", rsaPath, "error", err)
+				} else {
 					var rsaParams protocol.RSAParameters
-					if err := json.Unmarshal(rsaBytes, &rsaParams); err == nil {
-						if privKey, err := protocol.ParseRSAPrivateKey(&rsaParams); err == nil {
-							w.brokerClient = protocol.NewBrokerClient(nil, brokerURL, creds.AuthorizationURL, creds.ClientID, privKey)
-						}
+					if err := json.Unmarshal(rsaBytes, &rsaParams); err != nil {
+						logger.Warn("failed to unmarshal RSA parameters", "repo", alias, "error", err)
+					} else if privKey, err := protocol.ParseRSAPrivateKey(&rsaParams); err != nil {
+						logger.Warn("failed to parse RSA private key", "repo", alias, "error", err)
+					} else {
+						w.brokerClient = protocol.NewBrokerClient(nil, brokerURL, creds.AuthorizationURL, creds.ClientID, privKey)
 					}
 				}
 			}
@@ -143,20 +146,39 @@ func NewRepoWorker(alias string, repoCfg config.RepoConfig, resMgr *ResourceMana
 		if rc, ok := w.runServiceClient.(*protocol.RunServiceClient); ok {
 			protoRunClient = rc
 		}
-		coord := engine.NewCoordinator(host.NewDriver(), protoRunClient, w.workFolder).
+
+		var primaryDriver driver.Driver = host.NewDriver()
+		var dockerDrv driver.Driver
+		if strings.EqualFold(repoCfg.Driver, "docker") {
+			cli, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation())
+			if err != nil {
+				return nil, fmt.Errorf("initialize docker client for repo %q: %w", alias, err)
+			}
+			dockerDrv = docker.NewDriver(cli, true)
+			primaryDriver = dockerDrv
+		}
+
+		coord := engine.NewCoordinator(primaryDriver, protoRunClient, w.workFolder).
 			WithRunnerName(alias).
 			WithRepoAlias(alias).
 			WithRepositoryURL(repoCfg.URL)
+		if dockerDrv != nil {
+			coord.WithDockerDriver(dockerDrv)
+		}
 		if monServer != nil {
 			coord.SetMonitorServer(monServer)
 		}
-		if limits, err := repoCfg.ParseLimits(); err == nil && limits != nil {
+		if limits, err := repoCfg.ParseLimits(); err != nil {
+			logger.Warn("failed to parse repo limits", "repo", alias, "error", err)
+		} else if limits != nil {
 			coord.WithLimits(limits)
 		}
 		if w.tracer != nil {
 			coord.WithTracer(w.tracer)
 		}
-		if vaultProv, err := vault.NewProviderFromConfig(&repoCfg.Vault, repoCfg.ConfigDir); err == nil && vaultProv != nil {
+		if vaultProv, err := vault.NewProviderFromConfig(&repoCfg.Vault, repoCfg.ConfigDir); err != nil {
+			logger.Warn("failed to initialize vault provider", "repo", alias, "error", err)
+		} else if vaultProv != nil {
 			coord.WithVault(vaultProv)
 		}
 		w.coordinator = coord
@@ -170,6 +192,12 @@ func (w *RepoWorker) SetBrokerClient(b BrokerClientInterface) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.brokerClient = b
+}
+
+func (w *RepoWorker) getBrokerClient() BrokerClientInterface {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.brokerClient
 }
 
 // WithTracer sets the OpenTelemetry Manager on the worker and its coordinator.
@@ -190,11 +218,29 @@ func (w *RepoWorker) SetRunServiceClient(r RunServiceClientInterface) {
 	w.runServiceClient = r
 }
 
+func (w *RepoWorker) getRunServiceClient() RunServiceClientInterface {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.runServiceClient
+}
+
 // SetCoordinator overrides the JobExecutor (useful for testing and mocking).
 func (w *RepoWorker) SetCoordinator(c JobExecutor) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.coordinator = c
+}
+
+func (w *RepoWorker) getCoordinator() JobExecutor {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.coordinator
+}
+
+func (w *RepoWorker) getConnectionInfo() (serverURL, token, agentName string, agentID, poolID int64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.serverURL, w.token, w.agentName, w.agentID, w.poolID
 }
 
 // ActiveJobs returns the number of currently active jobs executing for this repo worker.
@@ -220,6 +266,12 @@ func (w *RepoWorker) Start(ctx context.Context, pollingCtx context.Context) erro
 
 	go func() {
 		defer close(w.doneCh)
+		defer func() {
+			w.mu.Lock()
+			w.running = false
+			w.stopping = false
+			w.mu.Unlock()
+		}()
 		w.runLoop(ctx, pollCtx)
 		w.jobWg.Wait()
 	}()
@@ -230,43 +282,64 @@ func (w *RepoWorker) Start(ctx context.Context, pollingCtx context.Context) erro
 // Stop halts the worker and cleans up any open broker session.
 func (w *RepoWorker) Stop(ctx context.Context) error {
 	w.mu.Lock()
-	if !w.running {
+	if !w.running || w.stopping {
+		done := w.doneCh
 		w.mu.Unlock()
+		if done != nil {
+			select {
+			case <-done:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 		return nil
 	}
+	w.stopping = true
 	if w.pollCancel != nil {
 		w.pollCancel()
 	}
 	done := w.doneCh
+	broker := w.brokerClient
 	w.mu.Unlock()
 
+	var drainErr error
 	select {
 	case <-done:
 	case <-ctx.Done():
-		return ctx.Err()
+		drainErr = ctx.Err()
+	}
+
+	if drainErr != nil {
+		return drainErr
+	}
+
+	if broker != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if err := broker.DeleteSession(cleanupCtx); err != nil {
+			logger.Warn("failed to delete broker session", "repo", w.repoAlias, "error", err)
+		}
 	}
 
 	w.mu.Lock()
 	w.running = false
+	w.stopping = false
 	w.mu.Unlock()
 
-	if w.brokerClient != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		defer cancel()
-		if err := w.brokerClient.DeleteSession(cleanupCtx); err != nil {
-			logger.Warn("failed to delete broker session", "repo", w.repoAlias, "error", err)
-		}
-	}
 	return nil
 }
 
 // executeWithGuards acquires a global execution permit from ResourceManager and releases it
 // via RAII defer, capturing any step or coordinator panics so the worker daemon never crashes.
-func (w *RepoWorker) executeWithGuards(ctx context.Context, reqRef JobRequestReference, fn func() error) (err error) {
+func (w *RepoWorker) executeWithGuards(ctx context.Context, reqRef protocol.JobRequestReference, fn func() error) (err error) {
 	permit, err := w.resMgr.Acquire(ctx)
 	if err != nil {
 		return err
 	}
+	return w.executeWithPermit(permit, fn)
+}
+
+func (w *RepoWorker) executeWithPermit(permit Permit, fn func() error) (err error) {
 	defer permit.Release()
 
 	defer func() {
@@ -286,11 +359,18 @@ func (w *RepoWorker) runLoop(ctx context.Context, pollingCtx context.Context) {
 	osName := runnerOS()
 	archName := runnerArch()
 
-	if w.brokerClient != nil && w.agentName != "" {
-		if err := w.brokerClient.CreateSession(ctx, w.agentName, w.agentID, w.poolID); err != nil {
+	_, _, agentName, agentID, poolID := w.getConnectionInfo()
+	if broker := w.getBrokerClient(); broker != nil && agentName != "" {
+		if err := broker.CreateSession(pollingCtx, agentName, agentID, poolID); err != nil {
 			logger.Error("failed to create broker session", "repo", w.repoAlias, "error", err)
 		}
 	}
+
+	const (
+		minBackoff = 500 * time.Millisecond
+		maxBackoff = 10 * time.Second
+	)
+	backoff := minBackoff
 
 	for {
 		select {
@@ -301,15 +381,14 @@ func (w *RepoWorker) runLoop(ctx context.Context, pollingCtx context.Context) {
 		default:
 		}
 
-		// Capacity-Gated Polling: Pause if global capacity is saturated
-		if w.resMgr.ActiveCount() >= w.resMgr.MaxConcurrentJobs() {
+		broker := w.getBrokerClient()
+		if broker == nil {
 			select {
-			case <-w.resMgr.SlotAvailable():
-			case <-time.After(500 * time.Millisecond):
 			case <-pollingCtx.Done():
 				return
 			case <-ctx.Done():
 				return
+			case <-time.After(200 * time.Millisecond):
 			}
 			continue
 		}
@@ -323,106 +402,120 @@ func (w *RepoWorker) runLoop(ctx context.Context, pollingCtx context.Context) {
 			return
 		}
 
-		// Double-check global capacity before calling broker (in case permits filled up while waiting for repoSem)
-		if w.resMgr.ActiveCount() >= w.resMgr.MaxConcurrentJobs() {
+		// Wait until global execution capacity is available before polling
+		if err := w.resMgr.WaitAvailable(pollingCtx); err != nil {
 			<-w.repoSem
-			select {
-			case <-w.resMgr.SlotAvailable():
-			case <-time.After(500 * time.Millisecond):
-			case <-pollingCtx.Done():
-				return
-			case <-ctx.Done():
-				return
-			}
-			continue
+			return
 		}
 
-		if w.brokerClient == nil {
-			<-w.repoSem
-			select {
-			case <-pollingCtx.Done():
-				return
-			case <-ctx.Done():
-				return
-			case <-time.After(200 * time.Millisecond):
-			}
-			continue
-		}
-
-		msg, err := w.brokerClient.GetMessage(pollingCtx, runnerVersion, osName, archName)
+		msg, err := broker.GetMessage(pollingCtx, runnerVersion, osName, archName)
 		if err != nil {
 			<-w.repoSem
-			if w.brokerClient != nil && w.agentName != "" && (strings.Contains(err.Error(), "RunnerSessionInvalid") ||
+			if pollingCtx.Err() != nil || ctx.Err() != nil {
+				return
+			}
+			_, _, agentName, agentID, poolID = w.getConnectionInfo()
+			if agentName != "" && (strings.Contains(err.Error(), "RunnerSessionInvalid") ||
 				strings.Contains(err.Error(), "Runner session is invalid") ||
 				strings.Contains(err.Error(), "no active session")) {
 				logger.Warn("broker session invalid; recreating broker session", "repo", w.repoAlias)
-				_ = w.brokerClient.CreateSession(ctx, w.agentName, w.agentID, w.poolID)
+				if sessErr := broker.CreateSession(pollingCtx, agentName, agentID, poolID); sessErr != nil {
+					logger.Warn("failed to recreate broker session", "repo", w.repoAlias, "error", sessErr)
+				}
 			}
 			select {
 			case <-pollingCtx.Done():
 				return
 			case <-ctx.Done():
 				return
-			case <-time.After(1 * time.Second):
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
 			}
 			continue
 		}
 
+		backoff = minBackoff
+
 		if msg == nil || (!strings.EqualFold(msg.MessageType, "RunnerJobRequest") && !strings.EqualFold(msg.MessageType, "PipelineAgentJobRequest")) {
 			<-w.repoSem
+			if msg == nil {
+				select {
+				case <-pollingCtx.Done():
+					return
+				case <-ctx.Done():
+					return
+				case <-time.After(50 * time.Millisecond):
+				}
+			}
 			continue
 		}
 
-		var reqRef JobRequestReference
+		var reqRef protocol.JobRequestReference
 		if msg.Body != "" {
-			_ = json.Unmarshal([]byte(msg.Body), &reqRef)
+			if err := json.Unmarshal([]byte(msg.Body), &reqRef); err != nil {
+				logger.Warn("failed to unmarshal job request reference", "repo", w.repoAlias, "messageID", msg.MessageID, "error", err)
+			}
 		}
 		if reqRef.RunnerRequestID == "" {
 			reqRef.RunnerRequestID = strconv.FormatInt(msg.MessageID, 10)
 		}
 
-		// Execute job in background goroutine with local slot held and jobWg tracking
+		// Acquire global execution permit after receiving job and before acknowledging
+		permit, err := w.resMgr.Acquire(ctx)
+		if err != nil {
+			<-w.repoSem
+			return
+		}
+
 		w.executingJobs.Add(1)
 		w.jobWg.Add(1)
-		go func(ref JobRequestReference) {
+		go func(ref protocol.JobRequestReference, p Permit) {
 			defer w.jobWg.Done()
 			defer w.executingJobs.Add(-1)
 			defer func() { <-w.repoSem }()
-			_ = w.executeWithGuards(ctx, ref, func() error {
+			_ = w.executeWithPermit(p, func() error {
 				return w.dispatchJob(ctx, ref)
 			})
-		}(reqRef)
+		}(reqRef, permit)
 	}
 }
 
 // dispatchJob acknowledges the broker message, claims the job from Run Service, runs execution
 // through coordinator, and delivers completion with context.WithoutCancel.
-func (w *RepoWorker) dispatchJob(ctx context.Context, ref JobRequestReference) (execErr error) {
-	if w.brokerClient != nil {
-		if err := w.brokerClient.AcknowledgeMessage(ctx, ref.RunnerRequestID); err != nil {
+func (w *RepoWorker) dispatchJob(ctx context.Context, ref protocol.JobRequestReference) (execErr error) {
+	broker := w.getBrokerClient()
+	if broker != nil {
+		if err := broker.AcknowledgeMessage(ctx, ref.RunnerRequestID); err != nil {
 			logger.Error("failed to ack message", "repo", w.repoAlias, "error", err)
 		}
 	}
 
-	if w.runServiceClient == nil {
+	runClient := w.getRunServiceClient()
+	if runClient == nil {
 		return nil
 	}
 
+	serverURL, token, _, _, _ := w.getConnectionInfo()
 	runServiceURL := ref.RunServiceURL
 	if runServiceURL == "" {
-		runServiceURL = w.serverURL
+		runServiceURL = serverURL
 	}
 
-	token := w.token
-	if bt, ok := w.brokerClient.(interface{ Token() string }); ok {
+	if bt, ok := broker.(interface{ Token() string }); ok {
 		if t := bt.Token(); t != "" {
 			token = t
 		}
 	}
 
-	jobSpec, err := w.runServiceClient.AcquireJob(ctx, runServiceURL, ref.RunnerRequestID, ref.BillingOwnerID, token)
+	jobSpec, err := runClient.AcquireJob(ctx, runServiceURL, ref.RunnerRequestID, ref.BillingOwnerID, token)
 	if err != nil {
 		return fmt.Errorf("acquire job: %w", err)
+	}
+	if jobSpec == nil {
+		return fmt.Errorf("acquire job returned nil specification")
 	}
 
 	jobToken := token
@@ -432,6 +525,9 @@ func (w *RepoWorker) dispatchJob(ctx context.Context, ref JobRequestReference) (
 
 	var completeReq *protocol.CompleteJobRequest
 	defer func() {
+		if jobSpec == nil {
+			return
+		}
 		if completeReq == nil {
 			completeReq = &protocol.CompleteJobRequest{
 				PlanID:     jobSpec.PlanID,
@@ -441,11 +537,11 @@ func (w *RepoWorker) dispatchJob(ctx context.Context, ref JobRequestReference) (
 		}
 		completeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 		defer cancel()
-		_ = w.runServiceClient.CompleteJob(completeCtx, runServiceURL, jobToken, completeReq)
+		_ = runClient.CompleteJob(completeCtx, runServiceURL, jobToken, completeReq)
 	}()
 
-	if w.coordinator != nil {
-		completeReq, execErr = w.coordinator.ExecuteJob(ctx, jobSpec, runServiceURL, jobToken)
+	if coord := w.getCoordinator(); coord != nil {
+		completeReq, execErr = coord.ExecuteJob(ctx, jobSpec, runServiceURL, jobToken)
 	}
 	return execErr
 }

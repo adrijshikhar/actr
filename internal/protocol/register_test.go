@@ -511,3 +511,17 @@ func TestRegisterRunner_MissingRequiredResponseFields(t *testing.T) {
 		})
 	}
 }
+
+func TestResolveRunnerRegistrationURL_CaseInsensitiveAndValidation(t *testing.T) {
+	u, err := resolveRunnerRegistrationURL("https://GitHub.com/owner/repo")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if u != "https://api.github.com/actions/runner-registration" {
+		t.Fatalf("expected api.github.com URL, got %q", u)
+	}
+
+	if _, err := resolveRunnerRegistrationURL("http://example.com/owner/repo"); err == nil {
+		t.Fatal("expected error for insecure non-loopback http URL")
+	}
+}

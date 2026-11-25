@@ -44,67 +44,6 @@ var runRegisterCmdFunc = func(cmd *cobra.Command) error {
 	return regCmd.RunE(regCmd, nil)
 }
 
-type JobRequestReference struct {
-	RunnerRequestID string `json:"runner_request_id"`
-	RunServiceURL   string `json:"run_service_url"`
-	BillingOwnerID  string `json:"billing_owner_id"`
-}
-
-func (r *JobRequestReference) UnmarshalJSON(data []byte) error {
-	var raw struct {
-		RunnerRequestID1 string `json:"runner_request_id"`
-		RunnerRequestID2 string `json:"runnerRequestId"`
-		RunnerRequestID3 string `json:"RunnerRequestId"`
-		RunnerRequestID4 string `json:"jobMessageId"`
-		RunnerRequestID5 string `json:"job_message_id"`
-
-		RunServiceURL1 string `json:"run_service_url"`
-		RunServiceURL2 string `json:"runServiceUrl"`
-		RunServiceURL3 string `json:"RunServiceUrl"`
-		RunServiceURL4 string `json:"runServiceURL"`
-
-		BillingOwnerID1 string `json:"billing_owner_id"`
-		BillingOwnerID2 string `json:"billingOwnerId"`
-		BillingOwnerID3 string `json:"BillingOwnerId"`
-	}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
-	}
-	r.RunnerRequestID = raw.RunnerRequestID1
-	if r.RunnerRequestID == "" {
-		r.RunnerRequestID = raw.RunnerRequestID2
-	}
-	if r.RunnerRequestID == "" {
-		r.RunnerRequestID = raw.RunnerRequestID3
-	}
-	if r.RunnerRequestID == "" {
-		r.RunnerRequestID = raw.RunnerRequestID4
-	}
-	if r.RunnerRequestID == "" {
-		r.RunnerRequestID = raw.RunnerRequestID5
-	}
-
-	r.RunServiceURL = raw.RunServiceURL1
-	if r.RunServiceURL == "" {
-		r.RunServiceURL = raw.RunServiceURL2
-	}
-	if r.RunServiceURL == "" {
-		r.RunServiceURL = raw.RunServiceURL3
-	}
-	if r.RunServiceURL == "" {
-		r.RunServiceURL = raw.RunServiceURL4
-	}
-
-	r.BillingOwnerID = raw.BillingOwnerID1
-	if r.BillingOwnerID == "" {
-		r.BillingOwnerID = raw.BillingOwnerID2
-	}
-	if r.BillingOwnerID == "" {
-		r.BillingOwnerID = raw.BillingOwnerID3
-	}
-	return nil
-}
-
 func resolveConfigDir(dir string, explicitlySet bool) string {
 	if explicitlySet && dir != "" {
 		return dir
@@ -690,7 +629,7 @@ func newRunCmd() *cobra.Command {
 
 				logger.Info("received job request message", "type", msg.MessageType, "id", msg.MessageID)
 
-				var reqRef JobRequestReference
+				var reqRef protocol.JobRequestReference
 				if msg.Body != "" {
 					if err := json.Unmarshal([]byte(msg.Body), &reqRef); err != nil {
 						logger.Warn("failed to parse job request reference from body", "error", err)

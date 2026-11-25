@@ -46,14 +46,14 @@ func TestSaveAndLoadConfig(t *testing.T) {
 		t.Fatalf("expected credentials permissions 0600, got %o", info.Mode().Perm())
 	}
 
-	// Verify .runner file permissions (should be 0644)
+	// Verify .runner file permissions (must be 0600)
 	cfgPath := filepath.Join(tmpDir, ".runner")
 	cfgInfo, err := os.Stat(cfgPath)
 	if err != nil {
 		t.Fatalf("stat failed on runner config: %v", err)
 	}
-	if cfgInfo.Mode().Perm() != 0644 {
-		t.Fatalf("expected runner config permissions 0644, got %o", cfgInfo.Mode().Perm())
+	if cfgInfo.Mode().Perm() != 0600 {
+		t.Fatalf("expected runner config permissions 0600, got %o", cfgInfo.Mode().Perm())
 	}
 
 	loadedCfg, err := LoadRunnerConfig(tmpDir)
@@ -360,4 +360,13 @@ func TestLoadYAMLConfig_Errors(t *testing.T) {
 
 	_, err = LoadYAMLConfig(badPath)
 	assert.Error(t, err)
+}
+
+func TestCredentialsData_UnmarshalJSON_Errors(t *testing.T) {
+	var cd CredentialsData
+	assert.Error(t, cd.UnmarshalJSON([]byte(`{"clientId": 123}`)))
+	assert.Error(t, cd.UnmarshalJSON([]byte(`{"authorizationUrl": 123}`)))
+	assert.Error(t, cd.UnmarshalJSON([]byte(`{"requireFipsCryptography": 123}`)))
+	assert.NoError(t, cd.UnmarshalJSON([]byte(`{"clientId": "abc", "authorizationUrl": "https://example.com", "requireFipsCryptography": "true"}`)))
+	assert.True(t, cd.RequireFipsCryptography)
 }

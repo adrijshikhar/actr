@@ -409,3 +409,16 @@ func TestDiskStore_Permissions(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, os.FileMode(0600), logInfo.Mode().Perm(), "step log file should have 0600 permissions")
 }
+
+func TestDiskStore_SanitizeIDRejectsReservedAndTraversal(t *testing.T) {
+	store, err := history.NewDiskStore(t.TempDir())
+	require.NoError(t, err)
+
+	for _, badID := range []string{"index.json", "INDEX.JSON", "Index.Json", "..", "a..b", "."} {
+		err := store.StartRun(&monitor.JobInfo{ID: badID}, nil, "docker")
+		assert.Error(t, err, "expected StartRun to reject ID %q", badID)
+
+		err = store.AppendStepLog("valid-job", badID, "line")
+		assert.Error(t, err, "expected AppendStepLog to reject stepID %q", badID)
+	}
+}

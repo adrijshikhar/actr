@@ -30,8 +30,12 @@ func (s *Server) handleSecretsList(w http.ResponseWriter, r *http.Request) {
 
 	secrets, err := s.cfg.SecretManager.ListSecrets(r.Context())
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
-		return
+		if errors.Is(err, vault.ErrReadOnlyVault) {
+			secrets = []vault.SecretMetadata{}
+		} else {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 
 	if secrets == nil {

@@ -23,12 +23,17 @@ var validIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_\-\.]+$`)
 var ErrCorruptedIndex = errors.New("corrupted index catalog")
 
 // sanitizeID verifies that id contains only alphanumeric characters, underscores,
-// hyphens, and dots, is not empty, does not contain "..", and is not ".".
+// hyphens, and dots, is not empty, is not "index.json" (case-insensitive),
+// does not contain "..", and is not ".".
 func sanitizeID(id string) (string, error) {
 	if strings.TrimSpace(id) == "" {
 		return "", errors.New("empty ID")
 	}
-	if strings.Contains(id, "..") {
+	normalized := strings.ToLower(id)
+	if normalized == "index.json" {
+		return "", fmt.Errorf("invalid ID %q: reserved name", id)
+	}
+	if strings.Contains(normalized, "..") {
 		return "", fmt.Errorf("invalid ID %q: contains '..'", id)
 	}
 	if !validIDPattern.MatchString(id) {
@@ -93,14 +98,17 @@ func (s *DiskStore) stepLogPath(jobID, stepID string) (string, error) {
 // backupCorruptIndex backs up a corrupted index.json to index.json.corrupt.<timestamp>.
 func (s *DiskStore) backupCorruptIndex(indexPath string) error {
 	if _, err := os.Stat(indexPath); err != nil {
-		return nil
+		return err
 	}
 	timestamp := fmt.Sprintf("%d", time.Now().UTC().UnixNano())
-	backupPath := fmt.Sprintf("%s.corrupt.%s", indexPath, timestamp)
+	backupPath := filepath.Clean(fmt.Sprintf("%s.corrupt.%s", indexPath, timestamp))
 	if err := os.Rename(indexPath, backupPath); err != nil {
 		if data, rErr := os.ReadFile(indexPath); rErr == nil {
-			_ = os.WriteFile(backupPath, data, 0600)
-			_ = os.Remove(indexPath)
+			if wErr := os.WriteFile(backupPath, data, 0600); wErr == nil {
+				if rmErr := os.Remove(indexPath); rmErr == nil {
+					return nil
+				}
+			}
 		}
 		return err
 	}
@@ -213,6 +221,14 @@ func (s *DiskStore) StartRun(job *monitor.JobInfo, limits *config.LimitsConfig, 
 		})
 	}
 
+	var runDur int64
+	if !job.EndedAt.IsZero() && !startedAt.IsZero() {
+		runDur = int64(job.EndedAt.Sub(startedAt).Seconds())
+		if runDur < 0 {
+			runDur = 0
+		}
+	}
+
 	meta := &RunMetadata{
 		ID:          job.ID,
 		Name:        job.Name,
@@ -223,7 +239,7 @@ func (s *DiskStore) StartRun(job *monitor.JobInfo, limits *config.LimitsConfig, 
 		Status:      status,
 		StartedAt:   startedAt,
 		EndedAt:     job.EndedAt,
-		DurationSec: 0,
+		DurationSec: runDur,
 		Driver:      driver,
 		Limits:      limits,
 		Steps:       steps,
@@ -251,7 +267,7 @@ func (s *DiskStore) StartRun(job *monitor.JobInfo, limits *config.LimitsConfig, 
 
 	found := false
 	for i, r := range catalog.Runs {
-		if r.ID == summary.ID {
+		if r != nil && r.ID == summary.ID {
 			catalog.Runs[i] = summary
 			found = true
 			break
@@ -315,7 +331,9 @@ func (s *DiskStore) FinishRun(jobID string, status monitor.StepStatus, metrics *
 
 	meta.Status = status
 	now := time.Now().UTC()
-	meta.EndedAt = now
+	if meta.EndedAt.IsZero() {
+		meta.EndedAt = now
+	}
 	if !meta.StartedAt.IsZero() {
 		dur := int64(meta.EndedAt.Sub(meta.StartedAt).Seconds())
 		if dur < 0 {
@@ -335,25 +353,44 @@ func (s *DiskStore) FinishRun(jobID string, status monitor.StepStatus, metrics *
 		}
 	}
 
-	// Flush any in-memory step stats that haven't been finalized via FinishStep
+	// Flush any in-memory step stats that haven't been finalized via FinishStep,
+	// synchronizing with stepLock before deleting stats and the lock.
+	flushAndDeleteStep := func(key string) *stepStats {
+		if val, ok := s.stepLocks.Load(key); ok {
+			lock := val.(*sync.RWMutex)
+			lock.Lock()
+			var flushed *stepStats
+			if sVal, ok := s.stepStats.LoadAndDelete(key); ok {
+				flushed = sVal.(*stepStats)
+			}
+			if cur, exists := s.stepLocks.Load(key); exists && cur == lock {
+				s.stepLocks.Delete(key)
+			}
+			lock.Unlock()
+			return flushed
+		}
+		if sVal, ok := s.stepStats.LoadAndDelete(key); ok {
+			return sVal.(*stepStats)
+		}
+		return nil
+	}
+
 	for _, st := range meta.Steps {
 		if st == nil {
 			continue
 		}
 		key := jobID + "/" + st.ID
-		if val, ok := s.stepStats.LoadAndDelete(key); ok {
-			stat := val.(*stepStats)
+		if stat := flushAndDeleteStep(key); stat != nil {
 			st.LogBytes += stat.bytes.Load()
 			st.LogLines += int(stat.lines.Load())
 		}
-		s.stepLocks.Delete(key)
 	}
 
 	// Clean up any remaining step locks or stats for this job
 	prefix := jobID + "/"
 	s.stepLocks.Range(func(k, _ any) bool {
 		if ks, ok := k.(string); ok && strings.HasPrefix(ks, prefix) {
-			s.stepLocks.Delete(k)
+			_ = flushAndDeleteStep(ks)
 		}
 		return true
 	})
@@ -370,7 +407,7 @@ func (s *DiskStore) FinishRun(jobID string, status monitor.StepStatus, metrics *
 
 	var target *RunSummary
 	for _, r := range catalog.Runs {
-		if r.ID == jobID {
+		if r != nil && r.ID == jobID {
 			target = r
 			break
 		}

@@ -3,12 +3,18 @@ package vault
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
 )
+
+const maxHashiCorpResponseBytes = 1 << 20
 
 var _ Provider = (*HashiCorpVaultProvider)(nil)
 
@@ -19,16 +25,51 @@ type HashiCorpVaultProvider struct {
 	mountPath  string
 	secretPath string
 	client     *http.Client
+	initErr    error
 }
 
 // NewHashiCorpVaultProvider creates a new HashiCorp Vault KV v2 provider.
 func NewHashiCorpVaultProvider(address, token, mountPath, secretPath string) Provider {
+	cleanAddr := strings.TrimRight(strings.TrimSpace(address), "/")
+	initErr := validateVaultAddress(cleanAddr)
+
 	return &HashiCorpVaultProvider{
-		address:    strings.TrimRight(address, "/"),
+		address:    cleanAddr,
 		token:      token,
 		mountPath:  strings.Trim(mountPath, "/"),
 		secretPath: strings.Trim(secretPath, "/"),
-		client:     &http.Client{Timeout: 10 * time.Second},
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		initErr: initErr,
+	}
+}
+
+func validateVaultAddress(address string) error {
+	if address == "" {
+		return errors.New("hashicorp vault address must not be empty")
+	}
+	u, err := url.Parse(address)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("invalid hashicorp vault address %q", address)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return nil
+	case "http":
+		host := u.Hostname()
+		if strings.EqualFold(host, "localhost") {
+			return nil
+		}
+		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			return nil
+		}
+		return fmt.Errorf("hashicorp vault address %q must use https for non-loopback hosts", address)
+	default:
+		return fmt.Errorf("unsupported hashicorp vault address scheme %q", u.Scheme)
 	}
 }
 
@@ -42,9 +83,12 @@ func (h *HashiCorpVaultProvider) Get(ctx context.Context, key string) (string, e
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
+	if h.initErr != nil {
+		return "", h.initErr
+	}
 
-	url := fmt.Sprintf("%s/v1/%s/data/%s", h.address, h.mountPath, h.secretPath)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	reqURL := fmt.Sprintf("%s/v1/%s/data/%s", h.address, h.mountPath, h.secretPath)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return "", err
 	}
@@ -68,19 +112,29 @@ func (h *HashiCorpVaultProvider) Get(ctx context.Context, key string) (string, e
 			Data map[string]any `json:"data"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+	dec := json.NewDecoder(io.LimitReader(resp.Body, maxHashiCorpResponseBytes))
+	dec.UseNumber()
+	if err := dec.Decode(&data); err != nil {
 		return "", err
 	}
 
-	if val, ok := data.Data.Data[key]; ok {
-		switch v := val.(type) {
-		case string:
-			return v, nil
-		default:
-			return fmt.Sprintf("%v", v), nil
-		}
+	val, ok := data.Data.Data[key]
+	if !ok {
+		return "", ErrSecretNotFound
 	}
-	return "", ErrSecretNotFound
+	if val == nil {
+		return "", fmt.Errorf("hashicorp vault secret %q has null value: %w", key, ErrSecretNotFound)
+	}
+	switch v := val.(type) {
+	case string:
+		return v, nil
+	case json.Number:
+		return v.String(), nil
+	case bool:
+		return fmt.Sprintf("%t", v), nil
+	default:
+		return "", fmt.Errorf("unsupported hashicorp vault secret value type %T for key %q", val, key)
+	}
 }
 
 // Set is not supported as HashiCorp Vault provider is read-only.
@@ -104,9 +158,12 @@ func (h *HashiCorpVaultProvider) List(ctx context.Context) ([]SecretMetadata, er
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if h.initErr != nil {
+		return nil, h.initErr
+	}
 
-	url := fmt.Sprintf("%s/v1/%s/data/%s", h.address, h.mountPath, h.secretPath)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	reqURL := fmt.Sprintf("%s/v1/%s/data/%s", h.address, h.mountPath, h.secretPath)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +187,9 @@ func (h *HashiCorpVaultProvider) List(ctx context.Context) ([]SecretMetadata, er
 			Data map[string]any `json:"data"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+	dec := json.NewDecoder(io.LimitReader(resp.Body, maxHashiCorpResponseBytes))
+	dec.UseNumber()
+	if err := dec.Decode(&data); err != nil {
 		return nil, err
 	}
 
@@ -139,7 +198,10 @@ func (h *HashiCorpVaultProvider) List(ctx context.Context) ([]SecretMetadata, er
 	}
 
 	list := make([]SecretMetadata, 0, len(data.Data.Data))
-	for k := range data.Data.Data {
+	for k, v := range data.Data.Data {
+		if v == nil {
+			continue
+		}
 		list = append(list, SecretMetadata{Key: k, Provider: h.Name()})
 	}
 	sort.Slice(list, func(i, j int) bool {

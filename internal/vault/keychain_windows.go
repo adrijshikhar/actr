@@ -30,19 +30,19 @@ func (w *WindowsDPAPIProvider) Set(ctx context.Context, key, value string) error
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return nil
+	return ErrReadOnlyVault
 }
 
 func (w *WindowsDPAPIProvider) Delete(ctx context.Context, key string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return nil
+	return ErrSecretNotFound
 }
 
 func (w *WindowsDPAPIProvider) List(ctx context.Context) ([]SecretMetadata, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return nil, nil
+	return []SecretMetadata{}, nil
 }
