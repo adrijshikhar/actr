@@ -13,9 +13,12 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/adrijshikhar/actr/internal/config"
 )
+
+type persistTask struct {
+	fn   func()
+	done chan struct{}
+}
 
 // Server provides an IPC server over a Unix domain socket for real-time
 // event streaming (NDJSON) and state snapshots (JSON).
@@ -38,6 +41,11 @@ type Server struct {
 	maxDiskBytes      int64
 	peakMetrics       map[string]*RunMetricsSummary
 	lastTelemetryTime map[string]time.Time
+
+	persistMu     sync.Mutex
+	persistCh     chan persistTask
+	persistWg     sync.WaitGroup
+	persistClosed bool
 
 	subMu       sync.Mutex
 	subscribers map[chan Event]struct{}
@@ -227,6 +235,121 @@ func (s *Server) hydrateFromStore() {
 	s.sortRecentJobsLocked()
 }
 
+func cloneStepInfo(st *StepInfo) *StepInfo {
+	if st == nil {
+		return nil
+	}
+	cp := *st
+	return &cp
+}
+
+func cloneJobInfo(j *JobInfo) *JobInfo {
+	if j == nil {
+		return nil
+	}
+	cp := *j
+	if j.MetricsSummary != nil {
+		m := *j.MetricsSummary
+		cp.MetricsSummary = &m
+	}
+	if j.Steps != nil {
+		cp.Steps = make([]*StepInfo, len(j.Steps))
+		for i, st := range j.Steps {
+			cp.Steps[i] = cloneStepInfo(st)
+		}
+	}
+	return &cp
+}
+
+func cloneTelemetry(t *TelemetrySample) *TelemetrySample {
+	if t == nil {
+		return nil
+	}
+	cp := *t
+	return &cp
+}
+
+func (s *Server) isActiveJobLocked(jobID string) bool {
+	for _, aj := range s.activeJobs {
+		if aj != nil && aj.ID == jobID {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) evictJobStateLocked(jobID string) {
+	delete(s.jobs, jobID)
+	delete(s.peakMetrics, jobID)
+	delete(s.lastTelemetryTime, jobID)
+	prefix := jobID + "/"
+	for k := range s.stepLogs {
+		if strings.HasPrefix(k, prefix) {
+			delete(s.stepLogs, k)
+		}
+	}
+}
+
+func (s *Server) enforceRetentionBoundsLocked() {
+	limit := s.maxRuns
+	if limit <= 0 {
+		limit = 100
+	}
+	maxJobs := limit * 2
+	if maxJobs < 100 {
+		maxJobs = 100
+	}
+
+	if len(s.jobs) > maxJobs {
+		retained := make(map[string]struct{}, len(s.activeJobs)+len(s.recentJobs))
+		for _, aj := range s.activeJobs {
+			if aj != nil {
+				retained[aj.ID] = struct{}{}
+			}
+		}
+		for _, rj := range s.recentJobs {
+			if rj != nil {
+				retained[rj.ID] = struct{}{}
+			}
+		}
+		for id := range s.jobs {
+			if _, keep := retained[id]; !keep {
+				s.evictJobStateLocked(id)
+			}
+		}
+	}
+
+	if len(s.peakMetrics) > maxJobs {
+		for id := range s.peakMetrics {
+			if _, exists := s.jobs[id]; !exists {
+				delete(s.peakMetrics, id)
+			}
+		}
+	}
+
+	if len(s.lastTelemetryTime) > maxJobs {
+		for id := range s.lastTelemetryTime {
+			if _, exists := s.jobs[id]; !exists {
+				delete(s.lastTelemetryTime, id)
+			}
+		}
+	}
+
+	maxStepLogs := maxJobs * 10
+	if len(s.stepLogs) > maxStepLogs {
+		for k := range s.stepLogs {
+			if len(s.stepLogs) <= maxStepLogs {
+				break
+			}
+			jobID, _, hasSlash := strings.Cut(k, "/")
+			if hasSlash && s.isActiveJobLocked(jobID) {
+				continue
+			}
+			delete(s.stepLogs, k)
+		}
+	}
+}
+
 func (s *Server) sortRecentJobsLocked() {
 	sort.Slice(s.recentJobs, func(i, j int) bool {
 		if s.recentJobs[i].StartedAt.Equal(s.recentJobs[j].StartedAt) {
@@ -234,9 +357,53 @@ func (s *Server) sortRecentJobsLocked() {
 		}
 		return s.recentJobs[i].StartedAt.After(s.recentJobs[j].StartedAt)
 	})
-	if len(s.recentJobs) > 100 {
-		s.recentJobs = s.recentJobs[:100]
+	limit := s.maxRuns
+	if limit <= 0 {
+		limit = 100
 	}
+	if len(s.recentJobs) > limit {
+		evicted := s.recentJobs[limit:]
+		s.recentJobs = append([]*JobInfo(nil), s.recentJobs[:limit]...)
+		for _, ej := range evicted {
+			if ej == nil || ej.ID == "" {
+				continue
+			}
+			if !s.isActiveJobLocked(ej.ID) {
+				s.evictJobStateLocked(ej.ID)
+			}
+		}
+	}
+	s.enforceRetentionBoundsLocked()
+}
+
+func (s *Server) enqueuePersist(fn func(), wait bool) <-chan struct{} {
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+	if s.persistClosed {
+		return nil
+	}
+	if s.persistCh == nil {
+		s.persistCh = make(chan persistTask, 4096)
+		ch := s.persistCh
+		s.persistWg.Add(1)
+		go func() {
+			defer s.persistWg.Done()
+			for task := range ch {
+				if task.fn != nil {
+					task.fn()
+				}
+				if task.done != nil {
+					close(task.done)
+				}
+			}
+		}()
+	}
+	var done chan struct{}
+	if wait {
+		done = make(chan struct{})
+	}
+	s.persistCh <- persistTask{fn: fn, done: done}
+	return done
 }
 
 // Start opens the Unix domain socket, applies permission 0600,
@@ -313,6 +480,17 @@ func (s *Server) Stop() error {
 		_ = s.listener.Close()
 	}
 	_ = os.Remove(s.sockPath)
+
+	s.persistMu.Lock()
+	if !s.persistClosed {
+		s.persistClosed = true
+		if s.persistCh != nil {
+			close(s.persistCh)
+		}
+	}
+	s.persistMu.Unlock()
+	s.persistWg.Wait()
+
 	return err
 }
 
@@ -392,16 +570,12 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 
 	activeJobsCopy := make([]*JobInfo, len(s.activeJobs))
 	for i, j := range s.activeJobs {
-		jCopy := *j
-		jCopy.Steps = append([]*StepInfo(nil), j.Steps...)
-		activeJobsCopy[i] = &jCopy
+		activeJobsCopy[i] = cloneJobInfo(j)
 	}
 
 	recentJobsCopy := make([]*JobInfo, len(s.recentJobs))
 	for i, j := range s.recentJobs {
-		jCopy := *j
-		jCopy.Steps = append([]*StepInfo(nil), j.Steps...)
-		recentJobsCopy[i] = &jCopy
+		recentJobsCopy[i] = cloneJobInfo(j)
 	}
 
 	var statusCopy *SupervisorStatus
@@ -424,7 +598,7 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		SupervisorStatus: statusCopy,
 		ActiveJobs:       activeJobsCopy,
 		RecentJobs:       recentJobsCopy,
-		Telemetry:        s.telemetry,
+		Telemetry:        cloneTelemetry(s.telemetry),
 		StepLogs:         logsCopy,
 	}
 	s.mu.RUnlock()
@@ -483,46 +657,19 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 func (s *Server) Publish(ev Event) {
 	broadcastEv := ev
 	if ev.Job != nil {
-		jCopy := *ev.Job
-		jCopy.Steps = append([]*StepInfo(nil), ev.Job.Steps...)
-		broadcastEv.Job = &jCopy
+		broadcastEv.Job = cloneJobInfo(ev.Job)
 	}
 	if ev.Step != nil {
-		sCopy := *ev.Step
-		broadcastEv.Step = &sCopy
+		broadcastEv.Step = cloneStepInfo(ev.Step)
+	}
+	if ev.Telemetry != nil {
+		broadcastEv.Telemetry = cloneTelemetry(ev.Telemetry)
 	}
 
-	var (
-		store HistoryStore
-
-		doStartRun  bool
-		startJob    *JobInfo
-		startLimits *config.LimitsConfig
-		startDriver string
-
-		doFinishStep   bool
-		stepJobID      string
-		stepFinishID   string
-		stepConclusion string
-		stepFinishedAt time.Time
-		stepStartedAt  time.Time
-		stepExitCode   int
-
-		doAppendLog bool
-		logJobID    string
-		logStepID   string
-		logLine     string
-
-		doFinishRun   bool
-		finishJobID   string
-		finishStatus  StepStatus
-		finishMetrics *RunMetricsSummary
-		finishMaxRuns int
-		finishMaxDisk int64
-	)
+	var persistDone <-chan struct{}
 
 	s.mu.Lock()
-	store = s.historyStore
+	store := s.historyStore
 
 	switch ev.Type {
 	case EventJobStart:
@@ -543,12 +690,18 @@ func (s *Server) Publish(ev Event) {
 				job.Workflow = ev.Job.Workflow
 				job.Repo = ev.Job.Repo
 				job.RepoAlias = ev.Job.RepoAlias
+				job.RepoURL = ev.Job.RepoURL
 				job.Owner = ev.Job.Owner
+				job.Driver = ev.Job.Driver
 				job.Status = ev.Job.Status
 				if !ev.Job.StartedAt.IsZero() {
 					job.StartedAt = ev.Job.StartedAt
 				}
-				job.Steps = append([]*StepInfo(nil), ev.Job.Steps...)
+				job.EndedAt = ev.Job.EndedAt
+				job.Steps = make([]*StepInfo, len(ev.Job.Steps))
+				for i, st := range ev.Job.Steps {
+					job.Steps[i] = cloneStepInfo(st)
+				}
 			}
 			if ev.RepoAlias != "" {
 				job.RepoAlias = ev.RepoAlias
@@ -572,17 +725,21 @@ func (s *Server) Publish(ev Event) {
 				s.activeJobs = append(s.activeJobs, job)
 			}
 			s.peakMetrics[jobID] = &RunMetricsSummary{}
+			s.enforceRetentionBoundsLocked()
 			if store != nil {
 				driver := ev.Driver
 				if driver == "" {
 					driver = "docker"
 				}
-				doStartRun = true
-				jCopy := *job
-				jCopy.Steps = append([]*StepInfo(nil), job.Steps...)
-				startJob = &jCopy
-				startLimits = ev.Limits
-				startDriver = driver
+				startJob := cloneJobInfo(job)
+				startLimits := ev.Limits
+				if startLimits != nil {
+					lc := *startLimits
+					startLimits = &lc
+				}
+				s.enqueuePersist(func() {
+					_ = store.StartRun(startJob, startLimits, driver)
+				}, false)
 			}
 		}
 	case EventJobFinish:
@@ -618,7 +775,7 @@ func (s *Server) Publish(ev Event) {
 		}
 		if jobToSave == nil {
 			if ev.Job != nil {
-				jobToSave = ev.Job
+				jobToSave = cloneJobInfo(ev.Job)
 			} else if jobID != "" {
 				if existing, ok := s.jobs[jobID]; ok {
 					jobToSave = existing
@@ -627,6 +784,17 @@ func (s *Server) Publish(ev Event) {
 				}
 			}
 		}
+		var peakMetrics *RunMetricsSummary
+		if metrics, ok := s.peakMetrics[jobID]; ok {
+			peakMetrics = metrics
+			delete(s.peakMetrics, jobID)
+		}
+		if jobToSave != nil && peakMetrics != nil {
+			mCopy := *peakMetrics
+			jobToSave.MetricsSummary = &mCopy
+		}
+		delete(s.lastTelemetryTime, jobID)
+
 		if jobToSave != nil {
 			s.jobs[jobID] = jobToSave
 			found := false
@@ -647,16 +815,6 @@ func (s *Server) Publish(ev Event) {
 			s.telemetry = nil
 		}
 
-		var peakMetrics *RunMetricsSummary
-		if metrics, ok := s.peakMetrics[jobID]; ok {
-			peakMetrics = metrics
-			delete(s.peakMetrics, jobID)
-		}
-		if jobToSave != nil && peakMetrics != nil {
-			jobToSave.MetricsSummary = peakMetrics
-		}
-		delete(s.lastTelemetryTime, jobID)
-
 		if store != nil && jobID != "" {
 			fStatus := StatusSuccess
 			if jobToSave != nil && jobToSave.Status != "" {
@@ -664,18 +822,27 @@ func (s *Server) Publish(ev Event) {
 			} else if ev.Job != nil && ev.Job.Status != "" {
 				fStatus = ev.Job.Status
 			}
-			doFinishRun = true
-			finishJobID = jobID
-			finishStatus = fStatus
-			finishMetrics = peakMetrics
-			finishMaxRuns = s.maxRuns
+			finishJobID := jobID
+			finishStatus := fStatus
+			var finishMetrics *RunMetricsSummary
+			if peakMetrics != nil {
+				mCopy := *peakMetrics
+				finishMetrics = &mCopy
+			}
+			finishMaxRuns := s.maxRuns
 			if finishMaxRuns <= 0 {
 				finishMaxRuns = 50
 			}
-			finishMaxDisk = s.maxDiskBytes
+			finishMaxDisk := s.maxDiskBytes
 			if finishMaxDisk <= 0 {
 				finishMaxDisk = 200 * 1024 * 1024
 			}
+			persistDone = s.enqueuePersist(func() {
+				_ = store.FinishRun(finishJobID, finishStatus, finishMetrics)
+			}, true)
+			s.enqueuePersist(func() {
+				_, _ = store.Prune(finishMaxRuns, finishMaxDisk)
+			}, false)
 		}
 	case EventStepStart, EventStepFinish:
 		if ev.Step != nil && ev.JobID != "" {
@@ -714,16 +881,18 @@ func (s *Server) Publish(ev Event) {
 			}
 
 			if ev.Type == EventStepFinish && store != nil {
-				doFinishStep = true
-				stepJobID = ev.JobID
-				stepFinishID = ev.Step.ID
-				stepConclusion = string(ev.Step.Status)
-				stepFinishedAt = ev.Step.EndedAt
-				stepStartedAt = stepClone.StartedAt
-				stepExitCode = ev.Step.ExitCode
+				stepJobID := ev.JobID
+				stepFinishID := ev.Step.ID
+				stepConclusion := string(ev.Step.Status)
+				stepFinishedAt := ev.Step.EndedAt
+				stepStartedAt := stepClone.StartedAt
+				stepExitCode := ev.Step.ExitCode
 				if stepExitCode == 0 && ev.Step.Status == StatusFailed {
 					stepExitCode = 1
 				}
+				s.enqueuePersist(func() {
+					_ = store.FinishStep(stepJobID, stepFinishID, stepConclusion, stepExitCode, stepFinishedAt, stepStartedAt)
+				}, false)
 			}
 		}
 	case EventStepLog:
@@ -735,6 +904,7 @@ func (s *Server) Publish(ev Event) {
 				s.stepLogs[key] = rb
 			}
 			rb.Append(ev.LogLine)
+			s.enforceRetentionBoundsLocked()
 
 			if store != nil {
 				targetJobID := ev.JobID
@@ -742,15 +912,17 @@ func (s *Server) Publish(ev Event) {
 					targetJobID = s.activeJobs[0].ID
 				}
 				if targetJobID != "" {
-					doAppendLog = true
-					logJobID = targetJobID
-					logStepID = ev.StepID
-					logLine = ev.LogLine
+					logJobID := targetJobID
+					logStepID := ev.StepID
+					logLine := ev.LogLine
+					s.enqueuePersist(func() {
+						_ = store.AppendStepLog(logJobID, logStepID, logLine)
+					}, false)
 				}
 			}
 		}
 	case EventTelemetry:
-		s.telemetry = ev.Telemetry
+		s.telemetry = cloneTelemetry(ev.Telemetry)
 		if ev.Telemetry != nil {
 			if ev.RepoAlias != "" {
 				if ev.JobID != "" {
@@ -817,25 +989,13 @@ func (s *Server) Publish(ev Event) {
 					peak.TotalDiskWrittenBytes += uint64(math.Round(float64(ev.Telemetry.DiskWriteRate) * deltaSeconds))
 				}
 			}
+			s.enforceRetentionBoundsLocked()
 		}
 	}
 	s.mu.Unlock()
 
-	// Execute Disk Operations OUTSIDE s.mu.Lock()
-	if doStartRun {
-		_ = store.StartRun(startJob, startLimits, startDriver)
-	}
-	if doFinishStep {
-		_ = store.FinishStep(stepJobID, stepFinishID, stepConclusion, stepExitCode, stepFinishedAt, stepStartedAt)
-	}
-	if doAppendLog {
-		_ = store.AppendStepLog(logJobID, logStepID, logLine)
-	}
-	if doFinishRun {
-		_ = store.FinishRun(finishJobID, finishStatus, finishMetrics)
-		go func() {
-			_, _ = store.Prune(finishMaxRuns, finishMaxDisk)
-		}()
+	if persistDone != nil {
+		<-persistDone
 	}
 
 	s.subMu.Lock()

@@ -425,3 +425,45 @@ func TestDiskStore_StepLocks_CleanedUp(t *testing.T) {
 	assert.Equal(t, 0, store.StepLockCount(), "all step locks should be cleaned up after run finish")
 	assert.Equal(t, 0, store.StepStatsCount(), "all step stats should be cleaned up after run finish")
 }
+
+func TestDiskStore_ConcurrentAppendAndStepFinalizationRace(t *testing.T) {
+	store, err := history.NewDiskStore(t.TempDir())
+	require.NoError(t, err)
+
+	jobID := "job-race-step"
+	stepID := "step-race"
+	now := time.Now().UTC()
+
+	require.NoError(t, store.StartRun(&monitor.JobInfo{
+		ID:        jobID,
+		Name:      "race test",
+		Status:    monitor.StatusRunning,
+		StartedAt: now,
+		Steps: []*monitor.StepInfo{
+			{ID: stepID, Name: "Race Step", Number: 1, Status: monitor.StatusRunning, StartedAt: now},
+		},
+	}, nil, "docker"))
+
+	var wg sync.WaitGroup
+	for g := 0; g < 6; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < 30; i++ {
+				_ = store.AppendStepLog(jobID, stepID, fmt.Sprintf("worker-%d-line-%d", id, i))
+			}
+		}(g)
+	}
+	for f := 0; f < 3; f++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = store.FinishStep(jobID, stepID, string(monitor.StatusSuccess), 0, time.Now().UTC())
+		}()
+	}
+	wg.Wait()
+
+	require.NoError(t, store.FinishRun(jobID, monitor.StatusSuccess, nil))
+	assert.Equal(t, 0, store.StepLockCount())
+	assert.Equal(t, 0, store.StepStatsCount())
+}

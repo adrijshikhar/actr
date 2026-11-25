@@ -2,9 +2,12 @@ package logger
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestLoggerLevels(t *testing.T) {
@@ -77,4 +80,12 @@ func TestConcurrentLogging(t *testing.T) {
 	if !strings.Contains(out, "concurrent debug") {
 		t.Fatalf("expected concurrent debug logs in output")
 	}
+}
+
+func TestLogger_InitNilWriterDoesNotPanic(t *testing.T) {
+	t.Cleanup(func() { Init(false, os.Stderr) })
+	Init(false, nil)
+	assert.NotPanics(t, func() {
+		Info("safe")
+	})
 }

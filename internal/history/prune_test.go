@@ -322,3 +322,49 @@ func TestDiskStore_RecoverInterruptedRuns_OnStoreInit(t *testing.T) {
 	assert.Equal(t, history.StatusInterrupted, metaRecovered.Status)
 	assert.False(t, metaRecovered.EndedAt.IsZero())
 }
+
+func TestDiskStore_RecoverInterruptedRuns_HandlesNilEntryAndQueuedSteps(t *testing.T) {
+	tempDir := t.TempDir()
+	now := time.Now().Add(-2 * time.Minute).UTC().Truncate(time.Second)
+
+	catalog := history.IndexCatalog{
+		Version:   1,
+		UpdatedAt: now,
+		Runs: []*history.RunSummary{
+			nil,
+			{
+				ID:        "job-queued-crash",
+				Name:      "Queued Crash",
+				Status:    monitor.StatusQueued,
+				StartedAt: now,
+			},
+		},
+	}
+	catalogBytes, err := json.Marshal(catalog)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(tempDir, "index.json"), catalogBytes, 0600))
+
+	jobDir := filepath.Join(tempDir, "job-queued-crash")
+	require.NoError(t, os.MkdirAll(jobDir, 0700))
+	meta := history.RunMetadata{
+		ID:        "job-queued-crash",
+		Name:      "Queued Crash",
+		Status:    monitor.StatusQueued,
+		StartedAt: now,
+		Steps: []*history.StepMetadata{
+			{ID: "step-q", Name: "Queued Step", Status: monitor.StatusQueued},
+		},
+	}
+	metaBytes, err := json.Marshal(meta)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(jobDir, "meta.json"), metaBytes, 0600))
+
+	store, err := history.NewDiskStore(tempDir)
+	require.NoError(t, err)
+
+	got, err := store.GetRun("job-queued-crash")
+	require.NoError(t, err)
+	assert.Equal(t, history.StatusInterrupted, got.Status)
+	require.Len(t, got.Steps, 1)
+	assert.Equal(t, history.StatusInterrupted, got.Steps[0].Status)
+}

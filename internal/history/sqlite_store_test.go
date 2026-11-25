@@ -4,12 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/adrijshikhar/actr/internal/monitor"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -391,4 +393,15 @@ func TestSQLiteStore_PruneDiskLimit(t *testing.T) {
 	runs, err := store.ListRuns(10)
 	require.NoError(t, err)
 	require.LessOrEqual(t, len(runs), 2)
+}
+
+func TestNewSQLiteStore_RestrictsDBFilePermissionsTo0600(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "history.db")
+	s, err := NewSQLiteStore(dbPath)
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	fi, err := os.Stat(dbPath)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), fi.Mode().Perm())
 }

@@ -58,9 +58,6 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("failed to open sqlite database at %s: %w", dbPath, err)
 	}
 
-	// Restrict file permissions to user-only read/write
-	_ = os.Chmod(dbPath, 0600)
-
 	// Set single-connection pool to serialize writes and eliminate SQLITE_BUSY concurrency conflicts.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
@@ -73,6 +70,12 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	if err := store.initSchema(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to initialize sqlite schema: %w", err)
+	}
+
+	// Restrict file permissions to user-only read/write after schema creation creates dbPath on disk.
+	if err := os.Chmod(dbPath, 0600); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to restrict sqlite database permissions on %s: %w", dbPath, err)
 	}
 
 	return store, nil
@@ -164,6 +167,11 @@ func (s *SQLiteStore) RecordRun(meta *monitor.RunMetadata) error {
 	if meta == nil || meta.ID == "" {
 		return errors.New("empty run metadata or ID")
 	}
+	for _, st := range meta.Steps {
+		if st != nil && st.ID == "" {
+			return errors.New("empty step ID")
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -179,12 +187,20 @@ func (s *SQLiteStore) RecordRun(meta *monitor.RunMetadata) error {
 
 	var limitsJSON sql.NullString
 	if meta.Limits != nil {
-		if b, err := json.Marshal(meta.Limits); err == nil {
-			limitsJSON = sql.NullString{String: string(b), Valid: true}
+		b, err := json.Marshal(meta.Limits)
+		if err != nil {
+			return fmt.Errorf("marshal limits for run %s: %w", meta.ID, err)
 		}
+		limitsJSON = sql.NullString{String: string(b), Valid: true}
 	}
 
-	_, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin record run tx %s: %w", meta.ID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO runs (
 			id, repo_alias, repo_url, name, workflow, owner, repo, status,
 			started_at, ended_at, duration_sec, driver, limits_json, peak_cpu_percent,
@@ -236,7 +252,7 @@ func (s *SQLiteStore) RecordRun(meta *monitor.RunMetadata) error {
 			stepIndex = i + 1
 		}
 
-		_, err := s.db.ExecContext(ctx, `
+		_, err := tx.ExecContext(ctx, `
 			INSERT INTO steps (
 				id, run_id, step_index, name, status, started_at, ended_at, duration_sec, exit_code
 			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -256,6 +272,9 @@ func (s *SQLiteStore) RecordRun(meta *monitor.RunMetadata) error {
 		}
 	}
 
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit run %s: %w", meta.ID, err)
+	}
 	return nil
 }
 
@@ -458,6 +477,9 @@ func (s *SQLiteStore) ListRuns(limit int) ([]*monitor.RunSummary, error) {
 
 // AppendStepLogs appends a batch of log lines atomically within a single transaction.
 func (s *SQLiteStore) AppendStepLogs(jobID, stepID string, lines []string) error {
+	if jobID == "" || stepID == "" {
+		return errors.New("empty jobID or stepID")
+	}
 	if len(lines) == 0 {
 		return nil
 	}
@@ -467,33 +489,37 @@ func (s *SQLiteStore) AppendStepLogs(jobID, stepID string, lines []string) error
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// Ensure run and step exist so foreign key doesn't fail if log is appended before run/step metadata
-	_, _ = s.db.ExecContext(ctx, `
-		INSERT INTO runs (id, status, started_at)
-		VALUES (?, ?, ?)
-		ON CONFLICT(id) DO NOTHING
-	`, jobID, monitor.StatusRunning, time.Now().UTC())
-
-	_, _ = s.db.ExecContext(ctx, `
-		INSERT INTO steps (id, run_id, step_index, name, status)
-		VALUES (?, ?, 0, ?, ?)
-		ON CONFLICT(run_id, id) DO NOTHING
-	`, stepID, jobID, stepID, monitor.StatusRunning)
-
-	var maxLine int
-	err := s.db.QueryRowContext(ctx, "SELECT COALESCE(MAX(line_num), 0) FROM step_logs WHERE run_id = ? AND step_id = ?", jobID, stepID).Scan(&maxLine)
-	if err != nil {
-		return fmt.Errorf("query max line num: %w", err)
-	}
-	startLine := maxLine + 1
-
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin log batch tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	stmt, err := tx.PrepareContext(ctx, "INSERT OR IGNORE INTO step_logs (run_id, step_id, line_num, log_line) VALUES (?, ?, ?, ?)")
+	// Ensure run and step exist so foreign key doesn't fail if log is appended before run/step metadata
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO runs (id, status, started_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(id) DO NOTHING
+	`, jobID, monitor.StatusRunning, time.Now().UTC()); err != nil {
+		return fmt.Errorf("ensure run %s for logs: %w", jobID, err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO steps (id, run_id, step_index, name, status)
+		VALUES (?, ?, 0, ?, ?)
+		ON CONFLICT(run_id, id) DO NOTHING
+	`, stepID, jobID, stepID, monitor.StatusRunning); err != nil {
+		return fmt.Errorf("ensure step %s/%s for logs: %w", jobID, stepID, err)
+	}
+
+	var maxLine int
+	err = tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(line_num), 0) FROM step_logs WHERE run_id = ? AND step_id = ?", jobID, stepID).Scan(&maxLine)
+	if err != nil {
+		return fmt.Errorf("query max line num: %w", err)
+	}
+	startLine := maxLine + 1
+
+	stmt, err := tx.PrepareContext(ctx, "INSERT INTO step_logs (run_id, step_id, line_num, log_line) VALUES (?, ?, ?, ?)")
 	if err != nil {
 		return fmt.Errorf("prepare log insert: %w", err)
 	}
@@ -505,7 +531,10 @@ func (s *SQLiteStore) AppendStepLogs(jobID, stepID string, lines []string) error
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit log batch tx: %w", err)
+	}
+	return nil
 }
 
 // GetStepLogs returns all lines recorded for the given step in ascending order.
@@ -580,6 +609,13 @@ func (s *SQLiteStore) StartRun(job *monitor.JobInfo, limits *config.LimitsConfig
 		if num == 0 {
 			num = i + 1
 		}
+		var stepDur int64
+		if !st.EndedAt.IsZero() && !st.StartedAt.IsZero() {
+			stepDur = int64(st.EndedAt.Sub(st.StartedAt).Seconds())
+			if stepDur < 0 {
+				stepDur = 0
+			}
+		}
 		steps = append(steps, &monitor.StepMetadata{
 			ID:          st.ID,
 			Number:      num,
@@ -587,24 +623,33 @@ func (s *SQLiteStore) StartRun(job *monitor.JobInfo, limits *config.LimitsConfig
 			Status:      st.Status,
 			StartedAt:   st.StartedAt,
 			EndedAt:     st.EndedAt,
-			DurationSec: 0,
+			DurationSec: stepDur,
 		})
 	}
 
+	var runDur int64
+	if !job.EndedAt.IsZero() && !startedAt.IsZero() {
+		runDur = int64(job.EndedAt.Sub(startedAt).Seconds())
+		if runDur < 0 {
+			runDur = 0
+		}
+	}
+
 	meta := &monitor.RunMetadata{
-		ID:        job.ID,
-		Name:      job.Name,
-		Workflow:  job.Workflow,
-		Repo:      job.Repo,
-		RepoAlias: job.RepoAlias,
-		RepoURL:   job.RepoURL,
-		Owner:     job.Owner,
-		Status:    status,
-		StartedAt: startedAt,
-		EndedAt:   job.EndedAt,
-		Driver:    driver,
-		Limits:    limits,
-		Steps:     steps,
+		ID:          job.ID,
+		Name:        job.Name,
+		Workflow:    job.Workflow,
+		Repo:        job.Repo,
+		RepoAlias:   job.RepoAlias,
+		RepoURL:     job.RepoURL,
+		Owner:       job.Owner,
+		Status:      status,
+		StartedAt:   startedAt,
+		EndedAt:     job.EndedAt,
+		DurationSec: runDur,
+		Driver:      driver,
+		Limits:      limits,
+		Steps:       steps,
 	}
 
 	return s.RecordRun(meta)
@@ -620,12 +665,22 @@ func (s *SQLiteStore) FinishStep(jobID, stepID, conclusion string, exitCode int,
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin finish step tx %s/%s: %w", jobID, stepID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	var sAt time.Time
 	if len(startedAt) > 0 && !startedAt[0].IsZero() {
 		sAt = startedAt[0]
 	} else {
 		var nullSAt sql.NullTime
-		_ = s.db.QueryRowContext(ctx, "SELECT started_at FROM steps WHERE run_id = ? AND id = ?", jobID, stepID).Scan(&nullSAt)
+		err := tx.QueryRowContext(ctx, "SELECT started_at FROM steps WHERE run_id = ? AND id = ?", jobID, stepID).Scan(&nullSAt)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("query step started_at %s/%s: %w", jobID, stepID, err)
+		}
 		if nullSAt.Valid {
 			sAt = nullSAt.Time
 		}
@@ -644,7 +699,7 @@ func (s *SQLiteStore) FinishStep(jobID, stepID, conclusion string, exitCode int,
 		sAtParam = sql.NullTime{Time: sAt, Valid: true}
 	}
 
-	res, err := s.db.ExecContext(ctx, `
+	res, err := tx.ExecContext(ctx, `
 		UPDATE steps
 		SET status = ?, ended_at = ?, duration_sec = ?, exit_code = ?, started_at = COALESCE(started_at, ?)
 		WHERE run_id = ? AND id = ?
@@ -653,9 +708,12 @@ func (s *SQLiteStore) FinishStep(jobID, stepID, conclusion string, exitCode int,
 		return fmt.Errorf("finish step %s/%s: %w", jobID, stepID, err)
 	}
 
-	rows, _ := res.RowsAffected()
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("finish step rows affected %s/%s: %w", jobID, stepID, err)
+	}
 	if rows == 0 {
-		_, err = s.db.ExecContext(ctx, `
+		_, err = tx.ExecContext(ctx, `
 			INSERT INTO steps (id, run_id, step_index, name, status, started_at, ended_at, duration_sec, exit_code)
 			VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(run_id, id) DO UPDATE SET
@@ -668,6 +726,9 @@ func (s *SQLiteStore) FinishStep(jobID, stepID, conclusion string, exitCode int,
 		if err != nil {
 			return fmt.Errorf("upsert finished step %s/%s: %w", jobID, stepID, err)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit finish step %s/%s: %w", jobID, stepID, err)
 	}
 	return nil
 }
@@ -684,16 +745,30 @@ func (s *SQLiteStore) FinishRun(jobID string, status monitor.StepStatus, metrics
 	defer cancel()
 	now := time.Now().UTC()
 
-	var sAt time.Time
-	var nullSAt sql.NullTime
-	_ = s.db.QueryRowContext(ctx, "SELECT started_at FROM runs WHERE id = ?", jobID).Scan(&nullSAt)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin finish run tx %s: %w", jobID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var sAt, eAt time.Time
+	var nullSAt, nullEAt sql.NullTime
+	err = tx.QueryRowContext(ctx, "SELECT started_at, ended_at FROM runs WHERE id = ?", jobID).Scan(&nullSAt, &nullEAt)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("query run timestamps %s: %w", jobID, err)
+	}
 	if nullSAt.Valid {
 		sAt = nullSAt.Time
+	}
+	if nullEAt.Valid && !nullEAt.Time.IsZero() {
+		eAt = nullEAt.Time
+	} else {
+		eAt = now
 	}
 
 	var dur int64
 	if !sAt.IsZero() {
-		dur = int64(now.Sub(sAt).Seconds())
+		dur = int64(eAt.Sub(sAt).Seconds())
 		if dur < 0 {
 			dur = 0
 		}
@@ -709,24 +784,29 @@ func (s *SQLiteStore) FinishRun(jobID string, status monitor.StepStatus, metrics
 		diskWrite = metrics.TotalDiskWrittenBytes
 	}
 
-	_, err := s.db.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `
 		UPDATE runs
 		SET status = ?, ended_at = ?, duration_sec = ?, peak_cpu_percent = ?, peak_rss_bytes = ?,
 		    total_net_rx_bytes = ?, total_net_tx_bytes = ?, total_disk_write_bytes = ?
 		WHERE id = ?
-	`, status, now, dur, peakCPU, peakRSS, netRx, netTx, diskWrite, jobID)
+	`, status, eAt, dur, peakCPU, peakRSS, netRx, netTx, diskWrite, jobID)
 	if err != nil {
 		return fmt.Errorf("finish run %s: %w", jobID, err)
 	}
 
 	if status == monitor.StatusSuccess {
-		_, _ = s.db.ExecContext(ctx, `
+		if _, err := tx.ExecContext(ctx, `
 			UPDATE steps
 			SET status = ?
 			WHERE run_id = ? AND status IN (?, ?, '')
-		`, monitor.StatusSuccess, jobID, monitor.StatusRunning, monitor.StatusQueued)
+		`, monitor.StatusSuccess, jobID, monitor.StatusRunning, monitor.StatusQueued); err != nil {
+			return fmt.Errorf("finish steps for run %s: %w", jobID, err)
+		}
 	}
 
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit finish run %s: %w", jobID, err)
+	}
 	return nil
 }
 
@@ -739,30 +819,47 @@ func (s *SQLiteStore) RecoverInterruptedRuns() (int, error) {
 	defer cancel()
 	now := time.Now().UTC()
 
-	rows, err := s.db.QueryContext(ctx, "SELECT id, started_at FROM runs WHERE status IN (?, ?)", monitor.StatusRunning, monitor.StatusQueued)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("query interrupted runs: %w", err)
+		return 0, fmt.Errorf("begin recover interrupted runs tx: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer func() { _ = tx.Rollback() }()
 
 	type runItem struct {
 		id        string
 		startedAt time.Time
 	}
-	var interrupted []runItem
-	for rows.Next() {
-		var item runItem
-		var sAt sql.NullTime
-		if err := rows.Scan(&item.id, &sAt); err != nil {
-			return 0, fmt.Errorf("scan interrupted run: %w", err)
+	interrupted, err := func() ([]runItem, error) {
+		rows, err := tx.QueryContext(ctx, "SELECT id, started_at FROM runs WHERE status IN (?, ?)", monitor.StatusRunning, monitor.StatusQueued)
+		if err != nil {
+			return nil, fmt.Errorf("query interrupted runs: %w", err)
 		}
-		if sAt.Valid {
-			item.startedAt = sAt.Time
+		defer func() { _ = rows.Close() }()
+
+		var items []runItem
+		for rows.Next() {
+			var item runItem
+			var sAt sql.NullTime
+			if err := rows.Scan(&item.id, &sAt); err != nil {
+				return nil, fmt.Errorf("scan interrupted run: %w", err)
+			}
+			if sAt.Valid {
+				item.startedAt = sAt.Time
+			}
+			items = append(items, item)
 		}
-		interrupted = append(interrupted, item)
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("iterate interrupted runs: %w", err)
+		}
+		return items, nil
+	}()
+	if err != nil {
+		return 0, err
 	}
-	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("iterate interrupted runs: %w", err)
+
+	type stepItem struct {
+		id        string
+		startedAt time.Time
 	}
 
 	for _, item := range interrupted {
@@ -774,7 +871,7 @@ func (s *SQLiteStore) RecoverInterruptedRuns() (int, error) {
 			}
 		}
 
-		if _, err := s.db.ExecContext(ctx, `
+		if _, err := tx.ExecContext(ctx, `
 			UPDATE runs
 			SET status = ?, ended_at = ?, duration_sec = ?
 			WHERE id = ?
@@ -782,46 +879,59 @@ func (s *SQLiteStore) RecoverInterruptedRuns() (int, error) {
 			return 0, fmt.Errorf("update interrupted run %s: %w", item.id, err)
 		}
 
-		stepRows, err := s.db.QueryContext(ctx, `
-			SELECT id, started_at
-			FROM steps
-			WHERE run_id = ? AND (status IN (?, ?) OR status = '')
-		`, item.id, monitor.StatusRunning, monitor.StatusQueued)
-		if err == nil {
-			type stepItem struct {
-				id        string
-				startedAt time.Time
+		stepsToUpdate, err := func() ([]stepItem, error) {
+			stepRows, err := tx.QueryContext(ctx, `
+				SELECT id, started_at
+				FROM steps
+				WHERE run_id = ? AND (status IN (?, ?) OR status = '')
+			`, item.id, monitor.StatusRunning, monitor.StatusQueued)
+			if err != nil {
+				return nil, fmt.Errorf("query interrupted steps for run %s: %w", item.id, err)
 			}
-			var stepsToUpdate []stepItem
+			defer func() { _ = stepRows.Close() }()
+
+			var items []stepItem
 			for stepRows.Next() {
 				var si stepItem
 				var sNull sql.NullTime
-				if err := stepRows.Scan(&si.id, &sNull); err == nil {
-					if sNull.Valid {
-						si.startedAt = sNull.Time
-					}
-					stepsToUpdate = append(stepsToUpdate, si)
+				if err := stepRows.Scan(&si.id, &sNull); err != nil {
+					return nil, fmt.Errorf("scan interrupted step for run %s: %w", item.id, err)
+				}
+				if sNull.Valid {
+					si.startedAt = sNull.Time
+				}
+				items = append(items, si)
+			}
+			if err := stepRows.Err(); err != nil {
+				return nil, fmt.Errorf("iterate interrupted steps for run %s: %w", item.id, err)
+			}
+			return items, nil
+		}()
+		if err != nil {
+			return 0, err
+		}
+
+		for _, si := range stepsToUpdate {
+			var sDur int64
+			if !si.startedAt.IsZero() {
+				sDur = int64(now.Sub(si.startedAt).Seconds())
+				if sDur < 0 {
+					sDur = 0
 				}
 			}
-			_ = stepRows.Close()
-
-			for _, si := range stepsToUpdate {
-				var sDur int64
-				if !si.startedAt.IsZero() {
-					sDur = int64(now.Sub(si.startedAt).Seconds())
-					if sDur < 0 {
-						sDur = 0
-					}
-				}
-				_, _ = s.db.ExecContext(ctx, `
-					UPDATE steps
-					SET status = ?, ended_at = ?, duration_sec = ?
-					WHERE run_id = ? AND id = ?
-				`, StatusInterrupted, now, sDur, item.id, si.id)
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE steps
+				SET status = ?, ended_at = ?, duration_sec = ?
+				WHERE run_id = ? AND id = ?
+			`, StatusInterrupted, now, sDur, item.id, si.id); err != nil {
+				return 0, fmt.Errorf("update interrupted step %s/%s: %w", item.id, si.id, err)
 			}
 		}
 	}
 
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit interrupted runs recovery: %w", err)
+	}
 	return len(interrupted), nil
 }
 
@@ -833,11 +943,18 @@ func (s *SQLiteStore) Prune(maxRuns int, maxDiskBytes ...int64) (int, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin prune tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	prunedCount := 0
 
 	// 1. Count pruning: remove oldest completed runs beyond maxRuns limit
 	if maxRuns > 0 {
-		res, err := s.db.ExecContext(ctx, `
+		res, err := tx.ExecContext(ctx, `
 			DELETE FROM runs
 			WHERE id IN (
 				SELECT id FROM runs
@@ -849,49 +966,59 @@ func (s *SQLiteStore) Prune(maxRuns int, maxDiskBytes ...int64) (int, error) {
 		if err != nil {
 			return 0, fmt.Errorf("prune runs by count: %w", err)
 		}
-		if rows, err := res.RowsAffected(); err == nil {
-			prunedCount += int(rows)
+		rows, err := res.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("prune runs rows affected: %w", err)
 		}
+		prunedCount += int(rows)
 	}
 
 	// 2. Disk size retention: prune oldest completed runs until total log bytes <= maxDiskBytes[0]
 	if len(maxDiskBytes) > 0 && maxDiskBytes[0] > 0 {
 		diskLimit := maxDiskBytes[0]
 		var totalBytes int64
-		err := s.db.QueryRowContext(ctx, `
+		err := tx.QueryRowContext(ctx, `
 			SELECT COALESCE(SUM(LENGTH(CAST(log_line AS BLOB)) + 1), 0)
 			FROM step_logs
 		`).Scan(&totalBytes)
-		if err == nil && totalBytes > diskLimit {
-			for totalBytes > diskLimit {
-				// Delete oldest completed run
-				var oldestID string
-				err = s.db.QueryRowContext(ctx, `
-					SELECT id FROM runs
-					WHERE status NOT IN ('running', 'queued') AND ended_at IS NOT NULL
-					ORDER BY started_at ASC
-					LIMIT 1
-				`).Scan(&oldestID)
-				if err != nil {
-					// No more completed runs to delete
+		if err != nil {
+			return 0, fmt.Errorf("query total step log bytes: %w", err)
+		}
+		for totalBytes > diskLimit {
+			// Delete oldest completed run
+			var oldestID string
+			err = tx.QueryRowContext(ctx, `
+				SELECT id FROM runs
+				WHERE status NOT IN ('running', 'queued') AND ended_at IS NOT NULL
+				ORDER BY started_at ASC
+				LIMIT 1
+			`).Scan(&oldestID)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
 					break
 				}
-
-				var runBytes int64
-				_ = s.db.QueryRowContext(ctx, `
-					SELECT COALESCE(SUM(LENGTH(CAST(log_line AS BLOB)) + 1), 0)
-					FROM step_logs
-					WHERE run_id = ?
-				`, oldestID).Scan(&runBytes)
-
-				if _, err := s.db.ExecContext(ctx, "DELETE FROM runs WHERE id = ?", oldestID); err != nil {
-					break
-				}
-				totalBytes -= runBytes
-				prunedCount++
+				return 0, fmt.Errorf("query oldest completed run for prune: %w", err)
 			}
+
+			var runBytes int64
+			if err := tx.QueryRowContext(ctx, `
+				SELECT COALESCE(SUM(LENGTH(CAST(log_line AS BLOB)) + 1), 0)
+				FROM step_logs
+				WHERE run_id = ?
+			`, oldestID).Scan(&runBytes); err != nil {
+				break
+			}
+
+			if _, err := tx.ExecContext(ctx, "DELETE FROM runs WHERE id = ?", oldestID); err != nil {
+				return 0, fmt.Errorf("delete pruned run %s: %w", oldestID, err)
+			}
+			totalBytes -= runBytes
+			prunedCount++
 		}
 	}
 
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit prune tx: %w", err)
+	}
 	return prunedCount, nil
 }

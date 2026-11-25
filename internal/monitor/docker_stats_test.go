@@ -409,3 +409,76 @@ func TestParseDockerStatsStream(t *testing.T) {
 		assert.ErrorIs(t, err, context.Canceled)
 	})
 }
+
+type blockingStatsReader struct {
+	mu      sync.Mutex
+	closed  int
+	unblock chan struct{}
+	once    sync.Once
+	payload []byte
+	readPos int
+}
+
+func (b *blockingStatsReader) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	if b.readPos < len(b.payload) {
+		n := copy(p, b.payload[b.readPos:])
+		b.readPos += n
+		b.mu.Unlock()
+		return n, nil
+	}
+	b.mu.Unlock()
+	<-b.unblock
+	return 0, io.EOF
+}
+
+func (b *blockingStatsReader) Close() error {
+	b.mu.Lock()
+	b.closed++
+	b.mu.Unlock()
+	b.once.Do(func() { close(b.unblock) })
+	return nil
+}
+
+func TestTelemetrySampler_CancelStopsStaleWritesAndClosesOnce(t *testing.T) {
+	frame := container.StatsResponse{
+		Stats: container.Stats{
+			MemoryStats: container.MemoryStats{Usage: 123 * 1024 * 1024},
+			PidsStats:   container.PidsStats{Current: ^uint64(0)},
+		},
+	}
+	var buf bytes.Buffer
+	require.NoError(t, json.NewEncoder(&buf).Encode(frame))
+
+	reader := &blockingStatsReader{
+		unblock: make(chan struct{}),
+		payload: buf.Bytes(),
+	}
+	mockCli := &mockDockerStatsClient{statsReader: reader}
+
+	sampler := NewTelemetrySampler()
+	sampler.SetTargetContainer("stale-cid", mockCli)
+
+	require.Eventually(t, func() bool {
+		s := sampler.Sample()
+		return s != nil && s.StepRSSBytes == 123*1024*1024
+	}, 2*time.Second, 10*time.Millisecond)
+
+	sample := sampler.Sample()
+	require.NotNil(t, sample)
+	assert.Positive(t, sample.ProcessCount)
+
+	// Cancel container target; stats must remain cleared and reader closed exactly once
+	sampler.SetTargetContainer("", nil)
+	time.Sleep(30 * time.Millisecond)
+
+	sampler.cStatsMu.RLock()
+	cStats := sampler.containerStats
+	sampler.cStatsMu.RUnlock()
+	assert.Nil(t, cStats)
+
+	reader.mu.Lock()
+	closedCount := reader.closed
+	reader.mu.Unlock()
+	assert.Equal(t, 1, closedCount)
+}

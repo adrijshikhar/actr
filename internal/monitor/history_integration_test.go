@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -369,4 +370,104 @@ func TestServer_HistoricalStepLogs_DirectHTTP404WhenNoStore(t *testing.T) {
 	client := monitor.NewClient(sockPath)
 	_, err := client.GetHistoricalStepLogs(context.Background(), "any-job", "any-step")
 	assert.Error(t, err)
+}
+
+type orderRecordingStore struct {
+	monitor.HistoryStore
+	mu     sync.Mutex
+	ops    []string
+	closed bool
+}
+
+func (o *orderRecordingStore) record(op string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
+		panic("store operation after Close: " + op)
+	}
+	o.ops = append(o.ops, op)
+}
+
+func (o *orderRecordingStore) StartRun(job *monitor.JobInfo, limits *config.LimitsConfig, driver string) error {
+	time.Sleep(15 * time.Millisecond)
+	o.record("StartRun:" + job.ID)
+	return nil
+}
+
+func (o *orderRecordingStore) AppendStepLog(jobID, stepID, line string) error {
+	o.record("AppendStepLog:" + jobID + "/" + stepID)
+	return nil
+}
+
+func (o *orderRecordingStore) FinishStep(jobID, stepID, conclusion string, exitCode int, finishedAt time.Time, startedAt ...time.Time) error {
+	o.record("FinishStep:" + jobID + "/" + stepID)
+	return nil
+}
+
+func (o *orderRecordingStore) FinishRun(jobID string, status monitor.StepStatus, metrics *monitor.RunMetricsSummary) error {
+	o.record("FinishRun:" + jobID)
+	return nil
+}
+
+func (o *orderRecordingStore) Prune(maxRuns int, maxDiskBytes ...int64) (int, error) {
+	time.Sleep(10 * time.Millisecond)
+	o.record("Prune")
+	return 0, nil
+}
+
+func (o *orderRecordingStore) ListRuns(limit int) ([]*monitor.RunSummary, error) {
+	return nil, nil
+}
+
+func (o *orderRecordingStore) Close() error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.closed = true
+	return nil
+}
+
+func TestServer_SequentialPersistenceOrderingAndStopDrain(t *testing.T) {
+	store := &orderRecordingStore{}
+	sockPath := newTestSocketPath(t)
+	server := monitor.NewServer(sockPath, "order-runner")
+	server.WithHistoryStore(store)
+	require.NoError(t, server.Start())
+
+	server.Publish(monitor.Event{
+		Type:  monitor.EventJobStart,
+		JobID: "job-ord-1",
+		Job:   &monitor.JobInfo{ID: "job-ord-1", Name: "Order Test", Status: monitor.StatusRunning},
+	})
+	server.Publish(monitor.Event{
+		Type:    monitor.EventStepLog,
+		JobID:   "job-ord-1",
+		StepID:  "step-1",
+		LogLine: "line 1",
+	})
+	server.Publish(monitor.Event{
+		Type:   monitor.EventStepFinish,
+		JobID:  "job-ord-1",
+		StepID: "step-1",
+		Step:   &monitor.StepInfo{ID: "step-1", Status: monitor.StatusSuccess, EndedAt: time.Now()},
+	})
+	server.Publish(monitor.Event{
+		Type:  monitor.EventJobFinish,
+		JobID: "job-ord-1",
+		Job:   &monitor.JobInfo{ID: "job-ord-1", Status: monitor.StatusSuccess},
+	})
+
+	require.NoError(t, server.Stop())
+	require.NoError(t, store.Close())
+
+	store.mu.Lock()
+	ops := append([]string(nil), store.ops...)
+	store.mu.Unlock()
+
+	assert.Equal(t, []string{
+		"StartRun:job-ord-1",
+		"AppendStepLog:job-ord-1/step-1",
+		"FinishStep:job-ord-1/step-1",
+		"FinishRun:job-ord-1",
+		"Prune",
+	}, ops)
 }
