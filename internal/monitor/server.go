@@ -43,7 +43,8 @@ type Server struct {
 	lastTelemetryTime map[string]time.Time
 
 	persistMu     sync.Mutex
-	persistCh     chan persistTask
+	persistCond   *sync.Cond
+	persistQueue  []persistTask
 	persistWg     sync.WaitGroup
 	persistClosed bool
 
@@ -382,13 +383,27 @@ func (s *Server) enqueuePersist(fn func(), wait bool) <-chan struct{} {
 	if s.persistClosed {
 		return nil
 	}
-	if s.persistCh == nil {
-		s.persistCh = make(chan persistTask, 4096)
-		ch := s.persistCh
+	if s.persistCond == nil {
+		s.persistCond = sync.NewCond(&s.persistMu)
 		s.persistWg.Add(1)
 		go func() {
 			defer s.persistWg.Done()
-			for task := range ch {
+			for {
+				s.persistMu.Lock()
+				for len(s.persistQueue) == 0 && !s.persistClosed {
+					s.persistCond.Wait()
+				}
+				if len(s.persistQueue) == 0 && s.persistClosed {
+					s.persistMu.Unlock()
+					return
+				}
+				task := s.persistQueue[0]
+				s.persistQueue = s.persistQueue[1:]
+				if len(s.persistQueue) == 0 && cap(s.persistQueue) > 1024 {
+					s.persistQueue = nil
+				}
+				s.persistMu.Unlock()
+
 				if task.fn != nil {
 					task.fn()
 				}
@@ -402,7 +417,8 @@ func (s *Server) enqueuePersist(fn func(), wait bool) <-chan struct{} {
 	if wait {
 		done = make(chan struct{})
 	}
-	s.persistCh <- persistTask{fn: fn, done: done}
+	s.persistQueue = append(s.persistQueue, persistTask{fn: fn, done: done})
+	s.persistCond.Signal()
 	return done
 }
 
@@ -484,8 +500,8 @@ func (s *Server) Stop() error {
 	s.persistMu.Lock()
 	if !s.persistClosed {
 		s.persistClosed = true
-		if s.persistCh != nil {
-			close(s.persistCh)
+		if s.persistCond != nil {
+			s.persistCond.Broadcast()
 		}
 	}
 	s.persistMu.Unlock()
