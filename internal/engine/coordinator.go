@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -49,6 +51,7 @@ type Coordinator struct {
 	defaultRepo       string
 	repoAlias         string
 	tracer            *telemetry.Manager
+	ownsDefaultTracer bool
 	actionResolver    action.Resolver
 	nodeDetector      action.NodeDetector
 	vault             vault.Provider
@@ -86,17 +89,26 @@ func NewCoordinator(d driver.Driver, runClient *protocol.RunServiceClient, workD
 		stepLoggerEnabled: true,
 		colorEnabled:      os.Getenv("NO_COLOR") == "",
 		tracer:            tracer,
+		ownsDefaultTracer: tracer != nil,
 	}
 }
 
 // WithRepoAlias configures the repository alias (e.g. from runner config) for this Coordinator.
 func (c *Coordinator) WithRepoAlias(alias string) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.repoAlias = alias
 	return c
 }
 
 // WithTracer overrides the OpenTelemetry tracer manager on the Coordinator.
 func (c *Coordinator) WithTracer(tm *telemetry.Manager) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ownsDefaultTracer && c.tracer != nil && c.tracer != tm {
+		_ = c.tracer.Shutdown(context.Background())
+		c.ownsDefaultTracer = false
+	}
 	c.tracer = tm
 	return c
 }
@@ -113,6 +125,8 @@ func (c *Coordinator) Shutdown(ctx context.Context) error {
 
 // WithDockerDriver configures the driver used for container-based jobs.
 func (c *Coordinator) WithDockerDriver(d driver.Driver) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.dockerDriver = d
 	return c
 }
@@ -167,12 +181,16 @@ func (c *Coordinator) getNodeDetector() action.NodeDetector {
 
 // WithLimits configures resource governance limits applied to jobs.
 func (c *Coordinator) WithLimits(limits *config.LimitsConfig) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.limits = limits
 	return c
 }
 
 // resolveDriver dynamically determines whether to use the host driver or docker driver for the given job.
 func (c *Coordinator) resolveDriver(job *protocol.JobSpecification) (driver.Driver, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if job != nil && job.Container != nil {
 		if c.dockerDriver == nil {
 			return nil, fmt.Errorf("job requires container image %q but Docker driver is not enabled/available", job.Container.Image)
@@ -187,6 +205,8 @@ func (c *Coordinator) resolveDriver(job *protocol.JobSpecification) (driver.Driv
 
 // WithRepositoryURL configures the runner's GitHub URL (e.g. from runner config).
 func (c *Coordinator) WithRepositoryURL(repoURL string) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.repoURL = repoURL
 	c.defaultRepo = extractRepoFromURL(repoURL)
 	return c
@@ -329,6 +349,9 @@ func newFailedCompleteJobRequest(job *protocol.JobSpecification) *protocol.Compl
 	planID := ""
 	if job != nil {
 		jobID = job.JobID
+		if jobID == "" {
+			jobID = job.ID
+		}
 		planID = job.PlanID
 	}
 	if jobID == "" {
@@ -354,6 +377,9 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	d, err := c.resolveDriver(job)
 	if err != nil {
 		return newFailedCompleteJobRequest(job), err
+	}
+	if cloneable, ok := d.(driver.Cloneable); ok {
+		d = cloneable.Clone()
 	}
 
 	if ctx == nil {
@@ -513,7 +539,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		return newFailedCompleteJobRequest(job), fmt.Errorf("create base work directory: %w", err)
 	}
 
-	runnerTemp := filepath.Join(baseWorkDir, "_temp")
+	runnerTemp := filepath.Join(baseWorkDir, "_temp", sanitizeJobDirComponent(jobID))
 	if err := os.MkdirAll(runnerTemp, 0o755); err != nil {
 		conclusion = "failure"
 		return newFailedCompleteJobRequest(job), fmt.Errorf("create runner temp directory: %w", err)
@@ -531,14 +557,30 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		return newFailedCompleteJobRequest(job), fmt.Errorf("create runner tool cache directory: %w", err)
 	}
 
-	jobDirName := job.JobName
-	if jobDirName == "" {
-		jobDirName = job.JobID
+	rawDirName := job.JobName
+	if rawDirName == "" {
+		rawDirName = job.JobID
 	}
-	if jobDirName == "" {
-		jobDirName = "workspace"
+	if rawDirName == "" {
+		rawDirName = "workspace"
 	}
+	sanitizedName := sanitizeJobDirComponent(rawDirName)
+	sanitizedID := sanitizeJobDirComponent(jobID)
+	shortSuffix := sanitizedID
+	if len(shortSuffix) > 16 {
+		sum := sha256.Sum256([]byte(jobID))
+		shortSuffix = hex.EncodeToString(sum[:4])
+	}
+	jobDirName := sanitizedName
+	if shortSuffix != "" && sanitizedName != sanitizedID && !strings.HasSuffix(jobDirName, shortSuffix) {
+		jobDirName = fmt.Sprintf("%s-%s", sanitizedName, shortSuffix)
+	}
+
 	jobWorkspace := filepath.Join(baseWorkDir, jobDirName)
+	if !hasPathPrefix(jobWorkspace, baseWorkDir) || filepath.Clean(jobWorkspace) == filepath.Clean(baseWorkDir) {
+		conclusion = "failure"
+		return newFailedCompleteJobRequest(job), fmt.Errorf("invalid job workspace %q: must be contained within %q", jobWorkspace, baseWorkDir)
+	}
 	_ = os.RemoveAll(jobWorkspace)
 	if err := os.MkdirAll(jobWorkspace, 0o755); err != nil {
 		conclusion = "failure"
@@ -787,6 +829,10 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 
 	if job.Environment != nil {
 		for k, v := range job.Environment {
+			cleanKey := strings.ToUpper(strings.TrimSpace(k))
+			if forbiddenEnvKeys[cleanKey] {
+				continue
+			}
 			cumulativeEnv[k] = evaluateValue(v, parsedContext)
 		}
 	}
@@ -859,6 +905,32 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	if token != "" {
 		jobMasker.AddMask(token)
 	}
+	if rtToken := cumulativeEnv["ACTIONS_RUNTIME_TOKEN"]; rtToken != "" {
+		jobMasker.AddMask(rtToken)
+	}
+	if secrets, ok := parsedContext["secrets"].(map[string]any); ok {
+		for _, v := range secrets {
+			if s, ok := v.(string); ok && s != "" {
+				jobMasker.AddMask(s)
+			}
+		}
+	} else if secrets, ok := parsedContext["secrets"].(map[string]string); ok {
+		for _, s := range secrets {
+			if s != "" {
+				jobMasker.AddMask(s)
+			}
+		}
+	}
+
+	c.mu.RLock()
+	monActive := c.monServer != nil
+	c.mu.RUnlock()
+	var jobSampler *monitor.TelemetrySampler
+	if monActive {
+		jobSampler = monitor.NewTelemetrySampler()
+		jobSampler.SetWorkspaceDir(jobWorkspace)
+		defer jobSampler.Close()
+	}
 
 	var stepLogger *StepLogger
 	if c.stepLoggerEnabled {
@@ -900,7 +972,11 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		}
 
 		if !shouldExecuteStep(step.Condition, parsedContext, jobFailed, jobCancelled) {
-			c.NotifyJobStepLog(jobID, stepID, fmt.Sprintf("::debug::Skipping step %s (condition %q evaluated to false)", stepDisplayName, step.Condition))
+			logMsg := fmt.Sprintf("::debug::Skipping step %s (condition %q evaluated to false)", stepDisplayName, step.Condition)
+			if jobMasker != nil {
+				logMsg = jobMasker.Mask(logMsg)
+			}
+			c.NotifyJobStepLog(jobID, stepID, logMsg)
 			c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusSkipped, 0)
 			continue
 		}
@@ -910,7 +986,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			conclusion = "failure"
 			return &protocol.CompleteJobRequest{
 				PlanID:      job.PlanID,
-				JobID:       job.JobID,
+				JobID:       jobID,
 				Conclusion:  "failure",
 				Outputs:     outputs,
 				StepResults: stepResults,
@@ -925,7 +1001,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			_ = os.Remove(envPath)
 			return &protocol.CompleteJobRequest{
 				PlanID:      job.PlanID,
-				JobID:       job.JobID,
+				JobID:       jobID,
 				Conclusion:  "failure",
 				Outputs:     outputs,
 				StepResults: stepResults,
@@ -941,7 +1017,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			_ = os.Remove(outputPath)
 			return &protocol.CompleteJobRequest{
 				PlanID:      job.PlanID,
-				JobID:       job.JobID,
+				JobID:       jobID,
 				Conclusion:  "failure",
 				Outputs:     outputs,
 				StepResults: stepResults,
@@ -958,7 +1034,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			_ = os.Remove(pathFilePath)
 			return &protocol.CompleteJobRequest{
 				PlanID:      job.PlanID,
-				JobID:       job.JobID,
+				JobID:       jobID,
 				Conclusion:  "failure",
 				Outputs:     outputs,
 				StepResults: stepResults,
@@ -981,6 +1057,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			if stepCancel != nil {
 				stepCancel()
 			}
+			parsedContext["env"] = cumulativeEnv
 		}
 
 		// Build step environment: cumulative environment + step-specific overrides + command files
@@ -991,22 +1068,49 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		stepEnv["GITHUB_STATE"] = statePath
 		stepEnv["GITHUB_WORKSPACE"] = jobWorkspace
 
+		// Build step-scoped expression env map combining cumulativeEnv + stepEnv
+		stepExprEnv := make(map[string]string, len(cumulativeEnv)+len(stepEnv))
+		for k, v := range cumulativeEnv {
+			stepExprEnv[k] = v
+		}
+		for k, v := range stepEnv {
+			stepExprEnv[k] = v
+		}
+		parsedContext["env"] = stepExprEnv
+
 		stepWorkDir := step.WorkingDirectory
 		if stepWorkDir == "" {
 			stepWorkDir = jobWorkspace
 		} else if !filepath.IsAbs(stepWorkDir) {
 			stepWorkDir = filepath.Join(jobWorkspace, stepWorkDir)
 		}
-		if err := os.MkdirAll(stepWorkDir, 0o755); err != nil {
-			conclusion = "failure"
-			cleanupStepFiles()
-			return &protocol.CompleteJobRequest{
-				PlanID:      job.PlanID,
-				JobID:       job.JobID,
-				Conclusion:  "failure",
-				Outputs:     outputs,
-				StepResults: stepResults,
-			}, fmt.Errorf("create step working directory: %w", err)
+
+		if job.Container == nil {
+			if !hasPathPrefix(stepWorkDir, jobWorkspace) {
+				conclusion = "failure"
+				cleanupStepFiles()
+				return &protocol.CompleteJobRequest{
+					PlanID:      job.PlanID,
+					JobID:       jobID,
+					Conclusion:  "failure",
+					Outputs:     outputs,
+					StepResults: stepResults,
+				}, fmt.Errorf("step working directory %q outside job workspace %q", stepWorkDir, jobWorkspace)
+			}
+		}
+
+		if !(job.Container != nil && filepath.IsAbs(step.WorkingDirectory)) {
+			if err := os.MkdirAll(stepWorkDir, 0o755); err != nil {
+				conclusion = "failure"
+				cleanupStepFiles()
+				return &protocol.CompleteJobRequest{
+					PlanID:      job.PlanID,
+					JobID:       jobID,
+					Conclusion:  "failure",
+					Outputs:     outputs,
+					StepResults: stepResults,
+				}, fmt.Errorf("create step working directory: %w", err)
+			}
 		}
 
 		var res *driver.StepResult
@@ -1036,7 +1140,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 				OutputFilePath: outputPath,
 				Context:        parsedContext,
 			}
-			res, _, stepErr = c.executeActionStep(stepCtx, jobID, stepID, stepDisplayName, ref, actCtx, stepLogger, jobMasker)
+			res, _, stepErr = c.executeActionStep(stepCtx, jobID, stepID, stepDisplayName, ref, actCtx, stepLogger, jobMasker, jobSampler)
 
 			// Ingest state file and queue post-step hook if manifest defines runs.post
 			stepState, _ := IngestStateFile(statePath)
@@ -1078,7 +1182,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 				Script:           stepScript,
 			}
 
-			res, _, stepErr = c.executeStep(stepCtx, d, jobID, spec, stepLogger, stepDisplayName, jobMasker)
+			res, _, stepErr = c.executeStep(stepCtx, d, jobID, spec, stepLogger, stepDisplayName, jobMasker, jobSampler)
 		}
 
 		if stepCtx.Err() != nil {
@@ -1117,7 +1221,6 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 
 		// Step succeeded: parse environment, output, and path files
 		if err := IngestEnvFile(envPath, cumulativeEnv); err != nil {
-			c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusFailed)
 			stepResults = append(stepResults, protocol.StepResult{
 				ID:         stepID,
 				Conclusion: "failure",
@@ -1133,7 +1236,6 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 
 		newOutputs, err := ParseEnvAndOutputFile(outputPath)
 		if err != nil {
-			c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusFailed)
 			stepResults = append(stepResults, protocol.StepResult{
 				ID:         stepID,
 				Conclusion: "failure",
@@ -1170,7 +1272,6 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		}
 		updatedPath, err := IngestPathFile(pathFilePath, cumulativeEnv[pathKey])
 		if err != nil {
-			c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusFailed)
 			stepResults = append(stepResults, protocol.StepResult{
 				ID:         stepID,
 				Conclusion: "failure",
@@ -1196,7 +1297,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 
 	return &protocol.CompleteJobRequest{
 		PlanID:      job.PlanID,
-		JobID:       job.JobID,
+		JobID:       jobID,
 		Conclusion:  conclusion,
 		Outputs:     outputs,
 		StepResults: stepResults,
@@ -1205,30 +1306,27 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 
 // executeStep executes a single step, publishing step start/finish events, streaming logs,
 // and sampling telemetry via a 500ms ticker.
-func (c *Coordinator) executeStep(ctx context.Context, d driver.Driver, jobID string, spec *driver.StepSpec, stepLogger *StepLogger, stepDisplayName string, jobMasker *SecretMasker) (*driver.StepResult, time.Duration, error) {
+func (c *Coordinator) executeStep(ctx context.Context, d driver.Driver, jobID string, spec *driver.StepSpec, stepLogger *StepLogger, stepDisplayName string, jobMasker *SecretMasker, jobSampler *monitor.TelemetrySampler) (*driver.StepResult, time.Duration, error) {
+	if spec == nil {
+		return nil, 0, errors.New("nil step spec")
+	}
 	if spec.OnProcessStart == nil {
 		spec.OnProcessStart = func(pid, pgid int) {
-			c.mu.RLock()
-			s := c.sampler
-			c.mu.RUnlock()
-			if s != nil {
-				s.SetTargetPID(int32(pid), int32(pgid))
+			if jobSampler != nil {
+				jobSampler.SetTargetPID(int32(pid), int32(pgid))
 			}
 		}
 	} else {
 		orig := spec.OnProcessStart
 		spec.OnProcessStart = func(pid, pgid int) {
 			orig(pid, pgid)
-			c.mu.RLock()
-			s := c.sampler
-			c.mu.RUnlock()
-			if s != nil {
-				s.SetTargetPID(int32(pid), int32(pgid))
+			if jobSampler != nil {
+				jobSampler.SetTargetPID(int32(pid), int32(pgid))
 			}
 		}
 	}
 
-	return c.executeWithStreams(ctx, jobID, spec.ID, stepDisplayName, spec.Script, stepLogger, jobMasker, func(stepCtx context.Context, stdout, stderr io.Writer) (*driver.StepResult, error) {
+	return c.executeWithStreams(ctx, jobID, spec.ID, stepDisplayName, spec.Script, stepLogger, jobMasker, jobSampler, func(stepCtx context.Context, stdout, stderr io.Writer) (*driver.StepResult, error) {
 		if c.tracer != nil && spec != nil {
 			if spec.Environment == nil {
 				spec.Environment = make(map[string]string)
@@ -1240,12 +1338,12 @@ func (c *Coordinator) executeStep(ctx context.Context, d driver.Driver, jobID st
 }
 
 // executeActionStep resolves, detects node runtime, and executes a JavaScript action step.
-func (c *Coordinator) executeActionStep(ctx context.Context, jobID, stepID, stepDisplayName string, ref *protocol.StepReference, actCtx *action.ActionContext, stepLogger *StepLogger, jobMasker *SecretMasker) (*driver.StepResult, time.Duration, error) {
+func (c *Coordinator) executeActionStep(ctx context.Context, jobID, stepID, stepDisplayName string, ref *protocol.StepReference, actCtx *action.ActionContext, stepLogger *StepLogger, jobMasker *SecretMasker, jobSampler *monitor.TelemetrySampler) (*driver.StepResult, time.Duration, error) {
 	scriptDesc := ""
 	if ref != nil {
 		scriptDesc = fmt.Sprintf("uses: %s@%s", ref.Name, ref.Version)
 	}
-	return c.executeWithStreams(ctx, jobID, stepID, stepDisplayName, scriptDesc, stepLogger, jobMasker, func(stepCtx context.Context, stdout, stderr io.Writer) (*driver.StepResult, error) {
+	return c.executeWithStreams(ctx, jobID, stepID, stepDisplayName, scriptDesc, stepLogger, jobMasker, jobSampler, func(stepCtx context.Context, stdout, stderr io.Writer) (*driver.StepResult, error) {
 		if actCtx == nil {
 			err := errors.New("action context is nil")
 			_, _ = fmt.Fprintf(stderr, "Error: %v\n", err)
@@ -1258,7 +1356,7 @@ func (c *Coordinator) executeActionStep(ctx context.Context, jobID, stepID, step
 		}
 
 		resolver := c.getActionResolver()
-		actionDir, err := resolver.Resolve(ctx, ref)
+		actionDir, err := resolver.Resolve(stepCtx, ref)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "Error resolving action %s: %v\n", ref.Name, err)
 			return &driver.StepResult{ExitCode: 1, Error: err}, err
@@ -1277,7 +1375,7 @@ func (c *Coordinator) executeActionStep(ctx context.Context, jobID, stepID, step
 		}
 
 		detector := c.getNodeDetector()
-		nodePath, err := detector.Detect(ctx)
+		nodePath, err := detector.Detect(stepCtx)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "Error detecting Node runtime: %v\n", err)
 			return &driver.StepResult{ExitCode: 1, Error: err}, err
@@ -1314,7 +1412,7 @@ func (c *Coordinator) executeActionStep(ctx context.Context, jobID, stepID, step
 }
 
 // executeWithStreams wraps common stream piping, logging, telemetry, and monitor notifications.
-func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, stepDisplayName, scriptDesc string, stepLogger *StepLogger, jobMasker *SecretMasker, runFn func(stepCtx context.Context, stdout, stderr io.Writer) (*driver.StepResult, error)) (*driver.StepResult, time.Duration, error) {
+func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, stepDisplayName, scriptDesc string, stepLogger *StepLogger, jobMasker *SecretMasker, jobSampler *monitor.TelemetrySampler, runFn func(stepCtx context.Context, stdout, stderr io.Writer) (*driver.StepResult, error)) (*driver.StepResult, time.Duration, error) {
 	c.NotifyStepStart(jobID, stepID, stepDisplayName)
 
 	stdout := c.stdout
@@ -1333,8 +1431,8 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 
 	c.mu.RLock()
 	monSrv := c.monServer
-	sampler := c.sampler
 	c.mu.RUnlock()
+	sampler := jobSampler
 
 	if jobMasker == nil {
 		if stepLogger != nil {
@@ -1358,15 +1456,21 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 		}
 		stepOut = stepOutWriter
 		stepErrStream = stepErrWriter
-	} else if monSrv != nil {
+	} else {
 		stepOutWriter = NewLineWriter(func(line string) {
-			c.NotifyJobStepLog(jobID, stepID, line)
+			_, _ = fmt.Fprintln(stdout, line)
+			if monSrv != nil {
+				c.NotifyJobStepLog(jobID, stepID, line)
+			}
 		}).WithMasker(jobMasker)
 		stepErrWriter = NewLineWriter(func(line string) {
-			c.NotifyJobStepLog(jobID, stepID, line)
+			_, _ = fmt.Fprintln(stderr, line)
+			if monSrv != nil {
+				c.NotifyJobStepLog(jobID, stepID, line)
+			}
 		}).WithMasker(jobMasker)
-		stepOut = io.MultiWriter(stdout, stepOutWriter)
-		stepErrStream = io.MultiWriter(stderr, stepErrWriter)
+		stepOut = stepOutWriter
+		stepErrStream = stepErrWriter
 	}
 
 	stepStartTime := time.Now()
@@ -1424,12 +1528,9 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 
 	defer func() {
 		defer func() { _ = recover() }()
-		c.mu.RLock()
-		s := c.sampler
-		c.mu.RUnlock()
-		if s != nil {
-			s.SetTargetPID(0, 0)
-			s.SetTraceContext("", "", "", time.Time{})
+		if sampler != nil {
+			sampler.SetTargetPID(0, 0)
+			sampler.SetTraceContext("", "", "", time.Time{})
 		}
 	}()
 
@@ -1574,6 +1675,10 @@ func (c *Coordinator) prepareStepEnvironment(
 		stepEnv[k] = v
 	}
 	for k, v := range step.Environment {
+		cleanKey := strings.ToUpper(strings.TrimSpace(k))
+		if forbiddenEnvKeys[cleanKey] {
+			continue
+		}
 		stepEnv[k] = evaluateValue(v, parsedContext)
 	}
 
@@ -1668,6 +1773,9 @@ func runnerArch() string {
 }
 
 func isCheckoutStep(step protocol.JobStep) bool {
+	if step.Reference != nil && strings.TrimSpace(step.Reference.Name) != "" {
+		return strings.EqualFold(strings.TrimSpace(step.Reference.Name), "actions/checkout")
+	}
 	lowerName := strings.ToLower(step.Name)
 	lowerID := strings.ToLower(step.ID)
 	return strings.Contains(lowerName, "checkout") || strings.Contains(lowerID, "checkout")
@@ -1699,7 +1807,15 @@ func generateCheckoutScript(step protocol.JobStep, env map[string]string) string
 	return `set -e
 TARGET_DIR="${GITHUB_WORKSPACE}"
 if [ -n "$ACTR_CHECKOUT_PATH" ]; then
-    TARGET_DIR="${GITHUB_WORKSPACE}/$ACTR_CHECKOUT_PATH"
+    case "$ACTR_CHECKOUT_PATH" in
+        /*|../*|*/../*|*/..|..)
+            echo "Error: invalid checkout path traversal: $ACTR_CHECKOUT_PATH" >&2
+            exit 1
+            ;;
+        *)
+            TARGET_DIR="${GITHUB_WORKSPACE}/$ACTR_CHECKOUT_PATH"
+            ;;
+    esac
 fi
 mkdir -p "$TARGET_DIR"
 cd "$TARGET_DIR"
@@ -1719,8 +1835,27 @@ if ! echo "$REPO_NAME" | grep -Eq '^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$'; then
 fi
 
 CLONE_URL="https://github.com/${REPO_NAME}.git"
+ASKPASS_FILE=""
 if [ -n "${GITHUB_TOKEN}" ]; then
-    CLONE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_NAME}.git"
+    ASKPASS_FILE="$(mktemp "${RUNNER_TEMP:-/tmp}/git-askpass-XXXXXX.sh")"
+    cat <<'EOF' > "$ASKPASS_FILE"
+#!/bin/sh
+case "$1" in
+    *Username*|*username*)
+        printf '%s\n' "x-access-token"
+        ;;
+    *Password*|*password*)
+        printf '%s\n' "${ACTR_INTERNAL_TOKEN}"
+        ;;
+    *)
+        printf '%s\n' "${ACTR_INTERNAL_TOKEN}"
+        ;;
+esac
+EOF
+    chmod 700 "$ASKPASS_FILE"
+    export GIT_ASKPASS="$ASKPASS_FILE"
+    export ACTR_INTERNAL_TOKEN="${GITHUB_TOKEN}"
+    trap 'rm -f "$ASKPASS_FILE"' EXIT
 fi
 
 if [ ! -d ".git" ]; then
@@ -2515,7 +2650,11 @@ func (c *Coordinator) executePostHooks(ctx context.Context, jobID string, postHo
 	detector := c.getNodeDetector()
 	nodePath, err := detector.Detect(postCtx)
 	if err != nil {
-		c.NotifyJobStepLog(jobID, "", fmt.Sprintf("Error detecting Node runtime for post hooks: %v", err))
+		errMsg := fmt.Sprintf("Error detecting Node runtime for post hooks: %v", err)
+		if jobMasker != nil {
+			errMsg = jobMasker.Mask(errMsg)
+		}
+		c.NotifyJobStepLog(jobID, "", errMsg)
 		return err
 	}
 
@@ -2683,14 +2822,18 @@ func (c *Coordinator) executeSinglePostHook(ctx context.Context, jobID string, h
 		stdout = stepOutWriter
 		stderr = stepErrWriter
 	} else {
+		rawOut := stdout
+		rawErr := stderr
 		lineOutWriter := NewLineWriter(func(line string) {
+			_, _ = fmt.Fprintln(rawOut, line)
 			c.NotifyJobStepLog(jobID, hook.StepID, line)
 		}).WithMasker(jobMasker)
 		lineErrWriter := NewLineWriter(func(line string) {
+			_, _ = fmt.Fprintln(rawErr, line)
 			c.NotifyJobStepLog(jobID, hook.StepID, line)
 		}).WithMasker(jobMasker)
-		stdout = io.MultiWriter(stdout, lineOutWriter)
-		stderr = io.MultiWriter(stderr, lineErrWriter)
+		stdout = lineOutWriter
+		stderr = lineErrWriter
 		stepOutWriter = lineOutWriter
 		stepErrWriter = lineErrWriter
 	}
@@ -2710,8 +2853,48 @@ func (c *Coordinator) executeSinglePostHook(ctx context.Context, jobID string, h
 	}
 
 	if execErr != nil {
-		c.NotifyJobStepLog(jobID, hook.StepID, fmt.Sprintf("Error executing post step %s: %v", hook.StepID, execErr))
+		errMsg := fmt.Sprintf("Error executing post step %s: %v", hook.StepID, execErr)
+		if jobMasker != nil {
+			errMsg = jobMasker.Mask(errMsg)
+		}
+		c.NotifyJobStepLog(jobID, hook.StepID, errMsg)
 		return execErr
 	}
 	return nil
+}
+
+// sanitizeJobDirComponent converts an arbitrary job name or ID into a safe single path segment.
+func sanitizeJobDirComponent(s string) string {
+	var b strings.Builder
+	for _, r := range strings.TrimSpace(s) {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('-')
+		}
+	}
+	res := strings.Trim(b.String(), "._-")
+	for strings.Contains(res, "..") {
+		res = strings.ReplaceAll(res, "..", ".")
+	}
+	res = strings.Trim(res, "._-")
+	if len(res) > 64 {
+		res = strings.TrimRight(res[:64], "._-")
+	}
+	if res == "" || res == "." || res == ".." {
+		return "job"
+	}
+	return res
+}
+
+func hasPathPrefix(p, prefix string) bool {
+	cp := filepath.Clean(p)
+	cpref := filepath.Clean(prefix)
+	if cp == cpref {
+		return true
+	}
+	if cpref == string(filepath.Separator) {
+		return strings.HasPrefix(cp, cpref)
+	}
+	return strings.HasPrefix(cp, cpref+string(filepath.Separator))
 }
