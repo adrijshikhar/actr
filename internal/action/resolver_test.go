@@ -588,3 +588,51 @@ func TestActionResolver_LockContentionContextCanceled(t *testing.T) {
 	assert.True(t, errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled), "expected context deadline/canceled error, got: %v", err)
 	assert.Less(t, elapsed, 1*time.Second, "lock acquisition did not respect context timeout")
 }
+
+func TestResolve_PostExtractionSymlinkVerification(t *testing.T) {
+	t.Run("rejects dangling symlink after extraction without writing marker", func(t *testing.T) {
+		archiveData := createTarGz(t, []tarEntry{
+			{Name: "repo-v1/action.yml", Content: "runs:\n  using: node20\n  main: index.js\n"},
+			{Name: "repo-v1/dangling", Typeflag: tar.TypeSymlink, Linkname: "does-not-exist", Mode: 0o777},
+		})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write(archiveData)
+		}))
+		defer srv.Close()
+
+		baseDir := t.TempDir()
+		r := action.NewActionResolver(baseDir, srv.Client())
+		r.BaseURL = srv.URL
+
+		_, err := r.Resolve(context.Background(), &protocol.StepReference{
+			Name:    "org/dangling-repo",
+			Version: "v1",
+		})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, action.ErrPathTraversal)
+		assert.NoFileExists(t, filepath.Join(baseDir, "_actions", "org", "dangling-repo", "v1.completed"))
+	})
+
+	t.Run("allows valid internal symlink resolving within destination", func(t *testing.T) {
+		archiveData := createTarGz(t, []tarEntry{
+			{Name: "repo-v1/action.yml", Content: "runs:\n  using: node20\n  main: index.js\n"},
+			{Name: "repo-v1/index.js", Content: "console.log('ok');"},
+			{Name: "repo-v1/alias.js", Typeflag: tar.TypeSymlink, Linkname: "index.js", Mode: 0o777},
+		})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write(archiveData)
+		}))
+		defer srv.Close()
+
+		baseDir := t.TempDir()
+		r := action.NewActionResolver(baseDir, srv.Client())
+		r.BaseURL = srv.URL
+
+		dest, err := r.Resolve(context.Background(), &protocol.StepReference{
+			Name:    "org/valid-sym-repo",
+			Version: "v1",
+		})
+		require.NoError(t, err)
+		assert.FileExists(t, filepath.Join(dest, "alias.js"))
+	})
+}

@@ -527,7 +527,8 @@ func hasPathPrefix(p, prefix string) bool {
 	if cp == cpref {
 		return true
 	}
-	return strings.HasPrefix(cp, cpref+string(filepath.Separator))
+	sep := string(filepath.Separator)
+	return strings.HasPrefix(cp, strings.TrimSuffix(cpref, sep)+sep)
 }
 
 func translateTempPath(hostPath, hostTemp string) string {

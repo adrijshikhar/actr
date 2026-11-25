@@ -98,6 +98,7 @@ func (l *linuxLimiter) tryCgroupsV2(pid int, limits *config.LimitsConfig) (func(
 				}
 			}
 
+			killedAny := false
 			procsData, err := os.ReadFile(filepath.Join(cgroupDir, "cgroup.procs"))
 			if err == nil {
 				for _, line := range strings.Split(string(procsData), "\n") {
@@ -107,11 +108,21 @@ func (l *linuxLimiter) tryCgroupsV2(pid int, limits *config.LimitsConfig) (func(
 					}
 					if p, err := strconv.Atoi(line); err == nil && p > 0 {
 						killProcessGroupOrPID(p)
+						killedAny = true
 					}
 				}
 			}
 
-			_ = os.Remove(cgroupDir)
+			if killedAny {
+				for i := 0; i < 5; i++ {
+					if err := os.Remove(cgroupDir); err == nil || os.IsNotExist(err) {
+						break
+					}
+					time.Sleep(20 * time.Millisecond)
+				}
+			} else {
+				_ = os.Remove(cgroupDir)
+			}
 		})
 	}
 

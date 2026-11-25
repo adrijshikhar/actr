@@ -227,12 +227,16 @@ func extractRepoFromURL(rawURL string) string {
 
 // WithRunnerName overrides the default runner name reported in RUNNER_NAME.
 func (c *Coordinator) WithRunnerName(name string) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.runnerName = name
 	return c
 }
 
 // WithRenewInterval configures the frequency of background job lease renewals.
 func (c *Coordinator) WithRenewInterval(interval time.Duration) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.renewInterval = interval
 	return c
 }
@@ -256,6 +260,8 @@ func (c *Coordinator) WithStepLogger(enabled bool) *Coordinator {
 
 // WithColor configures whether ANSI color codes are used in step formatting.
 func (c *Coordinator) WithColor(enabled bool) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.colorEnabled = enabled
 	return c
 }
@@ -400,6 +406,9 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	monSrv := c.monServer
 	jobStdout := c.stdout
 	stepLoggerEnabled := c.stepLoggerEnabled
+	colorEnabled := c.colorEnabled
+	runnerName := c.runnerName
+	renewInterval := c.renewInterval
 	c.mu.RUnlock()
 
 	if limits != nil && limits.Timeout > 0 {
@@ -789,7 +798,6 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			cumulativeEnv["ACTIONS_RESULTS_URL"] = cumulativeEnv["ACTIONS_RUNTIME_URL"]
 		}
 	}
-	runnerName := c.runnerName
 	if runnerName == "" {
 		runnerName = "actr"
 	}
@@ -870,7 +878,6 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	}
 
 	// Start background lease renew ticker if RunService is configured
-	renewInterval := c.renewInterval
 	if renewInterval <= 0 {
 		renewInterval = 50 * time.Second
 	}
@@ -946,7 +953,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 
 	var stepLogger *StepLogger
 	if stepLoggerEnabled {
-		stepLogger = NewStepLogger(jobDisplayName, stdout, c.colorEnabled).WithMasker(jobMasker)
+		stepLogger = NewStepLogger(jobDisplayName, stdout, colorEnabled).WithMasker(jobMasker)
 	}
 
 	// Defer post-hooks teardown (LIFO) so that action cleanups run even on step setup failure or cancel
@@ -1097,7 +1104,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			stepWorkDir = filepath.Join(jobWorkspace, stepWorkDir)
 		}
 
-		if job.Container == nil {
+		if job.Container == nil || !filepath.IsAbs(step.WorkingDirectory) {
 			if !hasPathPrefix(stepWorkDir, jobWorkspace) {
 				conclusion = "failure"
 				cleanupStepFiles()
@@ -1107,11 +1114,8 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 					Conclusion:  "failure",
 					Outputs:     outputs,
 					StepResults: stepResults,
-				}, fmt.Errorf("step working directory %q outside job workspace %q", stepWorkDir, jobWorkspace)
+				}, fmt.Errorf("step working directory %q outside job workspace", stepWorkDir)
 			}
-		}
-
-		if !(job.Container != nil && filepath.IsAbs(step.WorkingDirectory)) {
 			if err := os.MkdirAll(stepWorkDir, 0o755); err != nil {
 				conclusion = "failure"
 				cleanupStepFiles()
@@ -1445,8 +1449,8 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 		stderr = os.Stderr
 	}
 
-	stepOut := stdout
-	stepErrStream := stderr
+	var stepOut io.Writer
+	var stepErrStream io.Writer
 	var stepOutWriter *StepWriter
 	var stepErrWriter *StepWriter
 	sampler := jobSampler

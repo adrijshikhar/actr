@@ -131,14 +131,6 @@ runs:
 		assert.Error(t, err)
 		assert.Nil(t, manifest)
 	})
-
-	t.Run("null default is empty string", func(t *testing.T) {
-		raw := []byte("runs:\n  using: node20\n  main: dist/index.js\ninputs:\n  tok:\n    default: null\n  tilde:\n    default: ~\n")
-		m, err := action.ParseManifest(raw)
-		require.NoError(t, err)
-		assert.Equal(t, "", m.Inputs["tok"].Default)
-		assert.Equal(t, "", m.Inputs["tilde"].Default)
-	})
 }
 
 func TestActionInput_NullDefaultIsEmpty(t *testing.T) {

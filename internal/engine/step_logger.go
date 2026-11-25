@@ -274,16 +274,6 @@ func (sw *StepWriter) ensureMaskerLocked() *SecretMasker {
 	return sw.masker
 }
 
-// ensureMasker guarantees a non-nil masker is returned.
-func (sw *StepWriter) ensureMasker() *SecretMasker {
-	if sw == nil {
-		return nil
-	}
-	sw.mu.Lock()
-	defer sw.mu.Unlock()
-	return sw.ensureMaskerLocked()
-}
-
 // Masker returns the secret masker.
 func (sw *StepWriter) Masker() *SecretMasker {
 	if sw == nil {

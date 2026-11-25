@@ -3361,6 +3361,42 @@ func TestExecuteJob_RejectsStepWorkingDirectoryTraversal(t *testing.T) {
 	assert.Contains(t, err.Error(), "outside job workspace")
 }
 
+func TestExecuteJob_ContainerRelativeWorkingDirectoryTraversal(t *testing.T) {
+	dockerMock := &mockDriver{}
+	coord := NewCoordinator(&mockDriver{}, nil, t.TempDir()).
+		WithDockerDriver(dockerMock).
+		WithTracer(nil)
+
+	// Relative traversal must still be rejected for container jobs
+	jobTraversal := &protocol.JobSpecification{
+		JobID:     "container-traversal-job",
+		JobName:   "container-traversal-job",
+		Container: &protocol.JobContainer{Image: "alpine:latest"},
+		Steps: []protocol.JobStep{
+			{ID: "s1", Name: "escape", WorkingDirectory: "../../etc", Script: "pwd"},
+		},
+	}
+	res, err := coord.ExecuteJob(context.Background(), jobTraversal, "", "")
+	require.Error(t, err)
+	assert.Equal(t, "failure", res.Conclusion)
+	assert.Contains(t, err.Error(), "outside job workspace")
+
+	// Absolute container path must still be allowed for container jobs
+	jobAbs := &protocol.JobSpecification{
+		JobID:     "container-abs-job",
+		JobName:   "container-abs-job",
+		Container: &protocol.JobContainer{Image: "alpine:latest"},
+		Steps: []protocol.JobStep{
+			{ID: "s1", Name: "inside", WorkingDirectory: "/app", Script: "pwd"},
+		},
+	}
+	resAbs, errAbs := coord.ExecuteJob(context.Background(), jobAbs, "", "")
+	require.NoError(t, errAbs)
+	assert.Equal(t, "success", resAbs.Conclusion)
+	require.Len(t, dockerMock.stepsRun, 1)
+	assert.Equal(t, "/app", dockerMock.stepsRun[0].WorkingDirectory)
+}
+
 func TestExecuteStep_NilSpecGuard(t *testing.T) {
 	coord := NewCoordinator(&mockDriver{}, nil, t.TempDir()).WithTracer(nil)
 	_, _, err := coord.executeStep(context.Background(), &mockDriver{}, "job-1", nil, nil, "step", nil, nil)
@@ -3526,12 +3562,15 @@ func TestExpressionEvaluator_BuiltinsAndOperators(t *testing.T) {
 	assert.Equal(t, "42", evaluateExpression("a.b[1].c", ctx))
 	assert.Equal(t, "", evaluateExpression("a.b[9].c", ctx))
 
-	// Precedence: || < && < comparison < !
+	// Precedence: || < && < equality (==, !=) < relational (<, <=, >, >=) < !
 	assert.Equal(t, "true", evaluateExpression("true || false && false", ctx))
 	assert.Equal(t, "true", evaluateExpression("!(num < 5) && num >= 10", ctx))
 	assert.Equal(t, "true", evaluateExpression("num > 5 && num <= 10", ctx))
 	assert.Equal(t, "false", evaluateExpression("num > 10 || num < 10", ctx))
 	assert.Equal(t, "true", evaluateExpression("'apple' < 'Banana'", ctx))
+	assert.Equal(t, "false", evaluateExpression("true == (2 < 1)", ctx))
+	assert.Equal(t, "false", evaluateExpression("true == 2 < 1", ctx))
+	assert.Equal(t, "true", evaluateExpression("2 < 1 == false", ctx))
 
 	// join, toJSON, fromJSON, contains
 	assert.Equal(t, "alpha|beta|gamma", evaluateExpression("join(arr, '|')", ctx))
@@ -3562,6 +3601,13 @@ func TestExpressionEvaluator_BuiltinsAndOperators(t *testing.T) {
 	assert.False(t, shouldExecuteStep("'unterminated", ctx, false, false))
 	deep := strings.Repeat("(", 150) + "true" + strings.Repeat(")", 150)
 	assert.False(t, shouldExecuteStep(deep, ctx, false, false))
+
+	// hashFiles skips symlinks that resolve outside workspace
+	outsideDir := t.TempDir()
+	outsideSecret := filepath.Join(outsideDir, "secret.txt")
+	require.NoError(t, os.WriteFile(outsideSecret, []byte("top-secret\n"), 0o644))
+	require.NoError(t, os.Symlink(outsideSecret, filepath.Join(ws, "leaked.txt")))
+	assert.Equal(t, "", evaluateExpression("hashFiles('leaked.txt')", ctx))
 }
 
 

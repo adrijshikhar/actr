@@ -5,6 +5,7 @@ package host
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -39,7 +40,13 @@ func TestLinuxLimiter_DirectCgroupV2(t *testing.T) {
 		Pids:   50,
 	}
 
-	pid := os.Getpid()
+	cmd := exec.Command("sleep", "30")
+	require.NoError(t, cmd.Start())
+	defer func() {
+		_ = cmd.Process.Kill()
+	}()
+
+	pid := cmd.Process.Pid
 	cleanup, err := limiter.tryCgroupsV2(pid, limits)
 	require.NoError(t, err)
 
@@ -65,5 +72,6 @@ func TestLinuxLimiter_DirectCgroupV2(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(cgroupDir, "cgroup.procs"), []byte(fmt.Sprintf("%d\n999999\n", pid)), 0644))
 
 	cleanup()
+	assert.Error(t, cmd.Wait(), "sacrificial child process should have been terminated by cleanup")
 	assert.True(t, limiter.IsOOMKilled(pid))
 }

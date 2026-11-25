@@ -387,7 +387,7 @@ func TestStepWriter_ConcurrentMaskingRace(t *testing.T) {
 			if id%3 == 0 {
 				sw.WithMasker(NewSecretMasker())
 			}
-			_, _ = sw.Write([]byte(fmt.Sprintf("line %d with %s\n", id, secret)))
+			_, _ = fmt.Fprintf(sw, "line %d with %s\n", id, secret)
 			sw.Flush()
 		}(i)
 	}

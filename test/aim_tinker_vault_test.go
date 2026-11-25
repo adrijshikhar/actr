@@ -153,11 +153,6 @@ func TestAim_TinkerVaultIntegration(t *testing.T) {
 
 	// Test 3: Aim Web Workspace Step Execution
 	t.Run("AimWebWorkspace_SecretFulfillment", func(t *testing.T) {
-		aimWebDir := "/Users/nemesis/Projects/my-projects/aim/web"
-		if _, err := os.Stat(aimWebDir); os.IsNotExist(err) {
-			t.Skip("aim/web directory not present; skipping workspace execution")
-		}
-
 		logCapture.Reset()
 		job := &protocol.JobSpecification{
 			ID:        "job-aim-web-1",
@@ -172,7 +167,7 @@ func TestAim_TinkerVaultIntegration(t *testing.T) {
 					ID:               "step-node-env",
 					Name:             "Verify Node process.env in aim/web",
 					Type:             "script",
-					WorkingDirectory: aimWebDir,
+					WorkingDirectory: "web",
 					Environment: map[string]string{
 						"TINKER_API_KEY":      "",
 						"TINKER_API_BASE_URL": "",

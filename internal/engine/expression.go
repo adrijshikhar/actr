@@ -378,13 +378,13 @@ func (p *exprParser) parseOr() (exprNode, error) {
 }
 
 func (p *exprParser) parseAnd() (exprNode, error) {
-	left, err := p.parseComparison()
+	left, err := p.parseEquality()
 	if err != nil {
 		return nil, err
 	}
 	for p.peek().kind == tokAnd {
 		op := p.advance().val
-		right, err := p.parseComparison()
+		right, err := p.parseEquality()
 		if err != nil {
 			return nil, err
 		}
@@ -393,14 +393,34 @@ func (p *exprParser) parseAnd() (exprNode, error) {
 	return left, nil
 }
 
-func (p *exprParser) parseComparison() (exprNode, error) {
+func (p *exprParser) parseEquality() (exprNode, error) {
+	left, err := p.parseRelational()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		k := p.peek().kind
+		if k != tokEq && k != tokNe {
+			break
+		}
+		op := p.advance().val
+		right, err := p.parseRelational()
+		if err != nil {
+			return nil, err
+		}
+		left = binaryExpr{op: op, left: left, right: right}
+	}
+	return left, nil
+}
+
+func (p *exprParser) parseRelational() (exprNode, error) {
 	left, err := p.parseUnary()
 	if err != nil {
 		return nil, err
 	}
 	for {
 		k := p.peek().kind
-		if k != tokEq && k != tokNe && k != tokLt && k != tokLe && k != tokGt && k != tokGe {
+		if k != tokLt && k != tokLe && k != tokGt && k != tokGe {
 			break
 		}
 		op := p.advance().val
@@ -925,6 +945,10 @@ func evalHashFiles(patterns []string, ctx map[string]any) string {
 	if err != nil {
 		return ""
 	}
+	evalWorkspace, err := filepath.EvalSymlinks(absWorkspace)
+	if err != nil {
+		evalWorkspace = absWorkspace
+	}
 
 	var includes []string
 	var excludes []string
@@ -950,6 +974,15 @@ func evalHashFiles(patterns []string, ctx map[string]any) string {
 		}
 		if !hasPathPrefix(path, absWorkspace) {
 			return nil
+		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			target, err := filepath.EvalSymlinks(path)
+			if err != nil || !hasPathPrefix(target, evalWorkspace) {
+				return nil
+			}
+			if info, statErr := os.Stat(target); statErr != nil || info.IsDir() {
+				return nil
+			}
 		}
 		rel, err := filepath.Rel(absWorkspace, path)
 		if err != nil {

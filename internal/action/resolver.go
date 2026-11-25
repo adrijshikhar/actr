@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path"
@@ -459,6 +460,26 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 				return "", fmt.Errorf("unsupported special file type in archive: %v (%s)", hdr.Typeflag, hdr.Name)
 			}
 		}
+	}
+
+	// Post-extraction verification: ensure no symlinks resolve outside destination
+	if err := filepath.WalkDir(cleanDest, func(entryPath string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			realTarget, err := filepath.EvalSymlinks(entryPath)
+			if err != nil {
+				return fmt.Errorf("%w: symlink %s resolves outside destination: %v", ErrPathTraversal, entryPath, err)
+			}
+			cleanReal := filepath.Clean(realTarget)
+			if !strings.HasPrefix(cleanReal, cleanDest+string(filepath.Separator)) && cleanReal != cleanDest {
+				return fmt.Errorf("%w: symlink %s resolves outside destination", ErrPathTraversal, entryPath)
+			}
+		}
+		return nil
+	}); err != nil {
+		return "", err
 	}
 
 	if err := os.WriteFile(markerFile, []byte(time.Now().UTC().Format(time.RFC3339)), 0644); err != nil {
