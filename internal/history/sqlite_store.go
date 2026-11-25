@@ -1006,7 +1006,7 @@ func (s *SQLiteStore) Prune(maxRuns int, maxDiskBytes ...int64) (int, error) {
 				FROM step_logs
 				WHERE run_id = ?
 			`, oldestID).Scan(&runBytes); err != nil {
-				break
+				return 0, fmt.Errorf("query step log bytes for run %s: %w", oldestID, err)
 			}
 
 			if _, err := tx.ExecContext(ctx, "DELETE FROM runs WHERE id = ?", oldestID); err != nil {
