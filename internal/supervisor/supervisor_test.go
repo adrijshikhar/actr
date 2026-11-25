@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,6 +12,8 @@ import (
 	"github.com/adrijshikhar/actr/internal/config"
 	"github.com/adrijshikhar/actr/internal/protocol"
 	"github.com/adrijshikhar/actr/internal/telemetry"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // testSocketPath returns a unix socket path suitable for testing on Darwin/Linux.
@@ -446,4 +449,111 @@ func TestSupervisor_WithTracer(t *testing.T) {
 	if worker == nil || worker.tracer != tm {
 		t.Errorf("expected worker tracer to be set via WithTracer")
 	}
+}
+
+type drainCheckBroker struct{}
+
+func (b *drainCheckBroker) CreateSession(context.Context, string, int64, int64) error { return nil }
+func (b *drainCheckBroker) AcknowledgeMessage(context.Context, string) error         { return nil }
+func (b *drainCheckBroker) DeleteSession(context.Context) error                      { return nil }
+func (b *drainCheckBroker) GetMessage(ctx context.Context, _, _, _ string) (*protocol.BrokerMessage, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+		return &protocol.BrokerMessage{MessageID: 42, MessageType: "RunnerJobRequest"}, nil
+	}
+}
+
+type drainCheckRunClient struct{}
+
+func (r *drainCheckRunClient) AcquireJob(ctx context.Context, _, _, _, _ string) (*protocol.JobSpecification, error) {
+	return &protocol.JobSpecification{JobID: "drain-job", PlanID: "plan-1"}, nil
+}
+func (r *drainCheckRunClient) CompleteJob(context.Context, string, string, *protocol.CompleteJobRequest) error {
+	return nil
+}
+
+type drainCheckExecutor struct {
+	started    chan struct{}
+	once       sync.Once
+	ctxWasLive atomic.Bool
+}
+
+func (e *drainCheckExecutor) ExecuteJob(ctx context.Context, job *protocol.JobSpecification, _, _ string) (*protocol.CompleteJobRequest, error) {
+	e.once.Do(func() { close(e.started) })
+	time.Sleep(80 * time.Millisecond)
+	e.ctxWasLive.Store(ctx.Err() == nil)
+	return &protocol.CompleteJobRequest{JobID: job.JobID, PlanID: job.PlanID, Conclusion: "success"}, nil
+}
+
+func TestSupervisor_GracefulDrainDoesNotCancelInFlightJobsBeforeTimeout(t *testing.T) {
+	cfg := &config.SupervisorConfig{
+		Version: "1",
+		Global:  config.GlobalConfig{MaxConcurrentJobs: 1},
+		Repos:   map[string]config.RepoConfig{"r1": {URL: "https://github.com/o/r1", MaxConcurrentJobs: 1}},
+	}
+	s, err := NewSupervisor(cfg, "")
+	require.NoError(t, err)
+	w := s.Workers()["r1"]
+	exec := &drainCheckExecutor{started: make(chan struct{})}
+	w.SetBrokerClient(&drainCheckBroker{})
+	w.SetRunServiceClient(&drainCheckRunClient{})
+	w.SetCoordinator(exec)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Start(ctx) }()
+
+	<-exec.started
+	cancel() // must cancel pollingCtx first while keeping jobCtx alive during 30s drain window
+	require.NoError(t, <-done)
+	assert.True(t, exec.ctxWasLive.Load(), "in-flight job context must survive polling cancellation during drain")
+}
+
+func TestSupervisor_ReloadRecreatesModifiedRepoWorker(t *testing.T) {
+	cfg := &config.SupervisorConfig{
+		Version: "1",
+		Global:  config.GlobalConfig{MaxConcurrentJobs: 4},
+		Repos: map[string]config.RepoConfig{
+			"r1": {URL: "https://github.com/o/r1", MaxConcurrentJobs: 1},
+			"r2": {URL: "https://github.com/o/r2", MaxConcurrentJobs: 1},
+		},
+	}
+	s, err := NewSupervisor(cfg, "")
+	require.NoError(t, err)
+
+	oldR1 := s.Workers()["r1"]
+	oldR2 := s.Workers()["r2"]
+	require.NotNil(t, oldR1)
+	require.NotNil(t, oldR2)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.Start(ctx) }()
+	time.Sleep(30 * time.Millisecond)
+
+	// Modify r1, keep r2 identical
+	newCfg := &config.SupervisorConfig{
+		Version: "1",
+		Global:  config.GlobalConfig{MaxConcurrentJobs: 4},
+		Repos: map[string]config.RepoConfig{
+			"r1": {URL: "https://github.com/o/r1", MaxConcurrentJobs: 2},
+			"r2": {URL: "https://github.com/o/r2", MaxConcurrentJobs: 1},
+		},
+	}
+	require.NoError(t, s.Reload(newCfg))
+
+	workers := s.Workers()
+	newR1 := workers["r1"]
+	newR2 := workers["r2"]
+	require.NotNil(t, newR1)
+	require.NotNil(t, newR2)
+	assert.NotSame(t, oldR1, newR1, "modified repo worker must be recreated")
+	assert.Same(t, oldR2, newR2, "unchanged repo worker must be preserved")
+	assert.Equal(t, 2, cap(newR1.repoSem))
+
+	cancel()
+	require.NoError(t, <-done)
 }

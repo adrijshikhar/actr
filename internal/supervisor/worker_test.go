@@ -102,7 +102,7 @@ func TestRepoWorker_PermitReleasedOnPanic(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	reqRef := JobRequestReference{RunnerRequestID: "123"}
+	reqRef := protocol.JobRequestReference{RunnerRequestID: "123"}
 
 	// 1. Verify panic is caught and permit is released
 	err = worker.executeWithGuards(ctx, reqRef, func() error {
@@ -333,7 +333,7 @@ func TestRepoWorker_DispatchJob_CompleteOnCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	reqRef := JobRequestReference{RunnerRequestID: "req-1"}
+	reqRef := protocol.JobRequestReference{RunnerRequestID: "req-1"}
 	_ = worker.dispatchJob(ctx, reqRef)
 
 	if atomic.LoadInt32(&completeCalled) != 1 {
@@ -536,7 +536,7 @@ func TestRepoWorker_DynamicTokenRefresh(t *testing.T) {
 		repoSem:          make(chan struct{}, 1),
 	}
 
-	ref := JobRequestReference{
+	ref := protocol.JobRequestReference{
 		RunnerRequestID: "req-1",
 	}
 
@@ -582,7 +582,7 @@ func TestRepoWorker_PanicAfterAcquireNotifiesCompleteJob(t *testing.T) {
 		repoSem:          make(chan struct{}, 1),
 	}
 
-	ref := JobRequestReference{
+	ref := protocol.JobRequestReference{
 		RunnerRequestID: "req-panic",
 	}
 
@@ -596,5 +596,76 @@ func TestRepoWorker_PanicAfterAcquireNotifiesCompleteJob(t *testing.T) {
 
 	if !completedWithFailure {
 		t.Fatal("expected CompleteJob with conclusion='failure' to be delivered on coordinator panic")
+	}
+}
+
+func TestRepoWorker_CamelCaseJobRequestReference(t *testing.T) {
+	resMgr, err := NewResourceManager(1)
+	if err != nil {
+		t.Fatalf("NewResourceManager failed: %v", err)
+	}
+
+	mockBroker := &mockBrokerClient{
+		msgQueue: make(chan *protocol.BrokerMessage, 1),
+	}
+
+	type capturedAcquire struct {
+		url   string
+		reqID string
+		bill  string
+	}
+	acquiredCh := make(chan capturedAcquire, 1)
+	mockRun := &mockRunServiceClient{
+		acquireFn: func(ctx context.Context, runServiceURL, runnerRequestID, billingOwnerID, token string) (*protocol.JobSpecification, error) {
+			acquiredCh <- capturedAcquire{
+				url:   runServiceURL,
+				reqID: runnerRequestID,
+				bill:  billingOwnerID,
+			}
+			return &protocol.JobSpecification{PlanID: "p1", JobID: "j1"}, nil
+		},
+	}
+
+	worker := &RepoWorker{
+		repoAlias:        "camel-repo",
+		resMgr:           resMgr,
+		brokerClient:     mockBroker,
+		runServiceClient: mockRun,
+		coordinator:      &mockCoordinator{},
+		repoSem:          make(chan struct{}, 1),
+	}
+
+	ctx := context.Background()
+	pollingCtx, cancelPoll := context.WithCancel(context.Background())
+	defer cancelPoll()
+
+	if err := worker.Start(ctx, pollingCtx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer stopCancel()
+		_ = worker.Stop(stopCtx)
+	}()
+
+	mockBroker.msgQueue <- &protocol.BrokerMessage{
+		MessageID:   42,
+		MessageType: "RunnerJobRequest",
+		Body:        `{"runnerRequestId":"req-camel-1","runServiceUrl":"https://run.example.com","billingOwnerId":"bill-camel"}`,
+	}
+
+	select {
+	case got := <-acquiredCh:
+		if got.reqID != "req-camel-1" {
+			t.Fatalf("expected runnerRequestID 'req-camel-1', got %q", got.reqID)
+		}
+		if got.url != "https://run.example.com" {
+			t.Fatalf("expected runServiceURL 'https://run.example.com', got %q", got.url)
+		}
+		if got.bill != "bill-camel" {
+			t.Fatalf("expected billingOwnerID 'bill-camel', got %q", got.bill)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for AcquireJob")
 	}
 }
