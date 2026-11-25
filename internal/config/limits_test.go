@@ -103,3 +103,14 @@ func TestLimitsConfig(t *testing.T) {
 	assert.Equal(t, int64(512), cfg.Pids)
 	assert.Equal(t, 30*time.Minute, cfg.Timeout)
 }
+
+func TestParseMemory_RejectsBoundaryInt64Overflow(t *testing.T) {
+	_, err := ParseMemory("8589934592GiB") // 2^33 * 2^30 = 2^63 > MaxInt64
+	require.Error(t, err)
+	_, err = ParseMemory("9223372036854775808B") // 2^63 > MaxInt64
+	require.Error(t, err)
+	_, err = ParseMemory("9223372036854775808")
+	require.Error(t, err)
+	_, err = ParseMemory("1e309B") // Inf
+	require.Error(t, err)
+}

@@ -227,3 +227,54 @@ func TestRepoConfig_ParseLimits_EdgeCases(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1.5, limFloat.CPU)
 }
+
+func TestLoadSupervisorConfig_RejectsUnsafeAliasTraversal(t *testing.T) {
+	unsafeAliases := []string{
+		"../../evil",
+		"foo/bar",
+		`foo\bar`,
+		"..",
+		".hidden",
+		"-leading-dash",
+		"repo..name",
+		"bad alias!",
+		"",
+	}
+
+	for _, alias := range unsafeAliases {
+		t.Run("alias_"+alias, func(t *testing.T) {
+			dir := t.TempDir()
+			cfgPath := filepath.Join(dir, "config.yaml")
+			content := "version: '1'\nrepos:\n  '" + alias + "':\n    url: https://github.com/a/b\n"
+			require.NoError(t, os.WriteFile(cfgPath, []byte(content), 0o600))
+			_, err := LoadSupervisorConfig(cfgPath)
+			require.Error(t, err, "expected alias %q to be rejected", alias)
+		})
+	}
+}
+
+func TestLoadSupervisorConfig_RejectsEscapingRelativeConfigDir(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	content := "version: '1'\nrepos:\n  good:\n    url: https://github.com/a/b\n    config_dir: '../../evil'\n"
+	require.NoError(t, os.WriteFile(cfgPath, []byte(content), 0o600))
+	_, err := LoadSupervisorConfig(cfgPath)
+	require.Error(t, err)
+}
+
+func TestSaveSupervisorConfig_Permissions0600(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	cfg := &SupervisorConfig{
+		Version: "1",
+		Global:  GlobalConfig{MaxConcurrentJobs: 2},
+		Repos: map[string]RepoConfig{
+			"aim": {URL: "https://github.com/a/b"},
+		},
+	}
+	require.NoError(t, SaveSupervisorConfig(cfgPath, cfg))
+
+	info, err := os.Stat(cfgPath)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0600), info.Mode().Perm())
+}

@@ -4,11 +4,43 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
+
+var repoAliasRegexp = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+
+// ValidateRepoAlias ensures a repository alias is a safe single path-component identifier.
+func ValidateRepoAlias(alias string) error {
+	if alias == "" {
+		return fmt.Errorf("repo alias must not be empty")
+	}
+	if strings.Contains(alias, "..") || strings.ContainsAny(alias, `/\`) {
+		return fmt.Errorf("invalid repo alias %q: path traversal characters are not allowed", alias)
+	}
+	if !repoAliasRegexp.MatchString(alias) {
+		return fmt.Errorf("invalid repo alias %q: must match ^[a-zA-Z0-9][a-zA-Z0-9._-]*$", alias)
+	}
+	return nil
+}
+
+func verifyDirContained(absBaseDir, targetDir string) error {
+	absTarget, err := filepath.Abs(targetDir)
+	if err != nil {
+		return fmt.Errorf("resolve repo config_dir: %w", err)
+	}
+	rel, err := filepath.Rel(absBaseDir, absTarget)
+	if err != nil {
+		return fmt.Errorf("repo config_dir containment check failed: %w", err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("repo config_dir %q escapes config base directory %q", targetDir, absBaseDir)
+	}
+	return nil
+}
 
 type LimitsYAMLConfig struct {
 	CPU     any    `json:"cpu" yaml:"cpu"`
@@ -116,14 +148,27 @@ func LoadSupervisorConfig(configPath string) (*SupervisorConfig, error) {
 	}
 
 	baseDir := filepath.Dir(configPath)
+	absBaseDir, err := filepath.Abs(baseDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve config base dir: %w", err)
+	}
 	for alias, repo := range cfg.Repos {
+		if err := ValidateRepoAlias(alias); err != nil {
+			return nil, fmt.Errorf("repo %q: %w", alias, err)
+		}
 		if repo.MaxConcurrentJobs <= 0 {
 			repo.MaxConcurrentJobs = 1
 		}
 		if repo.ConfigDir == "" {
 			repo.ConfigDir = filepath.Join(baseDir, "repos", alias)
+			if err := verifyDirContained(absBaseDir, repo.ConfigDir); err != nil {
+				return nil, fmt.Errorf("repo %q: %w", alias, err)
+			}
 		} else if !filepath.IsAbs(repo.ConfigDir) {
 			repo.ConfigDir = filepath.Join(baseDir, repo.ConfigDir)
+			if err := verifyDirContained(absBaseDir, repo.ConfigDir); err != nil {
+				return nil, fmt.Errorf("repo %q: %w", alias, err)
+			}
 		}
 		if _, err := repo.ParseLimits(); err != nil {
 			return nil, fmt.Errorf("repo %q: %w", alias, err)
@@ -136,16 +181,15 @@ func LoadSupervisorConfig(configPath string) (*SupervisorConfig, error) {
 
 // SaveSupervisorConfig writes the supervisor configuration to configPath atomically.
 func SaveSupervisorConfig(configPath string, cfg *SupervisorConfig) error {
+	if err := os.MkdirAll(filepath.Dir(configPath), 0700); err != nil {
+		return fmt.Errorf("create supervisor config dir: %w", err)
+	}
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("marshal supervisor config: %w", err)
 	}
-	tmpPath := configPath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		return fmt.Errorf("write tmp supervisor config: %w", err)
-	}
-	if err := os.Rename(tmpPath, configPath); err != nil {
-		return fmt.Errorf("rename supervisor config: %w", err)
+	if err := writeFileAtomic(configPath, data, 0600); err != nil {
+		return fmt.Errorf("write supervisor config: %w", err)
 	}
 	return nil
 }
