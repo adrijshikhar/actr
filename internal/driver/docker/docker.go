@@ -1,7 +1,10 @@
 package docker
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +12,8 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,10 +33,14 @@ type Driver struct {
 	mu          sync.Mutex
 	containerID string
 	jobCtx      *driver.JobContext
+
+	execIDMu   sync.Mutex
+	execCancel context.CancelFunc
 }
 
-// Ensure Driver satisfies the driver.Driver interface.
+// Ensure Driver satisfies driver.Driver and driver.Cloneable interfaces.
 var _ driver.Driver = (*Driver)(nil)
+var _ driver.Cloneable = (*Driver)(nil)
 
 // NewDriver constructs a Docker driver with the given client and pull policy.
 func NewDriver(cli DockerClient, autoPull bool) *Driver {
@@ -46,11 +55,52 @@ func (d *Driver) Name() string {
 	return "docker"
 }
 
+// Clone returns an isolated Driver instance sharing the underlying docker client and pull policy.
+// This ensures concurrent jobs do not clobber container state or job context.
+func (d *Driver) Clone() driver.Driver {
+	d.mu.Lock()
+	cli := d.cli
+	autoPull := d.autoPull
+	d.mu.Unlock()
+	return NewDriver(cli, autoPull)
+}
+
 // ContainerID returns the currently running container ID for testing and telemetry tracking.
 func (d *Driver) ContainerID() string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.containerID
+}
+
+type pullStreamMessage struct {
+	Error       string `json:"error,omitempty"`
+	ErrorDetail *struct {
+		Message string `json:"message,omitempty"`
+	} `json:"errorDetail,omitempty"`
+}
+
+func decodeImagePullStream(r io.Reader) error {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var msg pullStreamMessage
+		if err := json.Unmarshal(line, &msg); err != nil {
+			continue
+		}
+		if msg.Error != "" {
+			return errors.New(msg.Error)
+		}
+		if msg.ErrorDetail != nil && msg.ErrorDetail.Message != "" {
+			return errors.New(msg.ErrorDetail.Message)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read pull stream: %w", err)
+	}
+	return nil
 }
 
 // PrepareJob provisions the container image, mounts, and resource governance limits.
@@ -92,8 +142,11 @@ func (d *Driver) PrepareJob(ctx context.Context, job *driver.JobContext) error {
 			return fmt.Errorf("pull image %q: %w", imageName, pullErr)
 		}
 		if reader != nil {
-			_, _ = io.Copy(io.Discard, reader)
+			err := decodeImagePullStream(reader)
 			_ = reader.Close()
+			if err != nil {
+				return fmt.Errorf("pull image %q: %w", imageName, err)
+			}
 		}
 	}
 
@@ -106,6 +159,17 @@ func (d *Driver) PrepareJob(ctx context.Context, job *driver.JobContext) error {
 			"actr.managed": "true",
 			"actr.job_id":  job.JobID,
 		},
+	}
+
+	if job.Container != nil && len(job.Container.Environment) > 0 {
+		keys := make([]string, 0, len(job.Container.Environment))
+		for k := range job.Container.Environment {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			containerConfig.Env = append(containerConfig.Env, fmt.Sprintf("%s=%s", k, job.Container.Environment[k]))
+		}
 	}
 
 	// On Linux, map container execution to host user's UID:GID to avoid root file permission lockouts
@@ -148,11 +212,6 @@ func (d *Driver) PrepareJob(ctx context.Context, job *driver.JobContext) error {
 		return fmt.Errorf("create container: %w", err)
 	}
 
-	d.mu.Lock()
-	d.containerID = resp.ID
-	d.jobCtx = job
-	d.mu.Unlock()
-
 	if err := d.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		_ = d.cli.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{
@@ -160,14 +219,26 @@ func (d *Driver) PrepareJob(ctx context.Context, job *driver.JobContext) error {
 			RemoveVolumes: true,
 		})
 		cancel()
+		d.mu.Lock()
+		d.containerID = ""
+		d.jobCtx = nil
+		d.mu.Unlock()
 		return fmt.Errorf("start container: %w", err)
 	}
+
+	d.mu.Lock()
+	d.containerID = resp.ID
+	d.jobCtx = job
+	d.mu.Unlock()
 
 	return nil
 }
 
 // ExecuteStep writes the step script to the host temp directory and executes it inside the container.
 func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout, stderr io.Writer) (*driver.StepResult, error) {
+	if step == nil {
+		return nil, errors.New("nil step specification")
+	}
 	if ctx.Err() != nil {
 		return &driver.StepResult{ExitCode: 1, Error: ctx.Err()}, ctx.Err()
 	}
@@ -180,6 +251,19 @@ func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout,
 	if cid == "" {
 		return nil, errors.New("container not running")
 	}
+
+	stepCtx, stepCancel := context.WithCancel(ctx)
+	defer stepCancel()
+
+	d.execIDMu.Lock()
+	d.execCancel = stepCancel
+	d.execIDMu.Unlock()
+
+	defer func() {
+		d.execIDMu.Lock()
+		d.execCancel = nil
+		d.execIDMu.Unlock()
+	}()
 
 	if stdout == nil {
 		stdout = io.Discard
@@ -199,11 +283,24 @@ func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout,
 		return nil, fmt.Errorf("prepare temp dir: %w", err)
 	}
 
-	hostScript := filepath.Join(tempDir, fmt.Sprintf("step_%s.sh", step.ID))
-	if err := os.WriteFile(hostScript, []byte(step.Script), 0755); err != nil {
+	f, err := os.CreateTemp(tempDir, fmt.Sprintf("step_%s_*.sh", sanitizeStepID(step.ID)))
+	if err != nil {
+		return nil, fmt.Errorf("create step script: %w", err)
+	}
+	hostScript := f.Name()
+	defer func() { _ = os.Remove(hostScript) }()
+
+	if err := f.Chmod(0755); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("chmod step script: %w", err)
+	}
+	if _, err := f.WriteString(step.Script); err != nil {
+		_ = f.Close()
 		return nil, fmt.Errorf("write step script: %w", err)
 	}
-	defer func() { _ = os.Remove(hostScript) }()
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("close step script: %w", err)
+	}
 
 	// Environment variable translation for container consumption
 	containerEnv := make(map[string]string)
@@ -225,7 +322,7 @@ func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout,
 
 	for k, v := range containerEnv {
 		switch k {
-		case "GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH":
+		case "GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH", "GITHUB_STATE":
 			containerEnv[k] = translateTempPath(v, hostTemp)
 		case "GITHUB_WORKSPACE":
 			containerEnv[k] = "/github/workspace"
@@ -234,9 +331,9 @@ func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout,
 		case "RUNNER_WORKSPACE":
 			containerEnv[k] = "/github"
 		default:
-			if hostWorkspace != "" && (v == hostWorkspace || strings.HasPrefix(v, hostWorkspace+"/")) {
+			if hostWorkspace != "" && hasPathPrefix(v, hostWorkspace) {
 				containerEnv[k] = translateWorkspacePath(v, hostWorkspace)
-			} else if hostTemp != "" && (v == hostTemp || strings.HasPrefix(v, hostTemp+"/")) {
+			} else if hostTemp != "" && hasPathPrefix(v, hostTemp) {
 				containerEnv[k] = translateTempPath(v, hostTemp)
 			}
 		}
@@ -246,6 +343,7 @@ func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout,
 	for k, v := range containerEnv {
 		envSlice = append(envSlice, fmt.Sprintf("%s=%s", k, v))
 	}
+	sort.Strings(envSlice)
 
 	containerWorkDir := translateWorkspacePath(step.WorkingDirectory, hostWorkspace)
 
@@ -253,7 +351,7 @@ func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout,
 	if shell == "" {
 		shell = "sh"
 	}
-	containerScriptPath := fmt.Sprintf("/github/workflow/step_%s.sh", step.ID)
+	containerScriptPath := path.Join("/github/workflow", filepath.Base(hostScript))
 	cmd := []string{shell, "-e", containerScriptPath}
 
 	execConfig := container.ExecOptions{
@@ -264,12 +362,12 @@ func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout,
 		AttachStderr: true,
 	}
 
-	execResp, err := d.cli.ContainerExecCreate(ctx, cid, execConfig)
+	execResp, err := d.cli.ContainerExecCreate(stepCtx, cid, execConfig)
 	if err != nil {
 		return nil, fmt.Errorf("container exec create: %w", err)
 	}
 
-	attachResp, err := d.cli.ContainerExecAttach(ctx, execResp.ID, container.ExecAttachOptions{})
+	attachResp, err := d.cli.ContainerExecAttach(stepCtx, execResp.ID, container.ExecAttachOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("container exec attach: %w", err)
 	}
@@ -279,23 +377,46 @@ func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout,
 		step.OnProcessStart(1, 1)
 	}
 
+	var wg sync.WaitGroup
 	stopWatcher := make(chan struct{})
-	defer close(stopWatcher)
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		select {
-		case <-ctx.Done():
+		case <-stepCtx.Done():
+			killCtx, killCancel := context.WithTimeout(context.WithoutCancel(stepCtx), 2*time.Second)
+			defer killCancel()
+
+			if inspect, err := d.cli.ContainerExecInspect(killCtx, execResp.ID); err == nil && inspect.Pid > 0 {
+				if killResp, kErr := d.cli.ContainerExecCreate(killCtx, cid, container.ExecOptions{
+					Cmd: []string{"kill", "-KILL", strconv.Itoa(inspect.Pid)},
+				}); kErr == nil {
+					if killAttach, aErr := d.cli.ContainerExecAttach(killCtx, killResp.ID, container.ExecAttachOptions{}); aErr == nil {
+						killAttach.Close()
+					}
+				}
+			}
 			attachResp.Close()
 		case <-stopWatcher:
 		}
 	}()
 
 	// Demultiplex container stdout and stderr streams
-	_, _ = stdcopy.StdCopy(stdout, stderr, attachResp.Reader)
+	_, copyErr := stdcopy.StdCopy(stdout, stderr, attachResp.Reader)
+	close(stopWatcher)
+	wg.Wait()
 
-	inspectResp, err := d.cli.ContainerExecInspect(ctx, execResp.ID)
+	if stepCtx.Err() == nil && copyErr != nil {
+		return nil, fmt.Errorf("read container streams: %w", copyErr)
+	}
+
+	inspectCtx, inspectCancel := context.WithTimeout(context.WithoutCancel(stepCtx), 3*time.Second)
+	defer inspectCancel()
+
+	inspectResp, err := d.cli.ContainerExecInspect(inspectCtx, execResp.ID)
 	if err != nil {
-		if ctx.Err() != nil {
-			return &driver.StepResult{ExitCode: 1, Error: ctx.Err()}, ctx.Err()
+		if stepCtx.Err() != nil {
+			return &driver.StepResult{ExitCode: 1, Error: stepCtx.Err()}, stepCtx.Err()
 		}
 		return nil, fmt.Errorf("container exec inspect: %w", err)
 	}
@@ -304,7 +425,7 @@ func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout,
 	oomKilled := false
 
 	if exitCode == 137 {
-		containerJSON, inspectErr := d.cli.ContainerInspect(ctx, cid)
+		containerJSON, inspectErr := d.cli.ContainerInspect(inspectCtx, cid)
 		if inspectErr == nil && containerJSON.State != nil && containerJSON.State.OOMKilled {
 			oomKilled = true
 		}
@@ -314,8 +435,8 @@ func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout,
 	if exitCode != 0 {
 		stepErr = fmt.Errorf("command failed with exit code %d", exitCode)
 	}
-	if ctx.Err() != nil {
-		stepErr = ctx.Err()
+	if stepCtx.Err() != nil {
+		stepErr = stepCtx.Err()
 		if exitCode == 0 {
 			exitCode = 1
 		}
@@ -330,9 +451,16 @@ func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout,
 
 // CleanupJob terminates and removes the job container and associated temporary volumes.
 func (d *Driver) CleanupJob(ctx context.Context) error {
+	d.execIDMu.Lock()
+	if d.execCancel != nil {
+		d.execCancel()
+	}
+	d.execIDMu.Unlock()
+
 	d.mu.Lock()
 	cid := d.containerID
 	d.containerID = ""
+	d.jobCtx = nil
 	d.mu.Unlock()
 
 	if cid == "" {
@@ -377,11 +505,36 @@ func sanitizeContainerName(s string) string {
 	return res
 }
 
+func sanitizeStepID(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	res := b.String()
+	if res == "" {
+		return "step"
+	}
+	return res
+}
+
+func hasPathPrefix(p, prefix string) bool {
+	cp := filepath.Clean(p)
+	cpref := filepath.Clean(prefix)
+	if cp == cpref {
+		return true
+	}
+	return strings.HasPrefix(cp, cpref+string(filepath.Separator))
+}
+
 func translateTempPath(hostPath, hostTemp string) string {
 	if hostPath == "" {
 		return ""
 	}
-	if hostTemp != "" && strings.HasPrefix(hostPath, hostTemp) {
+	if hostTemp != "" && hasPathPrefix(hostPath, hostTemp) {
 		rel, err := filepath.Rel(hostTemp, hostPath)
 		if err == nil {
 			return path.Join("/github/workflow", filepath.ToSlash(rel))
@@ -401,7 +554,7 @@ func translateWorkspacePath(hostPath, hostWorkspace string) string {
 		if hostPath == hostWorkspace {
 			return "/github/workspace"
 		}
-		if strings.HasPrefix(hostPath, hostWorkspace) {
+		if hasPathPrefix(hostPath, hostWorkspace) {
 			rel, err := filepath.Rel(hostWorkspace, hostPath)
 			if err == nil {
 				return path.Join("/github/workspace", filepath.ToSlash(rel))

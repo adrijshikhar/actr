@@ -41,3 +41,9 @@ type Driver interface {
 	ExecuteStep(ctx context.Context, step *StepSpec, stdout, stderr io.Writer) (*StepResult, error)
 	CleanupJob(ctx context.Context) error
 }
+
+// Cloneable is an optional interface implemented by stateful drivers so each
+// concurrent job receives an isolated instance.
+type Cloneable interface {
+	Clone() Driver
+}

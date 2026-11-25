@@ -73,6 +73,10 @@ type mockDockerClient struct {
 	existingImages map[string]types.ImageInspect
 	inspectError   error
 	pullError      error
+	pullStream     io.Reader
+
+	failNextStart bool
+	createCount   int
 
 	inspectedImages []string
 	pulledImages    []string
@@ -87,9 +91,10 @@ type mockDockerClient struct {
 	startedContainerID string
 	startError         error
 
-	createdExecConfig container.ExecOptions
-	execCreateID      string
-	execCreateError   error
+	createdExecConfig   container.ExecOptions
+	createdExecCommands [][]string
+	execCreateID        string
+	execCreateError     error
 
 	attachedExecID   string
 	execStreamStdout string
@@ -140,6 +145,9 @@ func (m *mockDockerClient) ImagePull(ctx context.Context, ref string, options im
 	if m.pullError != nil {
 		return nil, m.pullError
 	}
+	if m.pullStream != nil {
+		return io.NopCloser(m.pullStream), nil
+	}
 	return io.NopCloser(strings.NewReader(`{"status":"Pull complete"}`)), nil
 }
 
@@ -153,13 +161,21 @@ func (m *mockDockerClient) ContainerCreate(ctx context.Context, config *containe
 	if m.createError != nil {
 		return container.CreateResponse{}, m.createError
 	}
-	return container.CreateResponse{ID: m.createResponseID}, nil
+	m.createCount++
+	id := m.createResponseID
+	if m.createCount > 1 {
+		id = fmt.Sprintf("%s-%d", m.createResponseID, m.createCount)
+	}
+	return container.CreateResponse{ID: id}, nil
 }
 
 func (m *mockDockerClient) ContainerStart(ctx context.Context, containerID string, options container.StartOptions) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.startedContainerID = containerID
+	if m.failNextStart {
+		return errors.New("cannot start container: failed start")
+	}
 	return m.startError
 }
 
@@ -167,6 +183,7 @@ func (m *mockDockerClient) ContainerExecCreate(ctx context.Context, containerID 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.createdExecConfig = config
+	m.createdExecCommands = append(m.createdExecCommands, config.Cmd)
 	if m.execCreateError != nil {
 		return types.IDResponse{}, m.execCreateError
 	}
@@ -386,7 +403,10 @@ func TestDockerDriver_ExecuteStep_PathRewritingAndExecution(t *testing.T) {
 
 	// Verify ExecConfig received by Docker
 	execConfig := mockCli.createdExecConfig
-	assert.Equal(t, []string{"sh", "-e", "/github/workflow/step_step-install.sh"}, execConfig.Cmd)
+	require.Len(t, execConfig.Cmd, 3)
+	assert.Equal(t, "sh", execConfig.Cmd[0])
+	assert.Equal(t, "-e", execConfig.Cmd[1])
+	assert.True(t, strings.HasPrefix(execConfig.Cmd[2], "/github/workflow/step_step-install_") && strings.HasSuffix(execConfig.Cmd[2], ".sh"))
 	assert.Equal(t, "/github/workspace/frontend", execConfig.WorkingDir)
 
 	envMap := make(map[string]string)
@@ -679,4 +699,206 @@ func TestDockerDriver_ExecuteStep_ContextCancellation_BreaksDeadlock(t *testing.
 	if res != nil {
 		assert.NotEqual(t, 0, res.ExitCode)
 	}
+}
+
+func TestDriver_CloneIsolatesConcurrentJobsAndClearsOnStartError(t *testing.T) {
+	cli := newMockDockerClient()
+	cli.existingImages["alpine:latest"] = types.ImageInspect{}
+	base := NewDriver(cli, false)
+
+	c1, ok := any(base).(driver.Cloneable)
+	require.True(t, ok, "docker.Driver must implement driver.Cloneable")
+	d1 := c1.Clone().(*Driver)
+	d2 := c1.Clone().(*Driver)
+
+	cli.failNextStart = true
+	err := d1.PrepareJob(context.Background(), &driver.JobContext{
+		JobID:     "job-fail",
+		Container: &protocol.JobContainer{Image: "alpine:latest"},
+	})
+	require.Error(t, err)
+	assert.Empty(t, d1.ContainerID(), "containerID must be cleared when ContainerStart fails")
+
+	cli.failNextStart = false
+	require.NoError(t, d1.PrepareJob(context.Background(), &driver.JobContext{
+		JobID:     "job-1",
+		Container: &protocol.JobContainer{Image: "alpine:latest"},
+	}))
+	require.NoError(t, d2.PrepareJob(context.Background(), &driver.JobContext{
+		JobID:     "job-2",
+		Container: &protocol.JobContainer{Image: "alpine:latest"},
+	}))
+	assert.NotEqual(t, d1.ContainerID(), d2.ContainerID())
+}
+
+func TestTranslatePaths_EnforcesSeparatorBoundary(t *testing.T) {
+	assert.Equal(t, "/work/job2/file", translateWorkspacePath("/work/job2/file", "/work/job"))
+	assert.Equal(t, "/github/workspace/sub/file", translateWorkspacePath("/work/job/sub/file", "/work/job"))
+	assert.Equal(t, "/github/workflow", translateTempPath("/work/_temp", "/work/_temp"))
+	assert.Equal(t, "/github/workflow/out", translateTempPath("/work/_temp2/out", "/work/_temp")) // does not treat /work/_temp2 as inside /work/_temp
+}
+
+func TestDriver_ImagePullStreamError(t *testing.T) {
+	cli := newMockDockerClient()
+	// Simulate image missing locally so it pulls
+	cli.pullStream = strings.NewReader("{\"status\":\"Pulling fs layer\"}\n{\"error\":\"pull access denied, repository does not exist\",\"errorDetail\":{\"message\":\"pull access denied, repository does not exist\"}}\n")
+	drv := NewDriver(cli, true)
+
+	err := drv.PrepareJob(context.Background(), &driver.JobContext{
+		JobID:     "job-pull-err",
+		Container: &protocol.JobContainer{Image: "private/image:latest"},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "pull access denied")
+}
+
+func TestDriver_ExecuteStep_UniqueScriptsAndPathSanitization(t *testing.T) {
+	cli := newMockDockerClient()
+	drv := NewDriver(cli, true)
+	tempDir := t.TempDir()
+
+	jobCtx := &driver.JobContext{
+		JobID:        "job-unique",
+		WorkspaceDir: filepath.Join(tempDir, "workspace"),
+		TempDir:      filepath.Join(tempDir, "temp"),
+		Container:    &protocol.JobContainer{Image: "alpine:latest"},
+	}
+	require.NoError(t, drv.PrepareJob(context.Background(), jobCtx))
+
+	// Step with malicious path traversal in ID
+	step := &driver.StepSpec{
+		ID:     "../../etc/passwd",
+		Script: "echo safe",
+	}
+	_, err := drv.ExecuteStep(context.Background(), step, nil, nil)
+	require.NoError(t, err)
+
+	// Script command inside container should not contain path traversal
+	cmd := cli.createdExecConfig.Cmd
+	require.Len(t, cmd, 3)
+	assert.Equal(t, "sh", cmd[0])
+	assert.Equal(t, "-e", cmd[1])
+	assert.True(t, strings.HasPrefix(cmd[2], "/github/workflow/step_"), "script should be inside /github/workflow and start with step_")
+	assert.False(t, strings.Contains(cmd[2], ".."), "script path must not contain .. traversal")
+}
+
+func TestDriver_ExecuteStep_NilStep(t *testing.T) {
+	cli := newMockDockerClient()
+	drv := NewDriver(cli, false)
+
+	res, err := drv.ExecuteStep(context.Background(), nil, nil, nil)
+	require.Error(t, err)
+	assert.Nil(t, res)
+	assert.Equal(t, "nil step specification", err.Error())
+}
+
+func TestDriver_ExecuteStep_GithubStateMapped(t *testing.T) {
+	cli := newMockDockerClient()
+	drv := NewDriver(cli, true)
+	tempDir := t.TempDir()
+	runnerTemp := filepath.Join(tempDir, "temp")
+
+	jobCtx := &driver.JobContext{
+		JobID:        "job-state",
+		WorkspaceDir: filepath.Join(tempDir, "workspace"),
+		TempDir:      runnerTemp,
+		Container:    &protocol.JobContainer{Image: "alpine:latest"},
+	}
+	require.NoError(t, drv.PrepareJob(context.Background(), jobCtx))
+
+	step := &driver.StepSpec{
+		ID:     "step-state",
+		Script: "echo 'var=val' >> $GITHUB_STATE",
+		Environment: map[string]string{
+			"GITHUB_STATE": filepath.Join(runnerTemp, "_runner_file_commands", "state_file"),
+		},
+	}
+	_, err := drv.ExecuteStep(context.Background(), step, nil, nil)
+	require.NoError(t, err)
+
+	found := false
+	for _, env := range cli.createdExecConfig.Env {
+		if strings.HasPrefix(env, "GITHUB_STATE=") {
+			found = true
+			assert.Equal(t, "GITHUB_STATE=/github/workflow/_runner_file_commands/state_file", env)
+		}
+	}
+	assert.True(t, found, "GITHUB_STATE must be translated to /github/workflow path")
+}
+
+func TestDriver_ExecuteStep_CancelKillsExecProcess(t *testing.T) {
+	cli := newMockDockerClient()
+	cli.execInspectResp = container.ExecInspect{
+		Running: true,
+		Pid:     4242,
+	}
+
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	conn := &mockConn{
+		onClose: func() {
+			_ = pw.Close()
+		},
+	}
+	cli.customHijacked = &types.HijackedResponse{
+		Reader: bufio.NewReader(pr),
+		Conn:   conn,
+	}
+
+	drv := NewDriver(cli, true)
+	tempDir := t.TempDir()
+	jobCtx := &driver.JobContext{
+		JobID:        "job-cancel-kill",
+		WorkspaceDir: filepath.Join(tempDir, "workspace"),
+		TempDir:      filepath.Join(tempDir, "temp"),
+		Container:    &protocol.JobContainer{Image: "alpine:latest"},
+	}
+	require.NoError(t, drv.PrepareJob(context.Background(), jobCtx))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	step := &driver.StepSpec{
+		ID:     "step-hang",
+		Script: "sleep 100",
+	}
+
+	var stdout, stderr bytes.Buffer
+	_, err := drv.ExecuteStep(ctx, step, &stdout, &stderr)
+	require.Error(t, err)
+
+	// Verify kill command was sent to container
+	cli.mu.Lock()
+	defer cli.mu.Unlock()
+	killFound := false
+	for _, cmd := range cli.createdExecCommands {
+		if len(cmd) == 3 && cmd[0] == "kill" && cmd[1] == "-KILL" && cmd[2] == "4242" {
+			killFound = true
+			break
+		}
+	}
+	assert.True(t, killFound, "expected kill -KILL 4242 exec command to be created on cancellation")
+}
+
+func TestDriver_PrepareJob_ContainerEnvMerged(t *testing.T) {
+	cli := newMockDockerClient()
+	drv := NewDriver(cli, true)
+	tempDir := t.TempDir()
+
+	jobCtx := &driver.JobContext{
+		JobID:        "job-env-merge",
+		WorkspaceDir: filepath.Join(tempDir, "workspace"),
+		TempDir:      filepath.Join(tempDir, "temp"),
+		Container: &protocol.JobContainer{
+			Image: "alpine:latest",
+			Environment: map[string]string{
+				"FOO": "BAR",
+				"BAZ": "QUX",
+			},
+		},
+	}
+	require.NoError(t, drv.PrepareJob(context.Background(), jobCtx))
+	require.NotNil(t, cli.createdConfig)
+	assert.Contains(t, cli.createdConfig.Env, "FOO=BAR")
+	assert.Contains(t, cli.createdConfig.Env, "BAZ=QUX")
 }
