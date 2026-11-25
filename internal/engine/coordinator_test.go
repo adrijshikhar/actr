@@ -3477,4 +3477,93 @@ func TestExecuteJob_ConcurrentJobsIsolateDriverAndMonitor(t *testing.T) {
 	wg.Wait()
 }
 
+func TestShouldExecuteStep_ExpressionParserEdgeCases(t *testing.T) {
+	ctx := map[string]any{
+		"inputs": map[string]any{"msg": "always()", "env": "prod"},
+		"github": map[string]any{"ref": "refs/heads/main"},
+	}
+
+	// Literal 'always()' inside quotes must NOT bypass jobFailed=true!
+	assert.False(t, shouldExecuteStep("inputs.msg == 'always()'", ctx, true, false))
+
+	// Multiple format() calls in one comparison must evaluate == rather than outer format(...)
+	assert.False(t, shouldExecuteStep("format('{0}', 'a') == format('{0}', 'b')", ctx, false, false))
+	assert.True(t, shouldExecuteStep("format('{0}', 'a') == format('{0}', 'a')", ctx, false, false))
+
+	// Tight operators without spaces + multiline condition
+	assert.True(t, shouldExecuteStep("startsWith(github.ref,'refs/heads/')&&\ninputs.env=='prod'", ctx, false, false))
+	assert.False(t, shouldExecuteStep("(inputs.env == ')') || false", ctx, false, false))
+
+	// Short-circuited false && true must compare equal to false
+	assert.True(t, shouldExecuteStep("(false && true) == false", ctx, false, false))
+}
+
+func TestExpressionEvaluator_BuiltinsAndOperators(t *testing.T) {
+	ws := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(ws, "go.mod"), []byte("module example.com/test\n"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(ws, "sub"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(ws, "sub", "main.go"), []byte("package main\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(ws, "sub", "skip.tmp"), []byte("ignored\n"), 0o644))
+
+	ctx := map[string]any{
+		"github": map[string]any{
+			"workspace": ws,
+		},
+		"a": map[string]any{
+			"b": []any{
+				map[string]any{"c": "hello", "hyphen-key": "world"},
+				map[string]any{"c": 42},
+			},
+		},
+		"arr": []any{"alpha", "beta", "gamma"},
+		"num": 10,
+	}
+
+	// Property chains & indexing
+	assert.Equal(t, "hello", evaluateExpression("a.b[0].c", ctx))
+	assert.Equal(t, "world", evaluateExpression("a.b[0].hyphen-key", ctx))
+	assert.Equal(t, "world", evaluateExpression("a.b[0]['hyphen-key']", ctx))
+	assert.Equal(t, "42", evaluateExpression("a.b[1].c", ctx))
+	assert.Equal(t, "", evaluateExpression("a.b[9].c", ctx))
+
+	// Precedence: || < && < comparison < !
+	assert.Equal(t, "true", evaluateExpression("true || false && false", ctx))
+	assert.Equal(t, "true", evaluateExpression("!(num < 5) && num >= 10", ctx))
+	assert.Equal(t, "true", evaluateExpression("num > 5 && num <= 10", ctx))
+	assert.Equal(t, "false", evaluateExpression("num > 10 || num < 10", ctx))
+	assert.Equal(t, "true", evaluateExpression("'apple' < 'Banana'", ctx))
+
+	// join, toJSON, fromJSON, contains
+	assert.Equal(t, "alpha|beta|gamma", evaluateExpression("join(arr, '|')", ctx))
+	assert.Equal(t, "alpha,beta,gamma", evaluateExpression("join(arr)", ctx))
+	assert.Equal(t, "true", evaluateExpression("contains(arr, 'BETA')", ctx))
+	assert.Equal(t, "false", evaluateExpression("contains(arr, 'delta')", ctx))
+	assert.Equal(t, "42", evaluateExpression("fromJSON('{\"k\":{\"v\":42}}').k.v", ctx))
+	assert.Equal(t, "b", evaluateExpression("fromJSON('[\"a\",\"b\"]')[1]", ctx))
+	assert.Contains(t, evaluateExpression("toJSON(a.b[0])", ctx), `"c": "hello"`)
+
+	// hashFiles with glob and exclusion
+	h1 := evaluateExpression("hashFiles('**/*.go', '!sub/*.tmp')", ctx)
+	h2 := evaluateExpression("hashFiles('go.mod')", ctx)
+	assert.Len(t, h1, 64)
+	assert.Len(t, h2, 64)
+	assert.NotEqual(t, h1, h2)
+	assert.Equal(t, "", evaluateExpression("hashFiles('nonexistent-*.xyz')", ctx))
+
+	// containsStatusCheckFunction ignores literals and detects real calls
+	assert.False(t, containsStatusCheckFunction("inputs.msg == 'always()'"))
+	assert.False(t, containsStatusCheckFunction("'success()' != 'failure()'"))
+	assert.True(t, containsStatusCheckFunction("always()"))
+	assert.True(t, containsStatusCheckFunction("${{ failure() && true }}"))
+	assert.True(t, containsStatusCheckFunction("cancelled() || success()"))
+
+	// Syntax errors and deep nesting fail closed in shouldExecuteStep
+	assert.False(t, shouldExecuteStep("inputs.a ==", ctx, false, false))
+	assert.False(t, shouldExecuteStep("'unterminated", ctx, false, false))
+	deep := strings.Repeat("(", 150) + "true" + strings.Repeat(")", 150)
+	assert.False(t, shouldExecuteStep(deep, ctx, false, false))
+}
+
+
+
 
