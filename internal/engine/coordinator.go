@@ -240,6 +240,8 @@ func (c *Coordinator) WithRenewInterval(interval time.Duration) *Coordinator {
 
 // WithOutput configures custom writers for step standard output and error streams.
 func (c *Coordinator) WithOutput(stdout, stderr io.Writer) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.stdout = stdout
 	c.stderr = stderr
 	return c
@@ -247,6 +249,8 @@ func (c *Coordinator) WithOutput(stdout, stderr io.Writer) *Coordinator {
 
 // WithStepLogger configures whether step output is formatted and prefixed.
 func (c *Coordinator) WithStepLogger(enabled bool) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.stepLoggerEnabled = enabled
 	return c
 }
@@ -395,6 +399,8 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	repoURL := c.repoURL
 	defaultRepo := c.defaultRepo
 	monSrv := c.monServer
+	jobStdout := c.stdout
+	stepLoggerEnabled := c.stepLoggerEnabled
 	c.mu.RUnlock()
 
 	if limits != nil && limits.Timeout > 0 {
@@ -665,8 +671,8 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		}
 	}
 
-	if cumulativeEnv["GITHUB_REPOSITORY"] == "" && c.defaultRepo != "" {
-		cumulativeEnv["GITHUB_REPOSITORY"] = c.defaultRepo
+	if cumulativeEnv["GITHUB_REPOSITORY"] == "" && defaultRepo != "" {
+		cumulativeEnv["GITHUB_REPOSITORY"] = defaultRepo
 	}
 	if cumulativeEnv["GITHUB_EVENT_NAME"] == "" {
 		cumulativeEnv["GITHUB_EVENT_NAME"] = "workflow_dispatch"
@@ -900,7 +906,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	conclusion = "success"
 	var postHooks []PostStepHook
 
-	stdout := c.stdout
+	stdout := jobStdout
 	if stdout == nil {
 		stdout = os.Stdout
 	}
@@ -940,7 +946,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	}
 
 	var stepLogger *StepLogger
-	if c.stepLoggerEnabled {
+	if stepLoggerEnabled {
 		stepLogger = NewStepLogger(jobDisplayName, stdout, c.colorEnabled).WithMasker(jobMasker)
 	}
 
@@ -1425,11 +1431,17 @@ func (c *Coordinator) executeActionStep(ctx context.Context, jobID, stepID, step
 func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, stepDisplayName, scriptDesc string, stepLogger *StepLogger, jobMasker *SecretMasker, jobSampler *monitor.TelemetrySampler, runFn func(stepCtx context.Context, stdout, stderr io.Writer) (*driver.StepResult, error)) (*driver.StepResult, time.Duration, error) {
 	c.NotifyStepStart(jobID, stepID, stepDisplayName)
 
+	c.mu.RLock()
 	stdout := c.stdout
+	stderr := c.stderr
+	monSrv := c.monServer
+	tracer := c.tracer
+	repoAlias := c.repoAlias
+	c.mu.RUnlock()
+
 	if stdout == nil {
 		stdout = os.Stdout
 	}
-	stderr := c.stderr
 	if stderr == nil {
 		stderr = os.Stderr
 	}
@@ -1438,12 +1450,6 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 	stepErrStream := stderr
 	var stepOutWriter *StepWriter
 	var stepErrWriter *StepWriter
-
-	c.mu.RLock()
-	monSrv := c.monServer
-	tracer := c.tracer
-	repoAlias := c.repoAlias
-	c.mu.RUnlock()
 	sampler := jobSampler
 
 	if jobMasker == nil {
@@ -2800,11 +2806,13 @@ func (c *Coordinator) executeSinglePostHook(ctx context.Context, jobID string, h
 		}
 	}
 
+	c.mu.RLock()
 	stdout := c.stdout
+	stderr := c.stderr
+	c.mu.RUnlock()
 	if stdout == nil {
 		stdout = os.Stdout
 	}
-	stderr := c.stderr
 	if stderr == nil {
 		stderr = os.Stderr
 	}
