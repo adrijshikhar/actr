@@ -226,5 +226,10 @@ func TestParseCommandFile_RejectsUnterminatedHeredocAndEmptyKey(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, m, "")
 	assert.Equal(t, "val", m["GOOD"])
+
+	p3 := filepath.Join(dir, "emptydelim")
+	require.NoError(t, os.WriteFile(p3, []byte("KEY<<\nhello\n"), 0o600))
+	_, err = ParseCommandFile(p3)
+	require.Error(t, err)
 }
 

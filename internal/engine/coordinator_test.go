@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -3380,7 +3381,68 @@ func TestGenerateCheckoutScript_AskpassAndPathTraversal(t *testing.T) {
 	assert.NotContains(t, script, "${GITHUB_TOKEN}@github.com")
 	assert.Contains(t, script, "GIT_ASKPASS")
 	assert.Contains(t, script, "ACTR_INTERNAL_TOKEN")
+	assert.Contains(t, script, `mktemp "${RUNNER_TEMP:-/tmp}/git-askpass-XXXXXX"`)
+	assert.NotContains(t, script, "git-askpass-XXXXXX.sh")
 	assert.Contains(t, script, "invalid checkout path traversal")
+
+	// Verify shell traversal guard rejects both ../escape and backslash sub\escape
+	ws := t.TempDir()
+	for _, badPath := range []string{"../escape", "/abs/path", `sub\escape`} {
+		cmd := exec.Command("sh", "-c", script)
+		cmd.Env = append(os.Environ(),
+			"GITHUB_WORKSPACE="+ws,
+			"ACTR_CHECKOUT_PATH="+badPath,
+			"ACTR_CHECKOUT_REPO=owner/repo",
+		)
+		out, err := cmd.CombinedOutput()
+		require.Error(t, err, "expected traversal path %q to be rejected", badPath)
+		assert.Contains(t, string(out), "invalid checkout path traversal")
+	}
+}
+
+func TestExecuteJob_FallbackStreamConcurrentWriteRace(t *testing.T) {
+	var sharedBuf bytes.Buffer
+	d := &mockDriver{
+		executeFunc: func(ctx context.Context, step *driver.StepSpec, stdout, stderr io.Writer) (*driver.StepResult, error) {
+			var wg sync.WaitGroup
+			for i := 0; i < 10; i++ {
+				wg.Add(2)
+				go func(n int) {
+					defer wg.Done()
+					_, _ = fmt.Fprintf(stdout, "out-%d token=super-secret-val\n", n)
+				}(i)
+				go func(n int) {
+					defer wg.Done()
+					_, _ = fmt.Fprintf(stderr, "err-%d token=super-secret-val\n", n)
+				}(i)
+			}
+			wg.Wait()
+			return &driver.StepResult{ExitCode: 0}, nil
+		},
+	}
+	coord := NewCoordinator(d, nil, t.TempDir()).
+		WithTracer(nil).
+		WithOutput(&sharedBuf, &sharedBuf).
+		WithStepLogger(false)
+
+	job := &protocol.JobSpecification{
+		JobID:    "fallback-race-job",
+		JobToken: "super-secret-val",
+		Steps:    []protocol.JobStep{{ID: "s1", Name: "concurrent-output", Script: "echo ok"}},
+	}
+	res, err := coord.ExecuteJob(context.Background(), job, "", "super-secret-val")
+	require.NoError(t, err)
+	assert.Equal(t, "success", res.Conclusion)
+	assert.NotContains(t, sharedBuf.String(), "super-secret-val")
+	assert.Contains(t, sharedBuf.String(), "***")
+}
+
+func TestHasPathPrefix(t *testing.T) {
+	sep := string(filepath.Separator)
+	assert.True(t, hasPathPrefix(sep+"tmp", sep))
+	assert.True(t, hasPathPrefix(filepath.Join(sep+"work", "job"), filepath.Join(sep+"work", "job")))
+	assert.True(t, hasPathPrefix(filepath.Join(sep+"work", "job", "sub"), filepath.Join(sep+"work", "job")))
+	assert.False(t, hasPathPrefix(filepath.Join(sep+"work", "job2"), filepath.Join(sep+"work", "job")))
 }
 
 func TestExecuteJob_ConcurrentJobsIsolateDriverAndMonitor(t *testing.T) {

@@ -280,13 +280,14 @@ func (c *Coordinator) Sampler() *monitor.TelemetrySampler {
 func (c *Coordinator) NotifyStepStart(jobID, stepID, stepName string) {
 	c.mu.RLock()
 	srv := c.monServer
+	repoAlias := c.repoAlias
 	c.mu.RUnlock()
 
 	if srv != nil {
 		srv.Publish(monitor.Event{
 			Type:      monitor.EventStepStart,
 			JobID:     jobID,
-			RepoAlias: c.repoAlias,
+			RepoAlias: repoAlias,
 			StepID:    stepID,
 			Step: &monitor.StepInfo{
 				ID:        stepID,
@@ -318,6 +319,7 @@ func (c *Coordinator) NotifyJobStepLog(jobID, stepID, line string) {
 func (c *Coordinator) NotifyStepFinish(jobID, stepID, stepName string, status monitor.StepStatus, exitCode ...int) {
 	c.mu.RLock()
 	srv := c.monServer
+	repoAlias := c.repoAlias
 	c.mu.RUnlock()
 
 	code := 0
@@ -331,7 +333,7 @@ func (c *Coordinator) NotifyStepFinish(jobID, stepID, stepName string, status mo
 		srv.Publish(monitor.Event{
 			Type:      monitor.EventStepFinish,
 			JobID:     jobID,
-			RepoAlias: c.repoAlias,
+			RepoAlias: repoAlias,
 			StepID:    stepID,
 			Step: &monitor.StepInfo{
 				ID:       stepID,
@@ -386,9 +388,18 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		ctx = context.Background()
 	}
 
-	if c.limits != nil && c.limits.Timeout > 0 {
+	c.mu.RLock()
+	limits := c.limits
+	tracer := c.tracer
+	repoAlias := c.repoAlias
+	repoURL := c.repoURL
+	defaultRepo := c.defaultRepo
+	monSrv := c.monServer
+	c.mu.RUnlock()
+
+	if limits != nil && limits.Timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, c.limits.Timeout)
+		ctx, cancel = context.WithTimeout(ctx, limits.Timeout)
 		defer cancel()
 	}
 
@@ -426,22 +437,18 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		}
 	}
 	if repo == "" {
-		repo = c.defaultRepo
+		repo = defaultRepo
 	}
 	if repo == "" {
-		repo = c.repoAlias
+		repo = repoAlias
 	}
 
 	jobStartTime := time.Now()
 	var jobSpan trace.Span
-	if c.tracer != nil {
-		ctx, jobSpan = c.tracer.StartJobSpan(ctx, jobID, workflowName, repo, owner)
+	if tracer != nil {
+		ctx, jobSpan = tracer.StartJobSpan(ctx, jobID, workflowName, repo, owner)
 		defer jobSpan.End()
 	}
-
-	c.mu.RLock()
-	monSrv := c.monServer
-	c.mu.RUnlock()
 
 	if monSrv != nil {
 		jobInfo := &monitor.JobInfo{
@@ -449,8 +456,8 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			Name:      jobDisplayName,
 			Workflow:  workflowName,
 			Repo:      repo,
-			RepoAlias: c.repoAlias,
-			RepoURL:   c.repoURL,
+			RepoAlias: repoAlias,
+			RepoURL:   repoURL,
 			Owner:     owner,
 			Status:    monitor.StatusRunning,
 			StartedAt: time.Now(),
@@ -471,7 +478,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		monSrv.Publish(monitor.Event{
 			Type:      monitor.EventJobStart,
 			JobID:     jobID,
-			RepoAlias: c.repoAlias,
+			RepoAlias: repoAlias,
 			Job:       jobInfo,
 			Driver:    driverName,
 		})
@@ -480,15 +487,15 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	conclusion := "success"
 	defer func() {
 		jobDuration := time.Since(jobStartTime)
-		if c.tracer != nil {
+		if tracer != nil {
 			if jobSpan != nil {
 				if conclusion != "success" {
-					c.tracer.RecordSpanError(jobSpan, fmt.Errorf("job failed with status %s", conclusion))
+					tracer.RecordSpanError(jobSpan, fmt.Errorf("job failed with status %s", conclusion))
 				} else {
 					jobSpan.SetStatus(codes.Ok, "")
 				}
 			}
-			c.tracer.RecordJobCompletion(ctx, jobID, workflowName, repo, owner, conclusion, jobDuration.Seconds())
+			tracer.RecordJobCompletion(ctx, jobID, workflowName, repo, owner, conclusion, jobDuration.Seconds())
 		}
 
 		c.mu.RLock()
@@ -506,15 +513,15 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			s.Publish(monitor.Event{
 				Type:      monitor.EventJobFinish,
 				JobID:     jobID,
-				RepoAlias: c.repoAlias,
+				RepoAlias: repoAlias,
 				Driver:    driverName,
 				Job: &monitor.JobInfo{
 					ID:        jobID,
 					Name:      jobDisplayName,
 					Workflow:  workflowName,
 					Repo:      repo,
-					RepoAlias: c.repoAlias,
-					RepoURL:   c.repoURL,
+					RepoAlias: repoAlias,
+					RepoURL:   repoURL,
 					Owner:     owner,
 					Status:    finalStatus,
 					EndedAt:   time.Now(),
@@ -849,7 +856,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		TempDir:        runnerTemp,
 		Container:      job.Container,
 		Environment:    cumulativeEnv,
-		Limits:         c.limits,
+		Limits:         limits,
 	}
 
 	if err := d.PrepareJob(ctx, jobCtx); err != nil {
@@ -1327,11 +1334,14 @@ func (c *Coordinator) executeStep(ctx context.Context, d driver.Driver, jobID st
 	}
 
 	return c.executeWithStreams(ctx, jobID, spec.ID, stepDisplayName, spec.Script, stepLogger, jobMasker, jobSampler, func(stepCtx context.Context, stdout, stderr io.Writer) (*driver.StepResult, error) {
-		if c.tracer != nil && spec != nil {
+		c.mu.RLock()
+		tracer := c.tracer
+		c.mu.RUnlock()
+		if tracer != nil && spec != nil {
 			if spec.Environment == nil {
 				spec.Environment = make(map[string]string)
 			}
-			c.tracer.InjectStepTraceContext(stepCtx, spec.Environment)
+			tracer.InjectStepTraceContext(stepCtx, spec.Environment)
 		}
 		return d.ExecuteStep(stepCtx, spec, stdout, stderr)
 	})
@@ -1431,6 +1441,8 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 
 	c.mu.RLock()
 	monSrv := c.monServer
+	tracer := c.tracer
+	repoAlias := c.repoAlias
 	c.mu.RUnlock()
 	sampler := jobSampler
 
@@ -1457,14 +1469,19 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 		stepOut = stepOutWriter
 		stepErrStream = stepErrWriter
 	} else {
+		var outMu sync.Mutex
 		stepOutWriter = NewLineWriter(func(line string) {
+			outMu.Lock()
 			_, _ = fmt.Fprintln(stdout, line)
+			outMu.Unlock()
 			if monSrv != nil {
 				c.NotifyJobStepLog(jobID, stepID, line)
 			}
 		}).WithMasker(jobMasker)
 		stepErrWriter = NewLineWriter(func(line string) {
+			outMu.Lock()
 			_, _ = fmt.Fprintln(stderr, line)
+			outMu.Unlock()
 			if monSrv != nil {
 				c.NotifyJobStepLog(jobID, stepID, line)
 			}
@@ -1477,8 +1494,8 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 	var stepSpan trace.Span
 	traceID := ""
 	spanID := ""
-	if c.tracer != nil {
-		ctx, stepSpan = c.tracer.StartStepSpan(ctx, stepID, stepDisplayName)
+	if tracer != nil {
+		ctx, stepSpan = tracer.StartStepSpan(ctx, stepID, stepDisplayName)
 		defer stepSpan.End()
 		if sc := stepSpan.SpanContext(); sc.IsValid() {
 			traceID = sc.TraceID().String()
@@ -1504,9 +1521,9 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 			defer ticker.Stop()
 
 			if sample := sampler.Sample(); sample != nil {
-				monSrv.SetJobTelemetry(jobID, c.repoAlias, sample)
-				if c.tracer != nil && c.tracer.Enabled() {
-					c.tracer.RecordTelemetrySample(ctx, jobID, c.repoAlias, sample)
+				monSrv.SetJobTelemetry(jobID, repoAlias, sample)
+				if tracer != nil && tracer.Enabled() {
+					tracer.RecordTelemetrySample(ctx, jobID, repoAlias, sample)
 				}
 			}
 
@@ -1516,9 +1533,9 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 					return
 				case <-ticker.C:
 					if sample := sampler.Sample(); sample != nil {
-						monSrv.SetJobTelemetry(jobID, c.repoAlias, sample)
-						if c.tracer != nil && c.tracer.Enabled() {
-							c.tracer.RecordTelemetrySample(ctx, jobID, c.repoAlias, sample)
+						monSrv.SetJobTelemetry(jobID, repoAlias, sample)
+						if tracer != nil && tracer.Enabled() {
+							tracer.RecordTelemetrySample(ctx, jobID, repoAlias, sample)
 						}
 					}
 				}
@@ -1558,22 +1575,22 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 
 	durationSec := duration.Seconds()
 	if success {
-		if c.tracer != nil {
+		if tracer != nil {
 			if stepSpan != nil {
-				c.tracer.FinishStepSpan(stepSpan, exitCode, "success")
+				tracer.FinishStepSpan(stepSpan, exitCode, "success")
 			}
-			c.tracer.RecordStepCompletion(ctx, stepID, stepDisplayName, "success", exitCode, durationSec)
+			tracer.RecordStepCompletion(ctx, stepID, stepDisplayName, "success", exitCode, durationSec)
 		}
 		c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusSuccess, exitCode)
 	} else {
-		if c.tracer != nil {
+		if tracer != nil {
 			if stepSpan != nil {
 				if stepErr != nil {
-					c.tracer.RecordSpanError(stepSpan, stepErr)
+					tracer.RecordSpanError(stepSpan, stepErr)
 				}
-				c.tracer.FinishStepSpan(stepSpan, exitCode, "failed")
+				tracer.FinishStepSpan(stepSpan, exitCode, "failed")
 			}
-			c.tracer.RecordStepCompletion(ctx, stepID, stepDisplayName, "failed", exitCode, durationSec)
+			tracer.RecordStepCompletion(ctx, stepID, stepDisplayName, "failed", exitCode, durationSec)
 		}
 		c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusFailed, exitCode)
 	}
@@ -1808,7 +1825,7 @@ func generateCheckoutScript(step protocol.JobStep, env map[string]string) string
 TARGET_DIR="${GITHUB_WORKSPACE}"
 if [ -n "$ACTR_CHECKOUT_PATH" ]; then
     case "$ACTR_CHECKOUT_PATH" in
-        /*|../*|*/../*|*/..|..)
+        /*|../*|*/../*|*/..|..|*\\*)
             echo "Error: invalid checkout path traversal: $ACTR_CHECKOUT_PATH" >&2
             exit 1
             ;;
@@ -1837,7 +1854,7 @@ fi
 CLONE_URL="https://github.com/${REPO_NAME}.git"
 ASKPASS_FILE=""
 if [ -n "${GITHUB_TOKEN}" ]; then
-    ASKPASS_FILE="$(mktemp "${RUNNER_TEMP:-/tmp}/git-askpass-XXXXXX.sh")"
+    ASKPASS_FILE="$(mktemp "${RUNNER_TEMP:-/tmp}/git-askpass-XXXXXX")"
     cat <<'EOF' > "$ASKPASS_FILE"
 #!/bin/sh
 case "$1" in
@@ -2824,12 +2841,17 @@ func (c *Coordinator) executeSinglePostHook(ctx context.Context, jobID string, h
 	} else {
 		rawOut := stdout
 		rawErr := stderr
+		var outMu sync.Mutex
 		lineOutWriter := NewLineWriter(func(line string) {
+			outMu.Lock()
 			_, _ = fmt.Fprintln(rawOut, line)
+			outMu.Unlock()
 			c.NotifyJobStepLog(jobID, hook.StepID, line)
 		}).WithMasker(jobMasker)
 		lineErrWriter := NewLineWriter(func(line string) {
+			outMu.Lock()
 			_, _ = fmt.Fprintln(rawErr, line)
+			outMu.Unlock()
 			c.NotifyJobStepLog(jobID, hook.StepID, line)
 		}).WithMasker(jobMasker)
 		stdout = lineOutWriter
@@ -2893,8 +2915,6 @@ func hasPathPrefix(p, prefix string) bool {
 	if cp == cpref {
 		return true
 	}
-	if cpref == string(filepath.Separator) {
-		return strings.HasPrefix(cp, cpref)
-	}
-	return strings.HasPrefix(cp, cpref+string(filepath.Separator))
+	sep := string(filepath.Separator)
+	return strings.HasPrefix(cp, strings.TrimSuffix(cpref, sep)+sep)
 }

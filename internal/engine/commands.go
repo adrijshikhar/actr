@@ -50,6 +50,9 @@ func ParseCommandFile(path string) (map[string]string, error) {
 				continue
 			}
 			delimiter = strings.TrimSpace(line[heredocIdx+2:])
+			if delimiter == "" {
+				return nil, fmt.Errorf("empty heredoc delimiter for key %q", currentKey)
+			}
 			inMultiLine = true
 			continue
 		}
