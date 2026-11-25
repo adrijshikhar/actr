@@ -44,6 +44,10 @@ type vaultPayload struct {
 // NewFileProvider returns an AES-256-GCM + Argon2id encrypted file vault provider.
 // If the vault file already exists at vaultPath, it is decrypted and loaded into memory.
 func NewFileProvider(vaultPath string, passphrase []byte) (*FileVaultProvider, error) {
+	if len(passphrase) == 0 {
+		return nil, errors.New("encrypted vault passphrase must not be empty")
+	}
+
 	p := &FileVaultProvider{
 		path:       vaultPath,
 		passphrase: append([]byte(nil), passphrase...),
@@ -150,16 +154,39 @@ func (p *FileVaultProvider) save() error {
 			return fmt.Errorf("create vault directory: %w", err)
 		}
 	}
+	if dir == "" {
+		dir = "."
+	}
 
-	tmpFile := p.path + ".tmp"
-	if err := os.WriteFile(tmpFile, output, 0o600); err != nil {
+	tmpFile, err := os.CreateTemp(dir, ".vault-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create vault temp file: %w", err)
+	}
+	tmpName := tmpFile.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if err := tmpFile.Chmod(0o600); err != nil {
+		return fmt.Errorf("chmod vault temp file: %w", err)
+	}
+	if _, err := tmpFile.Write(output); err != nil {
 		return fmt.Errorf("write vault temp file: %w", err)
 	}
-
-	if err := os.Rename(tmpFile, p.path); err != nil {
-		_ = os.Remove(tmpFile)
+	if err := tmpFile.Sync(); err != nil {
+		return fmt.Errorf("sync vault temp file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close vault temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, p.path); err != nil {
 		return fmt.Errorf("rename vault file: %w", err)
 	}
+	cleanup = false
 
 	return nil
 }

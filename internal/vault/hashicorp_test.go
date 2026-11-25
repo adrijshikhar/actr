@@ -116,3 +116,47 @@ func TestHashiCorpVaultProvider_Errors(t *testing.T) {
 	_, err = pBadJSON.List(ctx)
 	assert.Error(t, err)
 }
+
+func TestHashiCorpVaultProvider_BlocksRedirectsAndRejectsNullOrInsecure(t *testing.T) {
+	ctx := context.Background()
+
+	// Reject non-loopback HTTP and empty address
+	_, err := NewHashiCorpVaultProvider("", "tok", "secret", "ci").Get(ctx, "KEY")
+	require.Error(t, err)
+	_, err = NewHashiCorpVaultProvider("http://vault.example.com:8200", "tok", "secret", "ci").Get(ctx, "KEY")
+	require.Error(t, err)
+
+	// Block HTTP redirects (must not follow and must not forward token)
+	var targetHit bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetHit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	pRedirect := NewHashiCorpVaultProvider(redirector.URL, "super-secret-token", "secret", "ci")
+	_, err = pRedirect.Get(ctx, "KEY")
+	require.Error(t, err)
+	assert.False(t, targetHit, "redirect target must never be requested")
+
+	// Handle null JSON secret value explicitly instead of returning "<nil>"
+	nullServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"data":{"NULL_KEY":null,"NUM_KEY":12345678901234567890}}}`))
+	}))
+	defer nullServer.Close()
+
+	pNull := NewHashiCorpVaultProvider(nullServer.URL, "tok", "secret", "ci")
+	val, err := pNull.Get(ctx, "NULL_KEY")
+	require.Error(t, err)
+	assert.NotEqual(t, "<nil>", val)
+
+	numVal, err := pNull.Get(ctx, "NUM_KEY")
+	require.NoError(t, err)
+	assert.Equal(t, "12345678901234567890", numVal)
+}

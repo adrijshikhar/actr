@@ -48,7 +48,11 @@ func TestFactory_ConfiguredProviders_Chained(t *testing.T) {
 		TrustedOnly: true,
 		Providers: []config.VaultProviderYAMLConfig{
 			{Type: "keychain", Label: "com.github.actr.custom"},
-			{Type: "encrypted-file", Path: filepath.Join(tmpDir, "vault.enc")},
+			{
+				Type: "encrypted-file",
+				Path: filepath.Join(tmpDir, "vault.enc"),
+				Auth: map[string]string{"passphrase": "chained-passphrase"},
+			},
 		},
 	}
 
@@ -105,6 +109,7 @@ func TestFactory_SingleProvider_EncryptedFile(t *testing.T) {
 }
 
 func TestFactory_SingleProvider_EncryptedFile_DefaultPath(t *testing.T) {
+	t.Setenv("ACTR_VAULT_PASSPHRASE", "env-default-passphrase")
 	tmpDir := t.TempDir()
 	cfg := &config.VaultYAMLConfig{
 		Enabled: true,
@@ -177,7 +182,11 @@ func TestFactory_EncryptedFile_Corrupted(t *testing.T) {
 	cfg := &config.VaultYAMLConfig{
 		Enabled: true,
 		Providers: []config.VaultProviderYAMLConfig{
-			{Type: "encrypted-file", Path: corruptPath},
+			{
+				Type: "encrypted-file",
+				Path: corruptPath,
+				Auth: map[string]string{"passphrase": "corrupt-test-passphrase"},
+			},
 		},
 	}
 
@@ -199,4 +208,38 @@ func TestFactory_UnsupportedProviderType(t *testing.T) {
 	assert.Error(t, err)
 	assert.Nil(t, p)
 	assert.Contains(t, err.Error(), `unsupported vault provider type: "invalid-type"`)
+}
+
+func TestNewProviderFromConfig_RejectsMissingFilePassphrase(t *testing.T) {
+	t.Setenv("ACTR_VAULT_PASSPHRASE", "")
+	_, err := NewProviderFromConfig(&config.VaultYAMLConfig{
+		Providers: []config.VaultProviderYAMLConfig{{Type: "encrypted-file", Path: filepath.Join(t.TempDir(), "vault.enc")}},
+	}, t.TempDir())
+	require.Error(t, err)
+
+	_, err = NewFileProvider(filepath.Join(t.TempDir(), "vault.enc"), nil)
+	require.Error(t, err)
+
+	_, err = NewFileProvider(filepath.Join(t.TempDir(), "vault.enc"), []byte{})
+	require.Error(t, err)
+}
+
+func TestLoadOrCreateDefaultVaultKey(t *testing.T) {
+	dir := t.TempDir()
+
+	key1, err := loadOrCreateDefaultVaultKey(dir)
+	require.NoError(t, err)
+	require.Len(t, key1, defaultVaultKeyBytes)
+
+	keyPath := filepath.Join(dir, "vault.key")
+	info, err := os.Stat(keyPath)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+
+	key2, err := loadOrCreateDefaultVaultKey(dir)
+	require.NoError(t, err)
+	assert.Equal(t, key1, key2)
+
+	_, err = loadOrCreateDefaultVaultKey("")
+	require.Error(t, err)
 }
