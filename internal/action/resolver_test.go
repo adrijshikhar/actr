@@ -21,6 +21,168 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestResolve_RejectsDotAndSlashVersions(t *testing.T) {
+	baseDir := t.TempDir()
+	keepDir := filepath.Join(baseDir, "_actions", "org", "repo", "v1")
+	require.NoError(t, os.MkdirAll(keepDir, 0o755))
+
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gw)
+	hdr := &tar.Header{Name: "repo/action.yml", Mode: 0644, Size: int64(len("runs:\n  using: node20\n"))}
+	require.NoError(t, tw.WriteHeader(hdr))
+	_, err := tw.Write([]byte("runs:\n  using: node20\n"))
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+	require.NoError(t, gw.Close())
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(buf.Bytes())
+	}))
+	defer srv.Close()
+
+	r := action.NewActionResolver(baseDir, srv.Client())
+	r.BaseURL = srv.URL
+	for _, badVer := range []string{".", "./v1", "feature/branch", `..\other`, "foo/.."} {
+		_, err := r.Resolve(context.Background(), &protocol.StepReference{
+			Name:    "org/repo",
+			Version: badVer,
+		})
+		require.Error(t, err, "version %q must be rejected", badVer)
+		assert.ErrorIs(t, err, action.ErrPathTraversal, "version %q must be ErrPathTraversal", badVer)
+	}
+	assert.DirExists(t, keepDir)
+}
+
+func TestResolve_RejectsMultiEntrySymlinkAndHardlinkEscape(t *testing.T) {
+	var buf bytes.Buffer
+	gzw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gzw)
+
+	entries := []struct {
+		hdr  tar.Header
+		body string
+	}{
+		{hdr: tar.Header{Name: "repo-v1/a/b/c/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		{hdr: tar.Header{Name: "repo-v1/a/b/c/up", Typeflag: tar.TypeSymlink, Linkname: "../../..", Mode: 0o777}},
+		// Lexical Dir(a/b/c/up) + ../../../etc previously stayed inside cleanDest even though up -> cleanDest
+		{hdr: tar.Header{Name: "repo-v1/a/b/c/up/escape", Typeflag: tar.TypeSymlink, Linkname: "../../../etc", Mode: 0o777}},
+	}
+	for _, e := range entries {
+		if e.body != "" {
+			e.hdr.Size = int64(len(e.body))
+		}
+		require.NoError(t, tw.WriteHeader(&e.hdr))
+		if e.body != "" {
+			_, err := tw.Write([]byte(e.body))
+			require.NoError(t, err)
+		}
+	}
+	require.NoError(t, tw.Close())
+	require.NoError(t, gzw.Close())
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(buf.Bytes())
+	}))
+	defer srv.Close()
+
+	baseDir := t.TempDir()
+	r := action.NewActionResolver(baseDir, srv.Client())
+	r.BaseURL = srv.URL
+
+	_, err := r.Resolve(context.Background(), &protocol.StepReference{
+		Name:    "org/repo",
+		Version: "v1",
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, action.ErrPathTraversal)
+}
+
+func TestResolve_RejectsHardlinkTargetingSymlink(t *testing.T) {
+	var buf bytes.Buffer
+	gzw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gzw)
+
+	entries := []struct {
+		hdr  tar.Header
+		body string
+	}{
+		{hdr: tar.Header{Name: "repo-v1/target.txt", Typeflag: tar.TypeReg, Mode: 0o644}, body: "target"},
+		{hdr: tar.Header{Name: "repo-v1/sym", Typeflag: tar.TypeSymlink, Linkname: "target.txt", Mode: 0o777}},
+		{hdr: tar.Header{Name: "repo-v1/hardlink", Typeflag: tar.TypeLink, Linkname: "repo-v1/sym", Mode: 0o644}},
+	}
+	for _, e := range entries {
+		if e.body != "" {
+			e.hdr.Size = int64(len(e.body))
+		}
+		require.NoError(t, tw.WriteHeader(&e.hdr))
+		if e.body != "" {
+			_, err := tw.Write([]byte(e.body))
+			require.NoError(t, err)
+		}
+	}
+	require.NoError(t, tw.Close())
+	require.NoError(t, gzw.Close())
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(buf.Bytes())
+	}))
+	defer srv.Close()
+
+	baseDir := t.TempDir()
+	r := action.NewActionResolver(baseDir, srv.Client())
+	r.BaseURL = srv.URL
+
+	_, err := r.Resolve(context.Background(), &protocol.StepReference{
+		Name:    "org/repo",
+		Version: "v1",
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, action.ErrPathTraversal)
+}
+
+func TestResolve_NormalizesWindowsBackslashesInTar(t *testing.T) {
+	var buf bytes.Buffer
+	gzw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gzw)
+
+	entries := []struct {
+		hdr  tar.Header
+		body string
+	}{
+		{hdr: tar.Header{Name: "repo-v1\\sub\\action.yml", Typeflag: tar.TypeReg, Mode: 0o644}, body: "runs:\n  using: node20\n  main: index.js\n"},
+	}
+	for _, e := range entries {
+		if e.body != "" {
+			e.hdr.Size = int64(len(e.body))
+		}
+		require.NoError(t, tw.WriteHeader(&e.hdr))
+		if e.body != "" {
+			_, err := tw.Write([]byte(e.body))
+			require.NoError(t, err)
+		}
+	}
+	require.NoError(t, tw.Close())
+	require.NoError(t, gzw.Close())
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(buf.Bytes())
+	}))
+	defer srv.Close()
+
+	baseDir := t.TempDir()
+	r := action.NewActionResolver(baseDir, srv.Client())
+	r.BaseURL = srv.URL
+
+	dest, err := r.Resolve(context.Background(), &protocol.StepReference{
+		Name:    "org/repo",
+		Version: "v1",
+	})
+	require.NoError(t, err)
+	assert.FileExists(t, filepath.Join(dest, "sub", "action.yml"))
+}
+
+
 type tarEntry struct {
 	Name     string
 	Content  string
@@ -425,4 +587,52 @@ func TestActionResolver_LockContentionContextCanceled(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled), "expected context deadline/canceled error, got: %v", err)
 	assert.Less(t, elapsed, 1*time.Second, "lock acquisition did not respect context timeout")
+}
+
+func TestResolve_PostExtractionSymlinkVerification(t *testing.T) {
+	t.Run("rejects dangling symlink after extraction without writing marker", func(t *testing.T) {
+		archiveData := createTarGz(t, []tarEntry{
+			{Name: "repo-v1/action.yml", Content: "runs:\n  using: node20\n  main: index.js\n"},
+			{Name: "repo-v1/dangling", Typeflag: tar.TypeSymlink, Linkname: "does-not-exist", Mode: 0o777},
+		})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write(archiveData)
+		}))
+		defer srv.Close()
+
+		baseDir := t.TempDir()
+		r := action.NewActionResolver(baseDir, srv.Client())
+		r.BaseURL = srv.URL
+
+		_, err := r.Resolve(context.Background(), &protocol.StepReference{
+			Name:    "org/dangling-repo",
+			Version: "v1",
+		})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, action.ErrPathTraversal)
+		assert.NoFileExists(t, filepath.Join(baseDir, "_actions", "org", "dangling-repo", "v1.completed"))
+	})
+
+	t.Run("allows valid internal symlink resolving within destination", func(t *testing.T) {
+		archiveData := createTarGz(t, []tarEntry{
+			{Name: "repo-v1/action.yml", Content: "runs:\n  using: node20\n  main: index.js\n"},
+			{Name: "repo-v1/index.js", Content: "console.log('ok');"},
+			{Name: "repo-v1/alias.js", Typeflag: tar.TypeSymlink, Linkname: "index.js", Mode: 0o777},
+		})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write(archiveData)
+		}))
+		defer srv.Close()
+
+		baseDir := t.TempDir()
+		r := action.NewActionResolver(baseDir, srv.Client())
+		r.BaseURL = srv.URL
+
+		dest, err := r.Resolve(context.Background(), &protocol.StepReference{
+			Name:    "org/valid-sym-repo",
+			Version: "v1",
+		})
+		require.NoError(t, err)
+		assert.FileExists(t, filepath.Join(dest, "alias.js"))
+	})
 }

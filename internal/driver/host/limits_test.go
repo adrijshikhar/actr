@@ -239,3 +239,24 @@ func TestHostDriver_ExecuteStep_LimiterMarkedOOM(t *testing.T) {
 	assert.True(t, res.OOMKilled, "res.OOMKilled should be true when limiter marked pid as OOM killed")
 	assert.Equal(t, 137, res.ExitCode, "exit code should be set to 137 on OOM kill")
 }
+
+func TestKillProcessGroupOrPID_ZeroOrNegative(t *testing.T) {
+	// Must return safely without sending signals to self (0) or all processes (-1)
+	killProcessGroupOrPID(0)
+	killProcessGroupOrPID(-1)
+	killProcessGroupOrPID(-100)
+}
+
+func TestGetProcessTreeRSS_DeepTree(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "sh -c 'sleep 0.5'")
+	require.NoError(t, cmd.Start())
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	rss, err := getProcessTreeRSS(cmd.Process.Pid)
+	require.NoError(t, err)
+	assert.Greater(t, rss, uint64(0))
+}

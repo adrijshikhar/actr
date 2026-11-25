@@ -15,7 +15,11 @@ import (
 
 	"github.com/adrijshikhar/actr/internal/config"
 	"github.com/adrijshikhar/actr/internal/driver"
+	"github.com/adrijshikhar/actr/internal/logger"
 )
+
+var _ driver.Driver = (*Driver)(nil)
+var _ driver.Cloneable = (*Driver)(nil)
 
 // Driver executes GitHub Actions steps on bare-metal host processes.
 type Driver struct {
@@ -28,6 +32,15 @@ type Driver struct {
 func NewDriver() *Driver {
 	return &Driver{
 		limiter: NewHostLimiter(),
+	}
+}
+
+// Clone creates a shallow clone of the host driver with a shared limiter but isolated job limits state.
+func (d *Driver) Clone() driver.Driver {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return &Driver{
+		limiter: d.limiter,
 	}
 }
 
@@ -79,6 +92,10 @@ func (d *Driver) PrepareJob(ctx context.Context, job *driver.JobContext) error {
 
 // ExecuteStep runs a single GitHub Actions step script as a local OS process with resource limits applied.
 func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout, stderr io.Writer) (*driver.StepResult, error) {
+	if step == nil {
+		return nil, errors.New("nil step specification")
+	}
+
 	workDir := step.WorkingDirectory
 	if workDir == "" {
 		workDir = "."
@@ -124,7 +141,7 @@ func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout,
 	}
 
 	// Environment layering
-	cmd.Env = os.Environ()
+	cmd.Env = sanitizeHostEnviron(os.Environ())
 	for k, v := range step.Environment {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
 	}
@@ -142,12 +159,21 @@ func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout,
 	limiter := d.limiter
 	d.mu.Unlock()
 
-	var cleanupLimits func()
+	var (
+		cleanupLimits func()
+		cleanupOnce   sync.Once
+	)
 	if limiter != nil && limits != nil {
-		cleanupLimits, _ = limiter.Apply(ctx, cmd.Process.Pid, limits)
-	}
-	if cleanupLimits != nil {
-		defer cleanupLimits()
+		rawCleanup, applyErr := limiter.Apply(ctx, cmd.Process.Pid, limits)
+		if applyErr != nil {
+			logger.Warn("failed to apply host process limits", "pid", cmd.Process.Pid, "error", applyErr)
+		}
+		if rawCleanup != nil {
+			cleanupLimits = func() {
+				cleanupOnce.Do(rawCleanup)
+			}
+			defer cleanupLimits()
+		}
 	}
 
 	if step.OnProcessStart != nil && cmd.Process != nil {
@@ -155,9 +181,14 @@ func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout,
 	}
 
 	err = cmd.Wait()
+	if cleanupLimits != nil {
+		cleanupLimits()
+	}
+
 	exitCode := 0
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
 			exitCode = exitErr.ExitCode()
 			if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
 				exitCode = 128 + int(ws.Signal())
@@ -168,10 +199,16 @@ func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout,
 	}
 
 	oomKilled := false
-	if limiter != nil && limiter.IsOOMKilled(cmd.Process.Pid) {
+	if limiter != nil && cmd.Process != nil && limiter.IsOOMKilled(cmd.Process.Pid) {
 		oomKilled = true
 	} else if exitCode == 137 && ctx.Err() == nil && limits != nil && limits.Memory > 0 {
 		oomKilled = true
+	}
+
+	if limiter != nil && cmd.Process != nil {
+		if c, ok := limiter.(interface{ ClearPID(int) }); ok {
+			c.ClearPID(cmd.Process.Pid)
+		}
 	}
 
 	if oomKilled {
@@ -194,6 +231,37 @@ func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout,
 		OOMKilled: oomKilled,
 		Error:     stepErr,
 	}, stepErr
+}
+
+func sanitizeHostEnviron(env []string) []string {
+	sanitized := make([]string, 0, len(env))
+	for _, kv := range env {
+		idx := strings.IndexByte(kv, '=')
+		if idx == -1 {
+			continue
+		}
+		key := kv[:idx]
+		if isBlockedHostEnv(key) {
+			continue
+		}
+		sanitized = append(sanitized, kv)
+	}
+	return sanitized
+}
+
+func isBlockedHostEnv(key string) bool {
+	upper := strings.ToUpper(key)
+	if strings.HasPrefix(upper, "AWS_") ||
+		strings.HasPrefix(upper, "LD_") ||
+		strings.HasPrefix(upper, "DYLD_") {
+		return true
+	}
+	switch upper {
+	case "GITHUB_TOKEN", "GH_TOKEN", "SSH_AUTH_SOCK", "NODE_OPTIONS", "HOMEBREW_GITHUB_API_TOKEN":
+		return true
+	default:
+		return false
+	}
 }
 
 // CleanupJob terminates any job-level state and clears current limits.

@@ -133,6 +133,33 @@ runs:
 	})
 }
 
+func TestActionInput_NullDefaultIsEmpty(t *testing.T) {
+	raw := []byte("runs:\n  using: node20\n  main: dist/index.js\ninputs:\n  tok:\n    default: null\n  tilde:\n    default: ~\n")
+	m, err := action.ParseManifest(raw)
+	require.NoError(t, err)
+	assert.Equal(t, "", m.Inputs["tok"].Default)
+	assert.Equal(t, "", m.Inputs["tilde"].Default)
+}
+
+func TestParseManifestFile_RejectsSymlinkOutsideDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	outsideDir := t.TempDir()
+
+	outsideManifest := filepath.Join(outsideDir, "action.yml")
+	err := os.WriteFile(outsideManifest, []byte("runs:\n  using: node20\n  main: index.js\n"), 0o600)
+	require.NoError(t, err)
+
+	symlinkPath := filepath.Join(tmpDir, "action.yml")
+	err = os.Symlink(outsideManifest, symlinkPath)
+	require.NoError(t, err)
+
+	manifest, err := action.ParseManifestFile(tmpDir)
+	assert.Error(t, err)
+	assert.Nil(t, manifest)
+	assert.ErrorIs(t, err, action.ErrPathTraversal)
+}
+
+
 func TestParseManifestFile(t *testing.T) {
 	t.Run("prefers action.yml over action.yaml", func(t *testing.T) {
 		tmpDir := t.TempDir()

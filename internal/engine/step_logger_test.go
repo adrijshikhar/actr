@@ -2,9 +2,13 @@ package engine
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestStepLogger_PrefixAndColor(t *testing.T) {
@@ -366,3 +370,37 @@ func TestNewLineWriter_SharedMaskerAcrossStreams(t *testing.T) {
 		t.Errorf("expected stderr line %q, got %q", expected, errLines[0])
 	}
 }
+
+func TestStepWriter_ConcurrentMaskingRace(t *testing.T) {
+	var buf bytes.Buffer
+	sl := NewStepLogger("job-race", &buf, false)
+	sw := sl.NewWriter("stdout")
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			secret := fmt.Sprintf("secret-%d", id)
+			sw.AddMask(secret)
+			_ = sw.Mask(fmt.Sprintf("text with %s and more", secret))
+			if id%3 == 0 {
+				sw.WithMasker(NewSecretMasker())
+			}
+			_, _ = fmt.Fprintf(sw, "line %d with %s\n", id, secret)
+			sw.Flush()
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestSecretMasker_MultilineSecretSplitsLines(t *testing.T) {
+	sm := NewSecretMasker()
+	sm.AddMask("line1-secret\nline2-token\nshort\n")
+
+	out := sm.Mask("hello line1-secret and line2-token and short")
+	assert.Contains(t, out, "***")
+	assert.NotContains(t, out, "line1-secret")
+	assert.NotContains(t, out, "line2-token")
+}
+

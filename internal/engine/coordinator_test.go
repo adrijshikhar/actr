@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -21,10 +22,12 @@ import (
 	"github.com/adrijshikhar/actr/internal/action"
 	"github.com/adrijshikhar/actr/internal/config"
 	"github.com/adrijshikhar/actr/internal/driver"
+	"github.com/adrijshikhar/actr/internal/driver/host"
 	"github.com/adrijshikhar/actr/internal/monitor"
 	"github.com/adrijshikhar/actr/internal/protocol"
 	"github.com/adrijshikhar/actr/internal/vault"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // mockDriver is a test double implementing driver.Driver.
@@ -383,8 +386,9 @@ func TestCoordinator_StandardEnvironmentAndWorkspace(t *testing.T) {
 		t.Fatal("recordedStep was nil")
 	}
 
-	// WorkingDirectory should resolve relative to GITHUB_WORKSPACE
-	expectedWorkDir := filepath.Join(workDir, "my-build-job", "custom-subdir")
+	// WorkingDirectory should resolve relative to per-job GITHUB_WORKSPACE
+	expectedWorkspace := filepath.Join(workDir, "my-build-job-job-env-test")
+	expectedWorkDir := filepath.Join(expectedWorkspace, "custom-subdir")
 	if recordedStep.WorkingDirectory != expectedWorkDir {
 		t.Errorf("expected WorkingDirectory %q, got %q", expectedWorkDir, recordedStep.WorkingDirectory)
 	}
@@ -396,14 +400,13 @@ func TestCoordinator_StandardEnvironmentAndWorkspace(t *testing.T) {
 
 	// Standard variables
 	env := recordedStep.Environment
-	expectedWorkspace := filepath.Join(workDir, "my-build-job")
 	if env["GITHUB_WORKSPACE"] != expectedWorkspace {
 		t.Errorf("expected GITHUB_WORKSPACE %q, got %q", expectedWorkspace, env["GITHUB_WORKSPACE"])
 	}
 	if env["RUNNER_WORKSPACE"] != workDir {
 		t.Errorf("expected RUNNER_WORKSPACE %q, got %q", workDir, env["RUNNER_WORKSPACE"])
 	}
-	expectedTemp := filepath.Join(workDir, "_temp")
+	expectedTemp := filepath.Join(workDir, "_temp", "job-env-test")
 	if env["RUNNER_TEMP"] != expectedTemp {
 		t.Errorf("expected RUNNER_TEMP %q, got %q", expectedTemp, env["RUNNER_TEMP"])
 	}
@@ -1063,11 +1066,12 @@ func TestCoordinator_ExecuteJob_ProcessStartPIDAndJobEvents(t *testing.T) {
 	}
 	defer func() { _ = server.Stop() }()
 
-	var capturedPIDDuringStep int32
 	mock := &mockDriver{
 		executeFunc: func(ctx context.Context, step *driver.StepSpec, stdout, stderr io.Writer) (*driver.StepResult, error) {
-			if step.OnProcessStart != nil {
-				step.OnProcessStart(12345, 12345)
+			if step.ID == "step-pid" {
+				if step.OnProcessStart != nil {
+					step.OnProcessStart(12345, 12345)
+				}
 			}
 			// wait briefly for telemetry sampler (ticker runs every 500ms)
 			time.Sleep(550 * time.Millisecond)
@@ -1077,17 +1081,6 @@ func TestCoordinator_ExecuteJob_ProcessStartPIDAndJobEvents(t *testing.T) {
 
 	coord := NewCoordinator(mock, nil, filepath.Join(tmpDir, "work")).WithStepLogger(true).WithRepoAlias("cxstatusline")
 	coord.SetMonitorServer(server)
-
-	// Wrap executeFunc to capture PID while process is running
-	origExec := mock.executeFunc
-	mock.executeFunc = func(ctx context.Context, step *driver.StepSpec, stdout, stderr io.Writer) (*driver.StepResult, error) {
-		res, err := origExec(ctx, step, stdout, stderr)
-		if coord.Sampler() != nil {
-			sample := coord.Sampler().Sample()
-			capturedPIDDuringStep = sample.PID
-		}
-		return res, err
-	}
 
 	client := monitor.NewClient(sockPath)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1113,6 +1106,7 @@ func TestCoordinator_ExecuteJob_ProcessStartPIDAndJobEvents(t *testing.T) {
 		JobName: "Verify PID & Job Events",
 		Steps: []protocol.JobStep{
 			{ID: "step-pid", Name: "PID Step", Script: "echo test"},
+			{ID: "step-no-pid", Name: "No PID Step", Script: "echo after"},
 		},
 	}
 
@@ -1133,7 +1127,7 @@ func TestCoordinator_ExecuteJob_ProcessStartPIDAndJobEvents(t *testing.T) {
 	copy(evs, received)
 	mu.Unlock()
 
-	var gotJobStart, gotJobFinish, gotStepStart, gotStepFinish, gotTelemetryWithPID bool
+	var gotJobStart, gotJobFinish, gotStepStart, gotStepFinish, gotTelemetryWithPID, gotResetTelemetry bool
 	for _, ev := range evs {
 		switch ev.Type {
 		case monitor.EventJobStart:
@@ -1156,6 +1150,9 @@ func TestCoordinator_ExecuteJob_ProcessStartPIDAndJobEvents(t *testing.T) {
 			if ev.Telemetry != nil && ev.Telemetry.PID == 12345 {
 				gotTelemetryWithPID = true
 			}
+			if ev.Telemetry != nil && ev.Telemetry.ActiveStepName == "No PID Step" && ev.Telemetry.PID == 0 {
+				gotResetTelemetry = true
+			}
 		}
 	}
 
@@ -1174,16 +1171,15 @@ func TestCoordinator_ExecuteJob_ProcessStartPIDAndJobEvents(t *testing.T) {
 	if !gotTelemetryWithPID {
 		t.Error("expected EventTelemetry with PID 12345")
 	}
-
-	if capturedPIDDuringStep != 12345 {
-		t.Errorf("expected sampler target PID during step to be 12345, got %d", capturedPIDDuringStep)
+	if !gotResetTelemetry {
+		t.Error("expected EventTelemetry for subsequent step to have PID reset to 0")
 	}
 
-	// Verify sampler target PID was reset to 0 after step defer
+	// Verify shared coordinator sampler was not mutated by per-job execution
 	if coord.Sampler() != nil {
 		sample := coord.Sampler().Sample()
 		if sample.PID != 0 {
-			t.Errorf("expected sampler target PID to be reset to 0 after step completion, got %d", sample.PID)
+			t.Errorf("expected shared coordinator sampler PID to remain 0, got %d", sample.PID)
 		}
 	}
 }
@@ -3274,3 +3270,346 @@ func TestIsTrustedContext(t *testing.T) {
 		})
 	}
 }
+
+func TestExecuteJob_SanitizesJobNameTraversalAndProtectsSiblingDirs(t *testing.T) {
+	baseDir := t.TempDir()
+	sentinel := filepath.Join(baseDir, "do-not-delete")
+	require.NoError(t, os.MkdirAll(sentinel, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(sentinel, "keep.txt"), []byte("ok"), 0o644))
+
+	coord := NewCoordinator(host.NewDriver(), nil, baseDir).WithTracer(nil)
+	job := &protocol.JobSpecification{
+		JobID:   "job-123",
+		JobName: "../do-not-delete",
+		Steps:   []protocol.JobStep{{ID: "s1", Name: "ok", Script: "pwd"}},
+	}
+	res, err := coord.ExecuteJob(context.Background(), job, "", "")
+	require.NoError(t, err)
+	assert.Equal(t, "success", res.Conclusion)
+	assert.FileExists(t, filepath.Join(sentinel, "keep.txt"))
+}
+
+func TestExecuteJob_MasksStdoutEvenWithoutStepLoggerAndMonitor(t *testing.T) {
+	var buf bytes.Buffer
+	coord := NewCoordinator(host.NewDriver(), nil, t.TempDir()).
+		WithTracer(nil).
+		WithOutput(&buf, &buf)
+	coord.stepLoggerEnabled = false
+
+	job := &protocol.JobSpecification{
+		JobID:    "mask-job",
+		JobToken: "super-secret-job-token",
+		Steps:    []protocol.JobStep{{ID: "s1", Name: "echo", Script: `echo "tok=super-secret-job-token"`}},
+	}
+	_, err := coord.ExecuteJob(context.Background(), job, "", "super-secret-job-token")
+	require.NoError(t, err)
+	assert.NotContains(t, buf.String(), "super-secret-job-token")
+	assert.Contains(t, buf.String(), "***")
+}
+
+func TestIsCheckoutStep_OnlyBuiltInCheckout(t *testing.T) {
+	assert.False(t, isCheckoutStep(protocol.JobStep{Name: "checkout", Reference: &protocol.StepReference{Name: "org/custom-checkout-helper", Version: "v1"}}))
+	assert.True(t, isCheckoutStep(protocol.JobStep{Name: "Checkout repo", Reference: &protocol.StepReference{Name: "actions/checkout", Version: "v4"}}))
+}
+
+func TestExecuteJob_ForbiddenEnvKeys_DroppedFromJobAndStep(t *testing.T) {
+	d := &mockDriver{}
+	coord := NewCoordinator(d, nil, t.TempDir()).WithTracer(nil)
+	job := &protocol.JobSpecification{
+		JobID: "forbidden-env-job",
+		Environment: map[string]string{
+			"NODE_OPTIONS":    "--inspect=0.0.0.0",
+			"node_options":    "--inspect=evil",
+			"CUSTOM_SAFE_VAR": "safe_val",
+		},
+		Steps: []protocol.JobStep{
+			{
+				ID:   "s1",
+				Name: "check-env",
+				Environment: map[string]string{
+					"LD_PRELOAD":     "/malicious.so",
+					"STEP_SAFE_VAR":  "step_val",
+				},
+				Script: "echo ok",
+			},
+		},
+	}
+	res, err := coord.ExecuteJob(context.Background(), job, "", "")
+	require.NoError(t, err)
+	assert.Equal(t, "success", res.Conclusion)
+	require.NotEmpty(t, d.stepsRun)
+	stepSpec := d.stepsRun[0]
+	assert.NotContains(t, stepSpec.Environment, "NODE_OPTIONS")
+	assert.NotContains(t, stepSpec.Environment, "node_options")
+	assert.NotContains(t, stepSpec.Environment, "LD_PRELOAD")
+	assert.Equal(t, "safe_val", stepSpec.Environment["CUSTOM_SAFE_VAR"])
+	assert.Equal(t, "step_val", stepSpec.Environment["STEP_SAFE_VAR"])
+}
+
+func TestExecuteJob_RejectsStepWorkingDirectoryTraversal(t *testing.T) {
+	coord := NewCoordinator(&mockDriver{}, nil, t.TempDir()).WithTracer(nil)
+	job := &protocol.JobSpecification{
+		JobID:   "traversal-job",
+		JobName: "traversal-job",
+		Steps: []protocol.JobStep{
+			{ID: "s1", Name: "escape", WorkingDirectory: "../../etc", Script: "pwd"},
+		},
+	}
+	res, err := coord.ExecuteJob(context.Background(), job, "", "")
+	require.Error(t, err)
+	assert.Equal(t, "failure", res.Conclusion)
+	assert.Contains(t, err.Error(), "outside job workspace")
+}
+
+func TestExecuteJob_ContainerRelativeWorkingDirectoryTraversal(t *testing.T) {
+	dockerMock := &mockDriver{}
+	coord := NewCoordinator(&mockDriver{}, nil, t.TempDir()).
+		WithDockerDriver(dockerMock).
+		WithTracer(nil)
+
+	// Relative traversal must still be rejected for container jobs
+	jobTraversal := &protocol.JobSpecification{
+		JobID:     "container-traversal-job",
+		JobName:   "container-traversal-job",
+		Container: &protocol.JobContainer{Image: "alpine:latest"},
+		Steps: []protocol.JobStep{
+			{ID: "s1", Name: "escape", WorkingDirectory: "../../etc", Script: "pwd"},
+		},
+	}
+	res, err := coord.ExecuteJob(context.Background(), jobTraversal, "", "")
+	require.Error(t, err)
+	assert.Equal(t, "failure", res.Conclusion)
+	assert.Contains(t, err.Error(), "outside job workspace")
+
+	// Absolute container path must still be allowed for container jobs
+	jobAbs := &protocol.JobSpecification{
+		JobID:     "container-abs-job",
+		JobName:   "container-abs-job",
+		Container: &protocol.JobContainer{Image: "alpine:latest"},
+		Steps: []protocol.JobStep{
+			{ID: "s1", Name: "inside", WorkingDirectory: "/app", Script: "pwd"},
+		},
+	}
+	resAbs, errAbs := coord.ExecuteJob(context.Background(), jobAbs, "", "")
+	require.NoError(t, errAbs)
+	assert.Equal(t, "success", resAbs.Conclusion)
+	require.Len(t, dockerMock.stepsRun, 1)
+	assert.Equal(t, "/app", dockerMock.stepsRun[0].WorkingDirectory)
+}
+
+func TestExecuteStep_NilSpecGuard(t *testing.T) {
+	coord := NewCoordinator(&mockDriver{}, nil, t.TempDir()).WithTracer(nil)
+	_, _, err := coord.executeStep(context.Background(), &mockDriver{}, "job-1", nil, nil, "step", nil, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nil step spec")
+}
+
+func TestGenerateCheckoutScript_AskpassAndPathTraversal(t *testing.T) {
+	env := map[string]string{
+		"GITHUB_REPOSITORY": "owner/repo",
+		"GITHUB_TOKEN":      "ghp_secret_token",
+	}
+	step := protocol.JobStep{
+		ID:     "checkout",
+		Inputs: map[string]string{"path": "../escape"},
+	}
+	script := generateCheckoutScript(step, env)
+	assert.NotContains(t, script, "${GITHUB_TOKEN}@github.com")
+	assert.Contains(t, script, "GIT_ASKPASS")
+	assert.Contains(t, script, "ACTR_INTERNAL_TOKEN")
+	assert.Contains(t, script, `mktemp "${RUNNER_TEMP:-/tmp}/git-askpass-XXXXXX"`)
+	assert.NotContains(t, script, "git-askpass-XXXXXX.sh")
+	assert.Contains(t, script, "invalid checkout path traversal")
+
+	// Verify shell traversal guard rejects both ../escape and backslash sub\escape
+	ws := t.TempDir()
+	for _, badPath := range []string{"../escape", "/abs/path", `sub\escape`} {
+		cmd := exec.Command("sh", "-c", script)
+		cmd.Env = append(os.Environ(),
+			"GITHUB_WORKSPACE="+ws,
+			"ACTR_CHECKOUT_PATH="+badPath,
+			"ACTR_CHECKOUT_REPO=owner/repo",
+		)
+		out, err := cmd.CombinedOutput()
+		require.Error(t, err, "expected traversal path %q to be rejected", badPath)
+		assert.Contains(t, string(out), "invalid checkout path traversal")
+	}
+}
+
+func TestExecuteJob_FallbackStreamConcurrentWriteRace(t *testing.T) {
+	var sharedBuf bytes.Buffer
+	d := &mockDriver{
+		executeFunc: func(ctx context.Context, step *driver.StepSpec, stdout, stderr io.Writer) (*driver.StepResult, error) {
+			var wg sync.WaitGroup
+			for i := 0; i < 10; i++ {
+				wg.Add(2)
+				go func(n int) {
+					defer wg.Done()
+					_, _ = fmt.Fprintf(stdout, "out-%d token=super-secret-val\n", n)
+				}(i)
+				go func(n int) {
+					defer wg.Done()
+					_, _ = fmt.Fprintf(stderr, "err-%d token=super-secret-val\n", n)
+				}(i)
+			}
+			wg.Wait()
+			return &driver.StepResult{ExitCode: 0}, nil
+		},
+	}
+	coord := NewCoordinator(d, nil, t.TempDir()).
+		WithTracer(nil).
+		WithOutput(&sharedBuf, &sharedBuf).
+		WithStepLogger(false)
+
+	job := &protocol.JobSpecification{
+		JobID:    "fallback-race-job",
+		JobToken: "super-secret-val",
+		Steps:    []protocol.JobStep{{ID: "s1", Name: "concurrent-output", Script: "echo ok"}},
+	}
+	res, err := coord.ExecuteJob(context.Background(), job, "", "super-secret-val")
+	require.NoError(t, err)
+	assert.Equal(t, "success", res.Conclusion)
+	assert.NotContains(t, sharedBuf.String(), "super-secret-val")
+	assert.Contains(t, sharedBuf.String(), "***")
+}
+
+func TestHasPathPrefix(t *testing.T) {
+	sep := string(filepath.Separator)
+	assert.True(t, hasPathPrefix(sep+"tmp", sep))
+	assert.True(t, hasPathPrefix(filepath.Join(sep+"work", "job"), filepath.Join(sep+"work", "job")))
+	assert.True(t, hasPathPrefix(filepath.Join(sep+"work", "job", "sub"), filepath.Join(sep+"work", "job")))
+	assert.False(t, hasPathPrefix(filepath.Join(sep+"work", "job2"), filepath.Join(sep+"work", "job")))
+}
+
+func TestExecuteJob_ConcurrentJobsIsolateDriverAndMonitor(t *testing.T) {
+	sockPath := testSocketPath(t)
+	server := monitor.NewServer(sockPath, "test-runner")
+	require.NoError(t, server.Start())
+	defer func() { _ = server.Stop() }()
+
+	coord := NewCoordinator(host.NewDriver(), nil, t.TempDir()).WithTracer(nil)
+	coord.SetMonitorServer(server)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			job := &protocol.JobSpecification{
+				JobID:    fmt.Sprintf("conc-job-%d", idx),
+				JobName:  "shared-name",
+				JobToken: fmt.Sprintf("secret-token-%d", idx),
+				Steps: []protocol.JobStep{
+					{ID: "s1", Name: "run", Script: fmt.Sprintf(`echo "job=%d tok=secret-token-%d"`, idx, idx)},
+				},
+			}
+			res, err := coord.ExecuteJob(context.Background(), job, "", job.JobToken)
+			assert.NoError(t, err)
+			if res != nil {
+				assert.Equal(t, "success", res.Conclusion)
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestShouldExecuteStep_ExpressionParserEdgeCases(t *testing.T) {
+	ctx := map[string]any{
+		"inputs": map[string]any{"msg": "always()", "env": "prod"},
+		"github": map[string]any{"ref": "refs/heads/main"},
+	}
+
+	// Literal 'always()' inside quotes must NOT bypass jobFailed=true!
+	assert.False(t, shouldExecuteStep("inputs.msg == 'always()'", ctx, true, false))
+
+	// Multiple format() calls in one comparison must evaluate == rather than outer format(...)
+	assert.False(t, shouldExecuteStep("format('{0}', 'a') == format('{0}', 'b')", ctx, false, false))
+	assert.True(t, shouldExecuteStep("format('{0}', 'a') == format('{0}', 'a')", ctx, false, false))
+
+	// Tight operators without spaces + multiline condition
+	assert.True(t, shouldExecuteStep("startsWith(github.ref,'refs/heads/')&&\ninputs.env=='prod'", ctx, false, false))
+	assert.False(t, shouldExecuteStep("(inputs.env == ')') || false", ctx, false, false))
+
+	// Short-circuited false && true must compare equal to false
+	assert.True(t, shouldExecuteStep("(false && true) == false", ctx, false, false))
+}
+
+func TestExpressionEvaluator_BuiltinsAndOperators(t *testing.T) {
+	ws := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(ws, "go.mod"), []byte("module example.com/test\n"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(ws, "sub"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(ws, "sub", "main.go"), []byte("package main\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(ws, "sub", "skip.tmp"), []byte("ignored\n"), 0o644))
+
+	ctx := map[string]any{
+		"github": map[string]any{
+			"workspace": ws,
+		},
+		"a": map[string]any{
+			"b": []any{
+				map[string]any{"c": "hello", "hyphen-key": "world"},
+				map[string]any{"c": 42},
+			},
+		},
+		"arr": []any{"alpha", "beta", "gamma"},
+		"num": 10,
+	}
+
+	// Property chains & indexing
+	assert.Equal(t, "hello", evaluateExpression("a.b[0].c", ctx))
+	assert.Equal(t, "world", evaluateExpression("a.b[0].hyphen-key", ctx))
+	assert.Equal(t, "world", evaluateExpression("a.b[0]['hyphen-key']", ctx))
+	assert.Equal(t, "42", evaluateExpression("a.b[1].c", ctx))
+	assert.Equal(t, "", evaluateExpression("a.b[9].c", ctx))
+
+	// Precedence: || < && < equality (==, !=) < relational (<, <=, >, >=) < !
+	assert.Equal(t, "true", evaluateExpression("true || false && false", ctx))
+	assert.Equal(t, "true", evaluateExpression("!(num < 5) && num >= 10", ctx))
+	assert.Equal(t, "true", evaluateExpression("num > 5 && num <= 10", ctx))
+	assert.Equal(t, "false", evaluateExpression("num > 10 || num < 10", ctx))
+	assert.Equal(t, "true", evaluateExpression("'apple' < 'Banana'", ctx))
+	assert.Equal(t, "false", evaluateExpression("true == (2 < 1)", ctx))
+	assert.Equal(t, "false", evaluateExpression("true == 2 < 1", ctx))
+	assert.Equal(t, "true", evaluateExpression("2 < 1 == false", ctx))
+
+	// join, toJSON, fromJSON, contains
+	assert.Equal(t, "alpha|beta|gamma", evaluateExpression("join(arr, '|')", ctx))
+	assert.Equal(t, "alpha,beta,gamma", evaluateExpression("join(arr)", ctx))
+	assert.Equal(t, "true", evaluateExpression("contains(arr, 'BETA')", ctx))
+	assert.Equal(t, "false", evaluateExpression("contains(arr, 'delta')", ctx))
+	assert.Equal(t, "42", evaluateExpression("fromJSON('{\"k\":{\"v\":42}}').k.v", ctx))
+	assert.Equal(t, "b", evaluateExpression("fromJSON('[\"a\",\"b\"]')[1]", ctx))
+	assert.Contains(t, evaluateExpression("toJSON(a.b[0])", ctx), `"c": "hello"`)
+
+	// hashFiles with glob and exclusion
+	h1 := evaluateExpression("hashFiles('**/*.go', '!sub/*.tmp')", ctx)
+	h2 := evaluateExpression("hashFiles('go.mod')", ctx)
+	assert.Len(t, h1, 64)
+	assert.Len(t, h2, 64)
+	assert.NotEqual(t, h1, h2)
+	assert.Equal(t, "", evaluateExpression("hashFiles('nonexistent-*.xyz')", ctx))
+
+	// containsStatusCheckFunction ignores literals and detects real calls
+	assert.False(t, containsStatusCheckFunction("inputs.msg == 'always()'"))
+	assert.False(t, containsStatusCheckFunction("'success()' != 'failure()'"))
+	assert.True(t, containsStatusCheckFunction("always()"))
+	assert.True(t, containsStatusCheckFunction("${{ failure() && true }}"))
+	assert.True(t, containsStatusCheckFunction("cancelled() || success()"))
+
+	// Syntax errors and deep nesting fail closed in shouldExecuteStep
+	assert.False(t, shouldExecuteStep("inputs.a ==", ctx, false, false))
+	assert.False(t, shouldExecuteStep("'unterminated", ctx, false, false))
+	deep := strings.Repeat("(", 150) + "true" + strings.Repeat(")", 150)
+	assert.False(t, shouldExecuteStep(deep, ctx, false, false))
+
+	// hashFiles skips symlinks that resolve outside workspace
+	outsideDir := t.TempDir()
+	outsideSecret := filepath.Join(outsideDir, "secret.txt")
+	require.NoError(t, os.WriteFile(outsideSecret, []byte("top-secret\n"), 0o644))
+	require.NoError(t, os.Symlink(outsideSecret, filepath.Join(ws, "leaked.txt")))
+	assert.Equal(t, "", evaluateExpression("hashFiles('leaked.txt')", ctx))
+}
+
+
+
+

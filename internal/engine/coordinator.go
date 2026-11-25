@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -12,7 +14,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -49,6 +50,7 @@ type Coordinator struct {
 	defaultRepo       string
 	repoAlias         string
 	tracer            *telemetry.Manager
+	ownsDefaultTracer bool
 	actionResolver    action.Resolver
 	nodeDetector      action.NodeDetector
 	vault             vault.Provider
@@ -86,17 +88,26 @@ func NewCoordinator(d driver.Driver, runClient *protocol.RunServiceClient, workD
 		stepLoggerEnabled: true,
 		colorEnabled:      os.Getenv("NO_COLOR") == "",
 		tracer:            tracer,
+		ownsDefaultTracer: tracer != nil,
 	}
 }
 
 // WithRepoAlias configures the repository alias (e.g. from runner config) for this Coordinator.
 func (c *Coordinator) WithRepoAlias(alias string) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.repoAlias = alias
 	return c
 }
 
 // WithTracer overrides the OpenTelemetry tracer manager on the Coordinator.
 func (c *Coordinator) WithTracer(tm *telemetry.Manager) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ownsDefaultTracer && c.tracer != nil && c.tracer != tm {
+		_ = c.tracer.Shutdown(context.Background())
+		c.ownsDefaultTracer = false
+	}
 	c.tracer = tm
 	return c
 }
@@ -113,6 +124,8 @@ func (c *Coordinator) Shutdown(ctx context.Context) error {
 
 // WithDockerDriver configures the driver used for container-based jobs.
 func (c *Coordinator) WithDockerDriver(d driver.Driver) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.dockerDriver = d
 	return c
 }
@@ -167,12 +180,16 @@ func (c *Coordinator) getNodeDetector() action.NodeDetector {
 
 // WithLimits configures resource governance limits applied to jobs.
 func (c *Coordinator) WithLimits(limits *config.LimitsConfig) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.limits = limits
 	return c
 }
 
 // resolveDriver dynamically determines whether to use the host driver or docker driver for the given job.
 func (c *Coordinator) resolveDriver(job *protocol.JobSpecification) (driver.Driver, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if job != nil && job.Container != nil {
 		if c.dockerDriver == nil {
 			return nil, fmt.Errorf("job requires container image %q but Docker driver is not enabled/available", job.Container.Image)
@@ -187,6 +204,8 @@ func (c *Coordinator) resolveDriver(job *protocol.JobSpecification) (driver.Driv
 
 // WithRepositoryURL configures the runner's GitHub URL (e.g. from runner config).
 func (c *Coordinator) WithRepositoryURL(repoURL string) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.repoURL = repoURL
 	c.defaultRepo = extractRepoFromURL(repoURL)
 	return c
@@ -208,18 +227,24 @@ func extractRepoFromURL(rawURL string) string {
 
 // WithRunnerName overrides the default runner name reported in RUNNER_NAME.
 func (c *Coordinator) WithRunnerName(name string) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.runnerName = name
 	return c
 }
 
 // WithRenewInterval configures the frequency of background job lease renewals.
 func (c *Coordinator) WithRenewInterval(interval time.Duration) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.renewInterval = interval
 	return c
 }
 
 // WithOutput configures custom writers for step standard output and error streams.
 func (c *Coordinator) WithOutput(stdout, stderr io.Writer) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.stdout = stdout
 	c.stderr = stderr
 	return c
@@ -227,12 +252,16 @@ func (c *Coordinator) WithOutput(stdout, stderr io.Writer) *Coordinator {
 
 // WithStepLogger configures whether step output is formatted and prefixed.
 func (c *Coordinator) WithStepLogger(enabled bool) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.stepLoggerEnabled = enabled
 	return c
 }
 
 // WithColor configures whether ANSI color codes are used in step formatting.
 func (c *Coordinator) WithColor(enabled bool) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.colorEnabled = enabled
 	return c
 }
@@ -260,13 +289,14 @@ func (c *Coordinator) Sampler() *monitor.TelemetrySampler {
 func (c *Coordinator) NotifyStepStart(jobID, stepID, stepName string) {
 	c.mu.RLock()
 	srv := c.monServer
+	repoAlias := c.repoAlias
 	c.mu.RUnlock()
 
 	if srv != nil {
 		srv.Publish(monitor.Event{
 			Type:      monitor.EventStepStart,
 			JobID:     jobID,
-			RepoAlias: c.repoAlias,
+			RepoAlias: repoAlias,
 			StepID:    stepID,
 			Step: &monitor.StepInfo{
 				ID:        stepID,
@@ -298,6 +328,7 @@ func (c *Coordinator) NotifyJobStepLog(jobID, stepID, line string) {
 func (c *Coordinator) NotifyStepFinish(jobID, stepID, stepName string, status monitor.StepStatus, exitCode ...int) {
 	c.mu.RLock()
 	srv := c.monServer
+	repoAlias := c.repoAlias
 	c.mu.RUnlock()
 
 	code := 0
@@ -311,7 +342,7 @@ func (c *Coordinator) NotifyStepFinish(jobID, stepID, stepName string, status mo
 		srv.Publish(monitor.Event{
 			Type:      monitor.EventStepFinish,
 			JobID:     jobID,
-			RepoAlias: c.repoAlias,
+			RepoAlias: repoAlias,
 			StepID:    stepID,
 			Step: &monitor.StepInfo{
 				ID:       stepID,
@@ -329,6 +360,9 @@ func newFailedCompleteJobRequest(job *protocol.JobSpecification) *protocol.Compl
 	planID := ""
 	if job != nil {
 		jobID = job.JobID
+		if jobID == "" {
+			jobID = job.ID
+		}
 		planID = job.PlanID
 	}
 	if jobID == "" {
@@ -355,14 +389,31 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	if err != nil {
 		return newFailedCompleteJobRequest(job), err
 	}
+	if cloneable, ok := d.(driver.Cloneable); ok {
+		d = cloneable.Clone()
+	}
 
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	if c.limits != nil && c.limits.Timeout > 0 {
+	c.mu.RLock()
+	limits := c.limits
+	tracer := c.tracer
+	repoAlias := c.repoAlias
+	repoURL := c.repoURL
+	defaultRepo := c.defaultRepo
+	monSrv := c.monServer
+	jobStdout := c.stdout
+	stepLoggerEnabled := c.stepLoggerEnabled
+	colorEnabled := c.colorEnabled
+	runnerName := c.runnerName
+	renewInterval := c.renewInterval
+	c.mu.RUnlock()
+
+	if limits != nil && limits.Timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, c.limits.Timeout)
+		ctx, cancel = context.WithTimeout(ctx, limits.Timeout)
 		defer cancel()
 	}
 
@@ -400,22 +451,18 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		}
 	}
 	if repo == "" {
-		repo = c.defaultRepo
+		repo = defaultRepo
 	}
 	if repo == "" {
-		repo = c.repoAlias
+		repo = repoAlias
 	}
 
 	jobStartTime := time.Now()
 	var jobSpan trace.Span
-	if c.tracer != nil {
-		ctx, jobSpan = c.tracer.StartJobSpan(ctx, jobID, workflowName, repo, owner)
+	if tracer != nil {
+		ctx, jobSpan = tracer.StartJobSpan(ctx, jobID, workflowName, repo, owner)
 		defer jobSpan.End()
 	}
-
-	c.mu.RLock()
-	monSrv := c.monServer
-	c.mu.RUnlock()
 
 	if monSrv != nil {
 		jobInfo := &monitor.JobInfo{
@@ -423,8 +470,8 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			Name:      jobDisplayName,
 			Workflow:  workflowName,
 			Repo:      repo,
-			RepoAlias: c.repoAlias,
-			RepoURL:   c.repoURL,
+			RepoAlias: repoAlias,
+			RepoURL:   repoURL,
 			Owner:     owner,
 			Status:    monitor.StatusRunning,
 			StartedAt: time.Now(),
@@ -445,7 +492,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		monSrv.Publish(monitor.Event{
 			Type:      monitor.EventJobStart,
 			JobID:     jobID,
-			RepoAlias: c.repoAlias,
+			RepoAlias: repoAlias,
 			Job:       jobInfo,
 			Driver:    driverName,
 		})
@@ -454,15 +501,15 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	conclusion := "success"
 	defer func() {
 		jobDuration := time.Since(jobStartTime)
-		if c.tracer != nil {
+		if tracer != nil {
 			if jobSpan != nil {
 				if conclusion != "success" {
-					c.tracer.RecordSpanError(jobSpan, fmt.Errorf("job failed with status %s", conclusion))
+					tracer.RecordSpanError(jobSpan, fmt.Errorf("job failed with status %s", conclusion))
 				} else {
 					jobSpan.SetStatus(codes.Ok, "")
 				}
 			}
-			c.tracer.RecordJobCompletion(ctx, jobID, workflowName, repo, owner, conclusion, jobDuration.Seconds())
+			tracer.RecordJobCompletion(ctx, jobID, workflowName, repo, owner, conclusion, jobDuration.Seconds())
 		}
 
 		c.mu.RLock()
@@ -480,15 +527,15 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			s.Publish(monitor.Event{
 				Type:      monitor.EventJobFinish,
 				JobID:     jobID,
-				RepoAlias: c.repoAlias,
+				RepoAlias: repoAlias,
 				Driver:    driverName,
 				Job: &monitor.JobInfo{
 					ID:        jobID,
 					Name:      jobDisplayName,
 					Workflow:  workflowName,
 					Repo:      repo,
-					RepoAlias: c.repoAlias,
-					RepoURL:   c.repoURL,
+					RepoAlias: repoAlias,
+					RepoURL:   repoURL,
 					Owner:     owner,
 					Status:    finalStatus,
 					EndedAt:   time.Now(),
@@ -513,7 +560,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		return newFailedCompleteJobRequest(job), fmt.Errorf("create base work directory: %w", err)
 	}
 
-	runnerTemp := filepath.Join(baseWorkDir, "_temp")
+	runnerTemp := filepath.Join(baseWorkDir, "_temp", sanitizeJobDirComponent(jobID))
 	if err := os.MkdirAll(runnerTemp, 0o755); err != nil {
 		conclusion = "failure"
 		return newFailedCompleteJobRequest(job), fmt.Errorf("create runner temp directory: %w", err)
@@ -531,14 +578,30 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		return newFailedCompleteJobRequest(job), fmt.Errorf("create runner tool cache directory: %w", err)
 	}
 
-	jobDirName := job.JobName
-	if jobDirName == "" {
-		jobDirName = job.JobID
+	rawDirName := job.JobName
+	if rawDirName == "" {
+		rawDirName = job.JobID
 	}
-	if jobDirName == "" {
-		jobDirName = "workspace"
+	if rawDirName == "" {
+		rawDirName = "workspace"
 	}
+	sanitizedName := sanitizeJobDirComponent(rawDirName)
+	sanitizedID := sanitizeJobDirComponent(jobID)
+	shortSuffix := sanitizedID
+	if len(shortSuffix) > 16 {
+		sum := sha256.Sum256([]byte(jobID))
+		shortSuffix = hex.EncodeToString(sum[:4])
+	}
+	jobDirName := sanitizedName
+	if shortSuffix != "" && sanitizedName != sanitizedID && !strings.HasSuffix(jobDirName, shortSuffix) {
+		jobDirName = fmt.Sprintf("%s-%s", sanitizedName, shortSuffix)
+	}
+
 	jobWorkspace := filepath.Join(baseWorkDir, jobDirName)
+	if !hasPathPrefix(jobWorkspace, baseWorkDir) || filepath.Clean(jobWorkspace) == filepath.Clean(baseWorkDir) {
+		conclusion = "failure"
+		return newFailedCompleteJobRequest(job), fmt.Errorf("invalid job workspace %q: must be contained within %q", jobWorkspace, baseWorkDir)
+	}
 	_ = os.RemoveAll(jobWorkspace)
 	if err := os.MkdirAll(jobWorkspace, 0o755); err != nil {
 		conclusion = "failure"
@@ -616,8 +679,8 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		}
 	}
 
-	if cumulativeEnv["GITHUB_REPOSITORY"] == "" && c.defaultRepo != "" {
-		cumulativeEnv["GITHUB_REPOSITORY"] = c.defaultRepo
+	if cumulativeEnv["GITHUB_REPOSITORY"] == "" && defaultRepo != "" {
+		cumulativeEnv["GITHUB_REPOSITORY"] = defaultRepo
 	}
 	if cumulativeEnv["GITHUB_EVENT_NAME"] == "" {
 		cumulativeEnv["GITHUB_EVENT_NAME"] = "workflow_dispatch"
@@ -735,7 +798,6 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			cumulativeEnv["ACTIONS_RESULTS_URL"] = cumulativeEnv["ACTIONS_RUNTIME_URL"]
 		}
 	}
-	runnerName := c.runnerName
 	if runnerName == "" {
 		runnerName = "actr"
 	}
@@ -787,6 +849,10 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 
 	if job.Environment != nil {
 		for k, v := range job.Environment {
+			cleanKey := strings.ToUpper(strings.TrimSpace(k))
+			if forbiddenEnvKeys[cleanKey] {
+				continue
+			}
 			cumulativeEnv[k] = evaluateValue(v, parsedContext)
 		}
 	}
@@ -803,7 +869,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		TempDir:        runnerTemp,
 		Container:      job.Container,
 		Environment:    cumulativeEnv,
-		Limits:         c.limits,
+		Limits:         limits,
 	}
 
 	if err := d.PrepareJob(ctx, jobCtx); err != nil {
@@ -812,7 +878,6 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	}
 
 	// Start background lease renew ticker if RunService is configured
-	renewInterval := c.renewInterval
 	if renewInterval <= 0 {
 		renewInterval = 50 * time.Second
 	}
@@ -847,7 +912,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	conclusion = "success"
 	var postHooks []PostStepHook
 
-	stdout := c.stdout
+	stdout := jobStdout
 	if stdout == nil {
 		stdout = os.Stdout
 	}
@@ -859,10 +924,36 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	if token != "" {
 		jobMasker.AddMask(token)
 	}
+	if rtToken := cumulativeEnv["ACTIONS_RUNTIME_TOKEN"]; rtToken != "" {
+		jobMasker.AddMask(rtToken)
+	}
+	if secrets, ok := parsedContext["secrets"].(map[string]any); ok {
+		for _, v := range secrets {
+			if s, ok := v.(string); ok && s != "" {
+				jobMasker.AddMask(s)
+			}
+		}
+	} else if secrets, ok := parsedContext["secrets"].(map[string]string); ok {
+		for _, s := range secrets {
+			if s != "" {
+				jobMasker.AddMask(s)
+			}
+		}
+	}
+
+	c.mu.RLock()
+	monActive := c.monServer != nil
+	c.mu.RUnlock()
+	var jobSampler *monitor.TelemetrySampler
+	if monActive {
+		jobSampler = monitor.NewTelemetrySampler()
+		jobSampler.SetWorkspaceDir(jobWorkspace)
+		defer jobSampler.Close()
+	}
 
 	var stepLogger *StepLogger
-	if c.stepLoggerEnabled {
-		stepLogger = NewStepLogger(jobDisplayName, stdout, c.colorEnabled).WithMasker(jobMasker)
+	if stepLoggerEnabled {
+		stepLogger = NewStepLogger(jobDisplayName, stdout, colorEnabled).WithMasker(jobMasker)
 	}
 
 	// Defer post-hooks teardown (LIFO) so that action cleanups run even on step setup failure or cancel
@@ -900,7 +991,11 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		}
 
 		if !shouldExecuteStep(step.Condition, parsedContext, jobFailed, jobCancelled) {
-			c.NotifyJobStepLog(jobID, stepID, fmt.Sprintf("::debug::Skipping step %s (condition %q evaluated to false)", stepDisplayName, step.Condition))
+			logMsg := fmt.Sprintf("::debug::Skipping step %s (condition %q evaluated to false)", stepDisplayName, step.Condition)
+			if jobMasker != nil {
+				logMsg = jobMasker.Mask(logMsg)
+			}
+			c.NotifyJobStepLog(jobID, stepID, logMsg)
 			c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusSkipped, 0)
 			continue
 		}
@@ -910,7 +1005,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			conclusion = "failure"
 			return &protocol.CompleteJobRequest{
 				PlanID:      job.PlanID,
-				JobID:       job.JobID,
+				JobID:       jobID,
 				Conclusion:  "failure",
 				Outputs:     outputs,
 				StepResults: stepResults,
@@ -925,7 +1020,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			_ = os.Remove(envPath)
 			return &protocol.CompleteJobRequest{
 				PlanID:      job.PlanID,
-				JobID:       job.JobID,
+				JobID:       jobID,
 				Conclusion:  "failure",
 				Outputs:     outputs,
 				StepResults: stepResults,
@@ -941,7 +1036,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			_ = os.Remove(outputPath)
 			return &protocol.CompleteJobRequest{
 				PlanID:      job.PlanID,
-				JobID:       job.JobID,
+				JobID:       jobID,
 				Conclusion:  "failure",
 				Outputs:     outputs,
 				StepResults: stepResults,
@@ -958,7 +1053,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			_ = os.Remove(pathFilePath)
 			return &protocol.CompleteJobRequest{
 				PlanID:      job.PlanID,
-				JobID:       job.JobID,
+				JobID:       jobID,
 				Conclusion:  "failure",
 				Outputs:     outputs,
 				StepResults: stepResults,
@@ -981,6 +1076,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			if stepCancel != nil {
 				stepCancel()
 			}
+			parsedContext["env"] = cumulativeEnv
 		}
 
 		// Build step environment: cumulative environment + step-specific overrides + command files
@@ -991,22 +1087,46 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		stepEnv["GITHUB_STATE"] = statePath
 		stepEnv["GITHUB_WORKSPACE"] = jobWorkspace
 
+		// Build step-scoped expression env map combining cumulativeEnv + stepEnv
+		stepExprEnv := make(map[string]string, len(cumulativeEnv)+len(stepEnv))
+		for k, v := range cumulativeEnv {
+			stepExprEnv[k] = v
+		}
+		for k, v := range stepEnv {
+			stepExprEnv[k] = v
+		}
+		parsedContext["env"] = stepExprEnv
+
 		stepWorkDir := step.WorkingDirectory
 		if stepWorkDir == "" {
 			stepWorkDir = jobWorkspace
 		} else if !filepath.IsAbs(stepWorkDir) {
 			stepWorkDir = filepath.Join(jobWorkspace, stepWorkDir)
 		}
-		if err := os.MkdirAll(stepWorkDir, 0o755); err != nil {
-			conclusion = "failure"
-			cleanupStepFiles()
-			return &protocol.CompleteJobRequest{
-				PlanID:      job.PlanID,
-				JobID:       job.JobID,
-				Conclusion:  "failure",
-				Outputs:     outputs,
-				StepResults: stepResults,
-			}, fmt.Errorf("create step working directory: %w", err)
+
+		if job.Container == nil || !filepath.IsAbs(step.WorkingDirectory) {
+			if !hasPathPrefix(stepWorkDir, jobWorkspace) {
+				conclusion = "failure"
+				cleanupStepFiles()
+				return &protocol.CompleteJobRequest{
+					PlanID:      job.PlanID,
+					JobID:       jobID,
+					Conclusion:  "failure",
+					Outputs:     outputs,
+					StepResults: stepResults,
+				}, fmt.Errorf("step working directory %q outside job workspace", stepWorkDir)
+			}
+			if err := os.MkdirAll(stepWorkDir, 0o755); err != nil {
+				conclusion = "failure"
+				cleanupStepFiles()
+				return &protocol.CompleteJobRequest{
+					PlanID:      job.PlanID,
+					JobID:       jobID,
+					Conclusion:  "failure",
+					Outputs:     outputs,
+					StepResults: stepResults,
+				}, fmt.Errorf("create step working directory: %w", err)
+			}
 		}
 
 		var res *driver.StepResult
@@ -1036,7 +1156,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 				OutputFilePath: outputPath,
 				Context:        parsedContext,
 			}
-			res, _, stepErr = c.executeActionStep(stepCtx, jobID, stepID, stepDisplayName, ref, actCtx, stepLogger, jobMasker)
+			res, _, stepErr = c.executeActionStep(stepCtx, jobID, stepID, stepDisplayName, ref, actCtx, stepLogger, jobMasker, jobSampler)
 
 			// Ingest state file and queue post-step hook if manifest defines runs.post
 			stepState, _ := IngestStateFile(statePath)
@@ -1078,7 +1198,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 				Script:           stepScript,
 			}
 
-			res, _, stepErr = c.executeStep(stepCtx, d, jobID, spec, stepLogger, stepDisplayName, jobMasker)
+			res, _, stepErr = c.executeStep(stepCtx, d, jobID, spec, stepLogger, stepDisplayName, jobMasker, jobSampler)
 		}
 
 		if stepCtx.Err() != nil {
@@ -1117,7 +1237,6 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 
 		// Step succeeded: parse environment, output, and path files
 		if err := IngestEnvFile(envPath, cumulativeEnv); err != nil {
-			c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusFailed)
 			stepResults = append(stepResults, protocol.StepResult{
 				ID:         stepID,
 				Conclusion: "failure",
@@ -1133,7 +1252,6 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 
 		newOutputs, err := ParseEnvAndOutputFile(outputPath)
 		if err != nil {
-			c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusFailed)
 			stepResults = append(stepResults, protocol.StepResult{
 				ID:         stepID,
 				Conclusion: "failure",
@@ -1170,7 +1288,6 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 		}
 		updatedPath, err := IngestPathFile(pathFilePath, cumulativeEnv[pathKey])
 		if err != nil {
-			c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusFailed)
 			stepResults = append(stepResults, protocol.StepResult{
 				ID:         stepID,
 				Conclusion: "failure",
@@ -1196,7 +1313,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 
 	return &protocol.CompleteJobRequest{
 		PlanID:      job.PlanID,
-		JobID:       job.JobID,
+		JobID:       jobID,
 		Conclusion:  conclusion,
 		Outputs:     outputs,
 		StepResults: stepResults,
@@ -1205,47 +1322,47 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 
 // executeStep executes a single step, publishing step start/finish events, streaming logs,
 // and sampling telemetry via a 500ms ticker.
-func (c *Coordinator) executeStep(ctx context.Context, d driver.Driver, jobID string, spec *driver.StepSpec, stepLogger *StepLogger, stepDisplayName string, jobMasker *SecretMasker) (*driver.StepResult, time.Duration, error) {
+func (c *Coordinator) executeStep(ctx context.Context, d driver.Driver, jobID string, spec *driver.StepSpec, stepLogger *StepLogger, stepDisplayName string, jobMasker *SecretMasker, jobSampler *monitor.TelemetrySampler) (*driver.StepResult, time.Duration, error) {
+	if spec == nil {
+		return nil, 0, errors.New("nil step spec")
+	}
 	if spec.OnProcessStart == nil {
 		spec.OnProcessStart = func(pid, pgid int) {
-			c.mu.RLock()
-			s := c.sampler
-			c.mu.RUnlock()
-			if s != nil {
-				s.SetTargetPID(int32(pid), int32(pgid))
+			if jobSampler != nil {
+				jobSampler.SetTargetPID(int32(pid), int32(pgid))
 			}
 		}
 	} else {
 		orig := spec.OnProcessStart
 		spec.OnProcessStart = func(pid, pgid int) {
 			orig(pid, pgid)
-			c.mu.RLock()
-			s := c.sampler
-			c.mu.RUnlock()
-			if s != nil {
-				s.SetTargetPID(int32(pid), int32(pgid))
+			if jobSampler != nil {
+				jobSampler.SetTargetPID(int32(pid), int32(pgid))
 			}
 		}
 	}
 
-	return c.executeWithStreams(ctx, jobID, spec.ID, stepDisplayName, spec.Script, stepLogger, jobMasker, func(stepCtx context.Context, stdout, stderr io.Writer) (*driver.StepResult, error) {
-		if c.tracer != nil && spec != nil {
+	return c.executeWithStreams(ctx, jobID, spec.ID, stepDisplayName, spec.Script, stepLogger, jobMasker, jobSampler, func(stepCtx context.Context, stdout, stderr io.Writer) (*driver.StepResult, error) {
+		c.mu.RLock()
+		tracer := c.tracer
+		c.mu.RUnlock()
+		if tracer != nil && spec != nil {
 			if spec.Environment == nil {
 				spec.Environment = make(map[string]string)
 			}
-			c.tracer.InjectStepTraceContext(stepCtx, spec.Environment)
+			tracer.InjectStepTraceContext(stepCtx, spec.Environment)
 		}
 		return d.ExecuteStep(stepCtx, spec, stdout, stderr)
 	})
 }
 
 // executeActionStep resolves, detects node runtime, and executes a JavaScript action step.
-func (c *Coordinator) executeActionStep(ctx context.Context, jobID, stepID, stepDisplayName string, ref *protocol.StepReference, actCtx *action.ActionContext, stepLogger *StepLogger, jobMasker *SecretMasker) (*driver.StepResult, time.Duration, error) {
+func (c *Coordinator) executeActionStep(ctx context.Context, jobID, stepID, stepDisplayName string, ref *protocol.StepReference, actCtx *action.ActionContext, stepLogger *StepLogger, jobMasker *SecretMasker, jobSampler *monitor.TelemetrySampler) (*driver.StepResult, time.Duration, error) {
 	scriptDesc := ""
 	if ref != nil {
 		scriptDesc = fmt.Sprintf("uses: %s@%s", ref.Name, ref.Version)
 	}
-	return c.executeWithStreams(ctx, jobID, stepID, stepDisplayName, scriptDesc, stepLogger, jobMasker, func(stepCtx context.Context, stdout, stderr io.Writer) (*driver.StepResult, error) {
+	return c.executeWithStreams(ctx, jobID, stepID, stepDisplayName, scriptDesc, stepLogger, jobMasker, jobSampler, func(stepCtx context.Context, stdout, stderr io.Writer) (*driver.StepResult, error) {
 		if actCtx == nil {
 			err := errors.New("action context is nil")
 			_, _ = fmt.Fprintf(stderr, "Error: %v\n", err)
@@ -1258,7 +1375,7 @@ func (c *Coordinator) executeActionStep(ctx context.Context, jobID, stepID, step
 		}
 
 		resolver := c.getActionResolver()
-		actionDir, err := resolver.Resolve(ctx, ref)
+		actionDir, err := resolver.Resolve(stepCtx, ref)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "Error resolving action %s: %v\n", ref.Name, err)
 			return &driver.StepResult{ExitCode: 1, Error: err}, err
@@ -1277,7 +1394,7 @@ func (c *Coordinator) executeActionStep(ctx context.Context, jobID, stepID, step
 		}
 
 		detector := c.getNodeDetector()
-		nodePath, err := detector.Detect(ctx)
+		nodePath, err := detector.Detect(stepCtx)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "Error detecting Node runtime: %v\n", err)
 			return &driver.StepResult{ExitCode: 1, Error: err}, err
@@ -1314,27 +1431,29 @@ func (c *Coordinator) executeActionStep(ctx context.Context, jobID, stepID, step
 }
 
 // executeWithStreams wraps common stream piping, logging, telemetry, and monitor notifications.
-func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, stepDisplayName, scriptDesc string, stepLogger *StepLogger, jobMasker *SecretMasker, runFn func(stepCtx context.Context, stdout, stderr io.Writer) (*driver.StepResult, error)) (*driver.StepResult, time.Duration, error) {
+func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, stepDisplayName, scriptDesc string, stepLogger *StepLogger, jobMasker *SecretMasker, jobSampler *monitor.TelemetrySampler, runFn func(stepCtx context.Context, stdout, stderr io.Writer) (*driver.StepResult, error)) (*driver.StepResult, time.Duration, error) {
 	c.NotifyStepStart(jobID, stepID, stepDisplayName)
 
+	c.mu.RLock()
 	stdout := c.stdout
+	stderr := c.stderr
+	monSrv := c.monServer
+	tracer := c.tracer
+	repoAlias := c.repoAlias
+	c.mu.RUnlock()
+
 	if stdout == nil {
 		stdout = os.Stdout
 	}
-	stderr := c.stderr
 	if stderr == nil {
 		stderr = os.Stderr
 	}
 
-	stepOut := stdout
-	stepErrStream := stderr
+	var stepOut io.Writer
+	var stepErrStream io.Writer
 	var stepOutWriter *StepWriter
 	var stepErrWriter *StepWriter
-
-	c.mu.RLock()
-	monSrv := c.monServer
-	sampler := c.sampler
-	c.mu.RUnlock()
+	sampler := jobSampler
 
 	if jobMasker == nil {
 		if stepLogger != nil {
@@ -1358,23 +1477,34 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 		}
 		stepOut = stepOutWriter
 		stepErrStream = stepErrWriter
-	} else if monSrv != nil {
+	} else {
+		var outMu sync.Mutex
 		stepOutWriter = NewLineWriter(func(line string) {
-			c.NotifyJobStepLog(jobID, stepID, line)
+			outMu.Lock()
+			_, _ = fmt.Fprintln(stdout, line)
+			outMu.Unlock()
+			if monSrv != nil {
+				c.NotifyJobStepLog(jobID, stepID, line)
+			}
 		}).WithMasker(jobMasker)
 		stepErrWriter = NewLineWriter(func(line string) {
-			c.NotifyJobStepLog(jobID, stepID, line)
+			outMu.Lock()
+			_, _ = fmt.Fprintln(stderr, line)
+			outMu.Unlock()
+			if monSrv != nil {
+				c.NotifyJobStepLog(jobID, stepID, line)
+			}
 		}).WithMasker(jobMasker)
-		stepOut = io.MultiWriter(stdout, stepOutWriter)
-		stepErrStream = io.MultiWriter(stderr, stepErrWriter)
+		stepOut = stepOutWriter
+		stepErrStream = stepErrWriter
 	}
 
 	stepStartTime := time.Now()
 	var stepSpan trace.Span
 	traceID := ""
 	spanID := ""
-	if c.tracer != nil {
-		ctx, stepSpan = c.tracer.StartStepSpan(ctx, stepID, stepDisplayName)
+	if tracer != nil {
+		ctx, stepSpan = tracer.StartStepSpan(ctx, stepID, stepDisplayName)
 		defer stepSpan.End()
 		if sc := stepSpan.SpanContext(); sc.IsValid() {
 			traceID = sc.TraceID().String()
@@ -1400,9 +1530,9 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 			defer ticker.Stop()
 
 			if sample := sampler.Sample(); sample != nil {
-				monSrv.SetJobTelemetry(jobID, c.repoAlias, sample)
-				if c.tracer != nil && c.tracer.Enabled() {
-					c.tracer.RecordTelemetrySample(ctx, jobID, c.repoAlias, sample)
+				monSrv.SetJobTelemetry(jobID, repoAlias, sample)
+				if tracer != nil && tracer.Enabled() {
+					tracer.RecordTelemetrySample(ctx, jobID, repoAlias, sample)
 				}
 			}
 
@@ -1412,9 +1542,9 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 					return
 				case <-ticker.C:
 					if sample := sampler.Sample(); sample != nil {
-						monSrv.SetJobTelemetry(jobID, c.repoAlias, sample)
-						if c.tracer != nil && c.tracer.Enabled() {
-							c.tracer.RecordTelemetrySample(ctx, jobID, c.repoAlias, sample)
+						monSrv.SetJobTelemetry(jobID, repoAlias, sample)
+						if tracer != nil && tracer.Enabled() {
+							tracer.RecordTelemetrySample(ctx, jobID, repoAlias, sample)
 						}
 					}
 				}
@@ -1424,12 +1554,9 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 
 	defer func() {
 		defer func() { _ = recover() }()
-		c.mu.RLock()
-		s := c.sampler
-		c.mu.RUnlock()
-		if s != nil {
-			s.SetTargetPID(0, 0)
-			s.SetTraceContext("", "", "", time.Time{})
+		if sampler != nil {
+			sampler.SetTargetPID(0, 0)
+			sampler.SetTraceContext("", "", "", time.Time{})
 		}
 	}()
 
@@ -1457,22 +1584,22 @@ func (c *Coordinator) executeWithStreams(ctx context.Context, jobID, stepID, ste
 
 	durationSec := duration.Seconds()
 	if success {
-		if c.tracer != nil {
+		if tracer != nil {
 			if stepSpan != nil {
-				c.tracer.FinishStepSpan(stepSpan, exitCode, "success")
+				tracer.FinishStepSpan(stepSpan, exitCode, "success")
 			}
-			c.tracer.RecordStepCompletion(ctx, stepID, stepDisplayName, "success", exitCode, durationSec)
+			tracer.RecordStepCompletion(ctx, stepID, stepDisplayName, "success", exitCode, durationSec)
 		}
 		c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusSuccess, exitCode)
 	} else {
-		if c.tracer != nil {
+		if tracer != nil {
 			if stepSpan != nil {
 				if stepErr != nil {
-					c.tracer.RecordSpanError(stepSpan, stepErr)
+					tracer.RecordSpanError(stepSpan, stepErr)
 				}
-				c.tracer.FinishStepSpan(stepSpan, exitCode, "failed")
+				tracer.FinishStepSpan(stepSpan, exitCode, "failed")
 			}
-			c.tracer.RecordStepCompletion(ctx, stepID, stepDisplayName, "failed", exitCode, durationSec)
+			tracer.RecordStepCompletion(ctx, stepID, stepDisplayName, "failed", exitCode, durationSec)
 		}
 		c.NotifyStepFinish(jobID, stepID, stepDisplayName, monitor.StatusFailed, exitCode)
 	}
@@ -1574,6 +1701,10 @@ func (c *Coordinator) prepareStepEnvironment(
 		stepEnv[k] = v
 	}
 	for k, v := range step.Environment {
+		cleanKey := strings.ToUpper(strings.TrimSpace(k))
+		if forbiddenEnvKeys[cleanKey] {
+			continue
+		}
 		stepEnv[k] = evaluateValue(v, parsedContext)
 	}
 
@@ -1668,6 +1799,9 @@ func runnerArch() string {
 }
 
 func isCheckoutStep(step protocol.JobStep) bool {
+	if step.Reference != nil && strings.TrimSpace(step.Reference.Name) != "" {
+		return strings.EqualFold(strings.TrimSpace(step.Reference.Name), "actions/checkout")
+	}
 	lowerName := strings.ToLower(step.Name)
 	lowerID := strings.ToLower(step.ID)
 	return strings.Contains(lowerName, "checkout") || strings.Contains(lowerID, "checkout")
@@ -1699,7 +1833,15 @@ func generateCheckoutScript(step protocol.JobStep, env map[string]string) string
 	return `set -e
 TARGET_DIR="${GITHUB_WORKSPACE}"
 if [ -n "$ACTR_CHECKOUT_PATH" ]; then
-    TARGET_DIR="${GITHUB_WORKSPACE}/$ACTR_CHECKOUT_PATH"
+    case "$ACTR_CHECKOUT_PATH" in
+        /*|../*|*/../*|*/..|..|*\\*)
+            echo "Error: invalid checkout path traversal: $ACTR_CHECKOUT_PATH" >&2
+            exit 1
+            ;;
+        *)
+            TARGET_DIR="${GITHUB_WORKSPACE}/$ACTR_CHECKOUT_PATH"
+            ;;
+    esac
 fi
 mkdir -p "$TARGET_DIR"
 cd "$TARGET_DIR"
@@ -1719,8 +1861,27 @@ if ! echo "$REPO_NAME" | grep -Eq '^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$'; then
 fi
 
 CLONE_URL="https://github.com/${REPO_NAME}.git"
+ASKPASS_FILE=""
 if [ -n "${GITHUB_TOKEN}" ]; then
-    CLONE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_NAME}.git"
+    ASKPASS_FILE="$(mktemp "${RUNNER_TEMP:-/tmp}/git-askpass-XXXXXX")"
+    cat <<'EOF' > "$ASKPASS_FILE"
+#!/bin/sh
+case "$1" in
+    *Username*|*username*)
+        printf '%s\n' "x-access-token"
+        ;;
+    *Password*|*password*)
+        printf '%s\n' "${ACTR_INTERNAL_TOKEN}"
+        ;;
+    *)
+        printf '%s\n' "${ACTR_INTERNAL_TOKEN}"
+        ;;
+esac
+EOF
+    chmod 700 "$ASKPASS_FILE"
+    export GIT_ASKPASS="$ASKPASS_FILE"
+    export ACTR_INTERNAL_TOKEN="${GITHUB_TOKEN}"
+    trap 'rm -f "$ASKPASS_FILE"' EXIT
 fi
 
 if [ ! -d ".git" ]; then
@@ -1796,590 +1957,12 @@ func parseContextData(v any) any {
 	}
 }
 
-func lookupContext(path string, ctx map[string]any) (any, bool) {
-	parts := strings.Split(path, ".")
-	var current any = ctx
-	for _, part := range parts {
-		if m, ok := current.(map[string]any); ok {
-			val, exists := m[part]
-			if !exists {
-				found := false
-				for k, v := range m {
-					if strings.EqualFold(k, part) {
-						val = v
-						found = true
-						break
-					}
-				}
-				if !found {
-					return nil, false
-				}
-			}
-			current = val
-			continue
-		}
-		if sm, ok := current.(map[string]string); ok {
-			val, exists := sm[part]
-			if !exists {
-				found := false
-				for k, v := range sm {
-					if strings.EqualFold(k, part) {
-						val = v
-						found = true
-						break
-					}
-				}
-				if !found {
-					return nil, false
-				}
-			}
-			current = val
-			continue
-		}
-		return nil, false
-	}
-	return current, true
-}
-
-// parseExpressionArgs splits a comma-separated argument list while respecting single-quoted strings and parentheses.
-func parseExpressionArgs(s string) []string {
-	var args []string
-	var current strings.Builder
-	inQuotes := false
-	parenDepth := 0
-
-	for i := 0; i < len(s); i++ {
-		ch := s[i]
-		switch ch {
-		case '\'':
-			if inQuotes && i+1 < len(s) && s[i+1] == '\'' {
-				current.WriteByte('\'')
-				current.WriteByte('\'')
-				i++
-				continue
-			}
-			inQuotes = !inQuotes
-			current.WriteByte(ch)
-		case '(':
-			if !inQuotes {
-				parenDepth++
-			}
-			current.WriteByte(ch)
-		case ')':
-			if !inQuotes {
-				parenDepth--
-			}
-			current.WriteByte(ch)
-		case ',':
-			if !inQuotes && parenDepth == 0 {
-				args = append(args, strings.TrimSpace(current.String()))
-				current.Reset()
-			} else {
-				current.WriteByte(ch)
-			}
-		default:
-			current.WriteByte(ch)
-		}
-	}
-	if current.Len() > 0 {
-		args = append(args, strings.TrimSpace(current.String()))
-	}
-	return args
-}
-
-// isTruthy reports whether an expression result string represents a truthy value.
-func isTruthy(s string) bool {
-	trimmed := strings.TrimSpace(s)
-	return trimmed != "" && trimmed != "false" && trimmed != "null" && trimmed != "0"
-}
-
-// splitTopLevel splits s by sep only at parentheses depth 0 and outside single quotes.
-func splitTopLevel(s, sep string) []string {
-	var parts []string
-	inQuotes := false
-	parenDepth := 0
-	lastIdx := 0
-	sepLen := len(sep)
-
-	for i := 0; i < len(s); i++ {
-		ch := s[i]
-		switch ch {
-		case '\'':
-			if inQuotes && i+1 < len(s) && s[i+1] == '\'' {
-				i++
-				continue
-			}
-			inQuotes = !inQuotes
-		case '(':
-			if !inQuotes {
-				parenDepth++
-			}
-		case ')':
-			if !inQuotes && parenDepth > 0 {
-				parenDepth--
-			}
-		}
-
-		if !inQuotes && parenDepth == 0 && i+sepLen <= len(s) && s[i:i+sepLen] == sep {
-			parts = append(parts, strings.TrimSpace(s[lastIdx:i]))
-			lastIdx = i + sepLen
-			i += sepLen - 1
-		}
-	}
-	if lastIdx < len(s) {
-		parts = append(parts, strings.TrimSpace(s[lastIdx:]))
-	}
-	return parts
-}
-
-func isContextPath(s string) bool {
-	roots := []string{
-		"github.", "env.", "job.", "steps.", "runner.",
-		"needs.", "inputs.", "matrix.", "strategy.", "secrets.", "vars.",
-	}
-	for _, r := range roots {
-		if strings.HasPrefix(s, r) {
-			return true
-		}
-	}
-	return false
-}
-
-func containsStatusCheckFunction(s string) bool {
-	lower := strings.ToLower(s)
-	return strings.Contains(lower, "success()") ||
-		strings.Contains(lower, "always()") ||
-		strings.Contains(lower, "failure()") ||
-		strings.Contains(lower, "cancelled()")
-}
-
-// shouldExecuteStep determines whether a job step should execute based on its condition.
-func shouldExecuteStep(cond string, ctx map[string]any, jobFailed, jobCancelled bool) bool {
-	trimmed := strings.TrimSpace(cond)
-	if strings.EqualFold(trimmed, "false") {
-		return false
-	}
-	if strings.EqualFold(trimmed, "true") {
-		return !jobFailed && !jobCancelled
-	}
-	if trimmed == "" || strings.EqualFold(trimmed, "success()") {
-		return !jobFailed && !jobCancelled
-	}
-	if strings.EqualFold(trimmed, "always()") {
-		return true
-	}
-	if strings.EqualFold(trimmed, "failure()") {
-		return jobFailed && !jobCancelled
-	}
-	if strings.EqualFold(trimmed, "cancelled()") {
-		return jobCancelled
-	}
-
-	// When the condition names none of success(), always(), failure(), or cancelled(),
-	// GitHub Actions implicitly requires !jobFailed && !jobCancelled.
-	if !containsStatusCheckFunction(trimmed) {
-		if jobFailed || jobCancelled {
-			return false
-		}
-	}
-
-	evalCtx := make(map[string]any, len(ctx)+4)
-	for k, v := range ctx {
-		evalCtx[k] = v
-	}
-	evalCtx["_job_failed"] = jobFailed
-	evalCtx["_job_cancelled"] = jobCancelled
-
-	res := evaluateExpression(trimmed, evalCtx)
-	return isTruthy(res)
-}
-
 func evaluateValue(val string, ctx map[string]any) string {
 	trimmed := strings.TrimSpace(val)
 	if strings.Contains(trimmed, "${{") || strings.HasPrefix(trimmed, "format(") {
 		return evaluateExpression(trimmed, ctx)
 	}
 	return val
-}
-
-func formatTemplate(templateStr string, argVals []string) string {
-	var sb strings.Builder
-	for i := 0; i < len(templateStr); {
-		if templateStr[i] == '{' {
-			if i+1 < len(templateStr) && templateStr[i+1] == '{' {
-				sb.WriteByte('{')
-				i += 2
-				continue
-			}
-			closeIdx := strings.IndexByte(templateStr[i+1:], '}')
-			if closeIdx != -1 {
-				numStr := templateStr[i+1 : i+1+closeIdx]
-				if idx, err := strconv.Atoi(numStr); err == nil && idx >= 0 && idx < len(argVals) {
-					sb.WriteString(argVals[idx])
-					i += 1 + closeIdx + 1
-					continue
-				}
-			}
-			sb.WriteByte('{')
-			i++
-			continue
-		}
-		if templateStr[i] == '}' {
-			if i+1 < len(templateStr) && templateStr[i+1] == '}' {
-				sb.WriteByte('}')
-				i += 2
-				continue
-			}
-			sb.WriteByte('}')
-			i++
-			continue
-		}
-		sb.WriteByte(templateStr[i])
-		i++
-	}
-	return sb.String()
-}
-
-func findMatchingExpressionEnd(s string) int {
-	inQuotes := false
-	for i := 0; i < len(s)-1; i++ {
-		if s[i] == '\'' {
-			if inQuotes && i+1 < len(s) && s[i+1] == '\'' {
-				i++
-				continue
-			}
-			inQuotes = !inQuotes
-			continue
-		}
-		if !inQuotes && s[i] == '}' && s[i+1] == '}' {
-			return i
-		}
-	}
-	return -1
-}
-
-func isSingleQuotedLiteral(s string) bool {
-	if !strings.HasPrefix(s, "'") || !strings.HasSuffix(s, "'") || len(s) < 2 {
-		return false
-	}
-	i := 1
-	for i < len(s) {
-		if s[i] == '\'' {
-			if i+1 < len(s) && s[i+1] == '\'' {
-				// Escaped quote: ''
-				i += 2
-				continue
-			}
-			return i == len(s)-1
-		}
-		i++
-	}
-	return false
-}
-
-func evaluateExpression(expr string, ctx map[string]any) string {
-	trimmed := strings.TrimSpace(expr)
-	if trimmed == "" {
-		return ""
-	}
-
-	// String literals: 'foo'
-	if isSingleQuotedLiteral(trimmed) {
-		unquoted := trimmed[1 : len(trimmed)-1]
-		return strings.ReplaceAll(unquoted, "''", "'")
-	}
-
-	// Handle format('template', arg0, arg1, ...) before embedded expression evaluation
-	if strings.HasPrefix(trimmed, "format(") && strings.HasSuffix(trimmed, ")") {
-		inner := strings.TrimSpace(trimmed[7 : len(trimmed)-1])
-		args := parseExpressionArgs(inner)
-		if len(args) > 0 {
-			templateStr := evaluateExpression(args[0], ctx)
-			var argVals []string
-			for i := 1; i < len(args); i++ {
-				argVals = append(argVals, evaluateExpression(args[i], ctx))
-			}
-			return formatTemplate(templateStr, argVals)
-		}
-	}
-
-	// Strip outer ${{ ... }} wrappers if present across the entire expression
-	if strings.HasPrefix(trimmed, "${{") && strings.HasSuffix(trimmed, "}}") {
-		endIdx := findMatchingExpressionEnd(trimmed[3:])
-		if endIdx != -1 && endIdx == len(trimmed[3:])-2 {
-			trimmed = strings.TrimSpace(trimmed[3 : len(trimmed)-2])
-		}
-	}
-
-	// Re-check format(...) in case it was wrapped in ${{ format(...) }}
-	if strings.HasPrefix(trimmed, "format(") && strings.HasSuffix(trimmed, ")") {
-		inner := strings.TrimSpace(trimmed[7 : len(trimmed)-1])
-		args := parseExpressionArgs(inner)
-		if len(args) > 0 {
-			templateStr := evaluateExpression(args[0], ctx)
-			var argVals []string
-			for i := 1; i < len(args); i++ {
-				argVals = append(argVals, evaluateExpression(args[i], ctx))
-			}
-			return formatTemplate(templateStr, argVals)
-		}
-	}
-
-	// Check if this string contains embedded ${{ ... }} expressions with text before or after, or multiple expressions
-	if strings.Contains(trimmed, "${{") && strings.Contains(trimmed, "}}") {
-		var sb strings.Builder
-		remaining := trimmed
-		hasEmbedded := false
-		for {
-			s := strings.Index(remaining, "${{")
-			if s == -1 {
-				sb.WriteString(remaining)
-				break
-			}
-			eRel := findMatchingExpressionEnd(remaining[s+len("${{"):])
-			if eRel == -1 {
-				sb.WriteString(remaining)
-				break
-			}
-			hasEmbedded = true
-			e := s + len("${{") + eRel
-			sb.WriteString(remaining[:s])
-			inner := strings.TrimSpace(remaining[s+len("${{") : e])
-			sb.WriteString(evaluateExpression(inner, ctx))
-			remaining = remaining[e+len("}}"):]
-		}
-		if hasEmbedded {
-			return sb.String()
-		}
-	}
-
-	// Trim outer matching parentheses: (expr)
-	for strings.HasPrefix(trimmed, "(") && strings.HasSuffix(trimmed, ")") {
-		depth := 0
-		matched := true
-		for i := 0; i < len(trimmed)-1; i++ {
-			if trimmed[i] == '(' {
-				depth++
-			} else if trimmed[i] == ')' {
-				depth--
-				if depth == 0 {
-					matched = false
-					break
-				}
-			}
-		}
-		if matched && depth == 1 {
-			trimmed = strings.TrimSpace(trimmed[1 : len(trimmed)-1])
-		} else {
-			break
-		}
-	}
-
-	// Handle status check functions
-	if strings.EqualFold(trimmed, "success()") {
-		failed, _ := ctx["_job_failed"].(bool)
-		cancelled, _ := ctx["_job_cancelled"].(bool)
-		if !failed && !cancelled {
-			return "true"
-		}
-		return "false"
-	}
-	if strings.EqualFold(trimmed, "always()") {
-		return "true"
-	}
-	if strings.EqualFold(trimmed, "failure()") {
-		failed, _ := ctx["_job_failed"].(bool)
-		cancelled, _ := ctx["_job_cancelled"].(bool)
-		if failed && !cancelled {
-			return "true"
-		}
-		return "false"
-	}
-	if strings.EqualFold(trimmed, "cancelled()") {
-		cancelled, _ := ctx["_job_cancelled"].(bool)
-		if cancelled {
-			return "true"
-		}
-		return "false"
-	}
-
-	// Handle OR expressions: left || right at top level
-	if orParts := splitTopLevel(trimmed, " || "); len(orParts) > 1 {
-		for _, part := range orParts {
-			res := evaluateExpression(part, ctx)
-			if isTruthy(res) {
-				return res
-			}
-		}
-		return evaluateExpression(orParts[len(orParts)-1], ctx)
-	}
-
-	// Handle AND expressions: left && right at top level
-	if andParts := splitTopLevel(trimmed, " && "); len(andParts) > 1 {
-		for _, part := range andParts {
-			res := evaluateExpression(part, ctx)
-			if !isTruthy(res) {
-				return ""
-			}
-		}
-		return evaluateExpression(andParts[len(andParts)-1], ctx)
-	}
-
-	// Handle equality expressions: left == right at top level
-	if eqParts := splitTopLevel(trimmed, " == "); len(eqParts) == 2 {
-		left := evaluateExpression(eqParts[0], ctx)
-		right := evaluateExpression(eqParts[1], ctx)
-		if strings.EqualFold(left, right) {
-			return "true"
-		}
-		return "false"
-	}
-
-	// Handle inequality expressions: left != right at top level
-	if neParts := splitTopLevel(trimmed, " != "); len(neParts) == 2 {
-		left := evaluateExpression(neParts[0], ctx)
-		right := evaluateExpression(neParts[1], ctx)
-		if !strings.EqualFold(left, right) {
-			return "true"
-		}
-		return "false"
-	}
-
-	// Handle prefix NOT: !expr
-	if strings.HasPrefix(trimmed, "!") {
-		inner := strings.TrimSpace(trimmed[1:])
-		res := evaluateExpression(inner, ctx)
-		if isTruthy(res) {
-			return "false"
-		}
-		return "true"
-	}
-
-	// Handle startsWith(searchString, prefix) - case-insensitive per GitHub Actions specification
-	if strings.HasPrefix(trimmed, "startsWith(") && strings.HasSuffix(trimmed, ")") {
-		inner := strings.TrimSpace(trimmed[11 : len(trimmed)-1])
-		args := parseExpressionArgs(inner)
-		if len(args) >= 2 {
-			str := strings.ToLower(evaluateExpression(args[0], ctx))
-			prefix := strings.ToLower(evaluateExpression(args[1], ctx))
-			if strings.HasPrefix(str, prefix) {
-				return "true"
-			}
-			return "false"
-		}
-	}
-
-	// Handle endsWith(searchString, suffix) - case-insensitive per GitHub Actions specification
-	if strings.HasPrefix(trimmed, "endsWith(") && strings.HasSuffix(trimmed, ")") {
-		inner := strings.TrimSpace(trimmed[9 : len(trimmed)-1])
-		args := parseExpressionArgs(inner)
-		if len(args) >= 2 {
-			str := strings.ToLower(evaluateExpression(args[0], ctx))
-			suffix := strings.ToLower(evaluateExpression(args[1], ctx))
-			if strings.HasSuffix(str, suffix) {
-				return "true"
-			}
-			return "false"
-		}
-	}
-
-	// Handle contains(searchString, item) - case-insensitive per GitHub Actions specification
-	if strings.HasPrefix(trimmed, "contains(") && strings.HasSuffix(trimmed, ")") {
-		inner := strings.TrimSpace(trimmed[9 : len(trimmed)-1])
-		args := parseExpressionArgs(inner)
-		if len(args) >= 2 {
-			str := strings.ToLower(evaluateExpression(args[0], ctx))
-			item := strings.ToLower(evaluateExpression(args[1], ctx))
-			if strings.Contains(str, item) {
-				return "true"
-			}
-			return "false"
-		}
-	}
-
-	// Handle eq(a, b)
-	if strings.HasPrefix(trimmed, "eq(") && strings.HasSuffix(trimmed, ")") {
-		inner := strings.TrimSpace(trimmed[3 : len(trimmed)-1])
-		args := parseExpressionArgs(inner)
-		if len(args) >= 2 {
-			a := evaluateExpression(args[0], ctx)
-			b := evaluateExpression(args[1], ctx)
-			if strings.EqualFold(a, b) {
-				return "true"
-			}
-			return "false"
-		}
-	}
-
-	// Handle ne(a, b)
-	if strings.HasPrefix(trimmed, "ne(") && strings.HasSuffix(trimmed, ")") {
-		inner := strings.TrimSpace(trimmed[3 : len(trimmed)-1])
-		args := parseExpressionArgs(inner)
-		if len(args) >= 2 {
-			a := evaluateExpression(args[0], ctx)
-			b := evaluateExpression(args[1], ctx)
-			if !strings.EqualFold(a, b) {
-				return "true"
-			}
-			return "false"
-		}
-	}
-
-	// Handle and(arg0, arg1, ...)
-	if strings.HasPrefix(trimmed, "and(") && strings.HasSuffix(trimmed, ")") {
-		inner := strings.TrimSpace(trimmed[4 : len(trimmed)-1])
-		args := parseExpressionArgs(inner)
-		for _, arg := range args {
-			res := evaluateExpression(arg, ctx)
-			if !isTruthy(res) {
-				return "false"
-			}
-		}
-		return "true"
-	}
-
-	// Handle or(arg0, arg1, ...)
-	if strings.HasPrefix(trimmed, "or(") && strings.HasSuffix(trimmed, ")") {
-		inner := strings.TrimSpace(trimmed[3 : len(trimmed)-1])
-		args := parseExpressionArgs(inner)
-		for _, arg := range args {
-			res := evaluateExpression(arg, ctx)
-			if isTruthy(res) {
-				return "true"
-			}
-		}
-		return "false"
-	}
-
-	// Handle not(arg)
-	if strings.HasPrefix(trimmed, "not(") && strings.HasSuffix(trimmed, ")") {
-		inner := strings.TrimSpace(trimmed[4 : len(trimmed)-1])
-		res := evaluateExpression(inner, ctx)
-		if isTruthy(res) {
-			return "false"
-		}
-		return "true"
-	}
-
-	// String literals: 'foo'
-	if strings.HasPrefix(trimmed, "'") && strings.HasSuffix(trimmed, "'") && len(trimmed) >= 2 {
-		unquoted := trimmed[1 : len(trimmed)-1]
-		return strings.ReplaceAll(unquoted, "''", "'")
-	}
-
-	// Boolean/null literals
-	if trimmed == "true" || trimmed == "false" || trimmed == "null" {
-		return trimmed
-	}
-
-	// Context lookup (e.g. inputs.platforms, needs.detect.outputs.platforms, github.event_name)
-	if val, ok := lookupContext(trimmed, ctx); ok && val != nil {
-		return fmt.Sprint(val)
-	} else if isContextPath(trimmed) {
-		return ""
-	}
-
-	return trimmed
 }
 
 // IngestPathFile reads lines from the file at filePath, cleans each non-empty entry,
@@ -2515,7 +2098,11 @@ func (c *Coordinator) executePostHooks(ctx context.Context, jobID string, postHo
 	detector := c.getNodeDetector()
 	nodePath, err := detector.Detect(postCtx)
 	if err != nil {
-		c.NotifyJobStepLog(jobID, "", fmt.Sprintf("Error detecting Node runtime for post hooks: %v", err))
+		errMsg := fmt.Sprintf("Error detecting Node runtime for post hooks: %v", err)
+		if jobMasker != nil {
+			errMsg = jobMasker.Mask(errMsg)
+		}
+		c.NotifyJobStepLog(jobID, "", errMsg)
 		return err
 	}
 
@@ -2644,11 +2231,13 @@ func (c *Coordinator) executeSinglePostHook(ctx context.Context, jobID string, h
 		}
 	}
 
+	c.mu.RLock()
 	stdout := c.stdout
+	stderr := c.stderr
+	c.mu.RUnlock()
 	if stdout == nil {
 		stdout = os.Stdout
 	}
-	stderr := c.stderr
 	if stderr == nil {
 		stderr = os.Stderr
 	}
@@ -2683,14 +2272,23 @@ func (c *Coordinator) executeSinglePostHook(ctx context.Context, jobID string, h
 		stdout = stepOutWriter
 		stderr = stepErrWriter
 	} else {
+		rawOut := stdout
+		rawErr := stderr
+		var outMu sync.Mutex
 		lineOutWriter := NewLineWriter(func(line string) {
+			outMu.Lock()
+			_, _ = fmt.Fprintln(rawOut, line)
+			outMu.Unlock()
 			c.NotifyJobStepLog(jobID, hook.StepID, line)
 		}).WithMasker(jobMasker)
 		lineErrWriter := NewLineWriter(func(line string) {
+			outMu.Lock()
+			_, _ = fmt.Fprintln(rawErr, line)
+			outMu.Unlock()
 			c.NotifyJobStepLog(jobID, hook.StepID, line)
 		}).WithMasker(jobMasker)
-		stdout = io.MultiWriter(stdout, lineOutWriter)
-		stderr = io.MultiWriter(stderr, lineErrWriter)
+		stdout = lineOutWriter
+		stderr = lineErrWriter
 		stepOutWriter = lineOutWriter
 		stepErrWriter = lineErrWriter
 	}
@@ -2710,8 +2308,46 @@ func (c *Coordinator) executeSinglePostHook(ctx context.Context, jobID string, h
 	}
 
 	if execErr != nil {
-		c.NotifyJobStepLog(jobID, hook.StepID, fmt.Sprintf("Error executing post step %s: %v", hook.StepID, execErr))
+		errMsg := fmt.Sprintf("Error executing post step %s: %v", hook.StepID, execErr)
+		if jobMasker != nil {
+			errMsg = jobMasker.Mask(errMsg)
+		}
+		c.NotifyJobStepLog(jobID, hook.StepID, errMsg)
 		return execErr
 	}
 	return nil
+}
+
+// sanitizeJobDirComponent converts an arbitrary job name or ID into a safe single path segment.
+func sanitizeJobDirComponent(s string) string {
+	var b strings.Builder
+	for _, r := range strings.TrimSpace(s) {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('-')
+		}
+	}
+	res := strings.Trim(b.String(), "._-")
+	for strings.Contains(res, "..") {
+		res = strings.ReplaceAll(res, "..", ".")
+	}
+	res = strings.Trim(res, "._-")
+	if len(res) > 64 {
+		res = strings.TrimRight(res[:64], "._-")
+	}
+	if res == "" || res == "." || res == ".." {
+		return "job"
+	}
+	return res
+}
+
+func hasPathPrefix(p, prefix string) bool {
+	cp := filepath.Clean(p)
+	cpref := filepath.Clean(prefix)
+	if cp == cpref {
+		return true
+	}
+	sep := string(filepath.Separator)
+	return strings.HasPrefix(cp, strings.TrimSuffix(cpref, sep)+sep)
 }

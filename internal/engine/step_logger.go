@@ -47,6 +47,15 @@ func NewSecretMasker() *SecretMasker {
 // AddMask registers a secret string to be redacted from log outputs.
 // Secrets shorter than 3 characters are ignored to prevent pathological over-redaction of common characters.
 func (sm *SecretMasker) AddMask(secret string) {
+	if sm == nil {
+		return
+	}
+	if strings.Contains(secret, "\n") {
+		for _, line := range strings.Split(secret, "\n") {
+			sm.AddMask(line)
+		}
+		return
+	}
 	secret = strings.TrimSpace(secret)
 	if len(secret) < 3 {
 		return
@@ -175,6 +184,9 @@ func (sl *StepLogger) Mask(s string) string {
 
 // LogStepStart outputs a step start banner.
 func (sl *StepLogger) LogStepStart(stepName, script string) {
+	if sl == nil {
+		return
+	}
 	sl.mu.Lock()
 	defer sl.mu.Unlock()
 
@@ -192,6 +204,9 @@ func (sl *StepLogger) LogStepStart(stepName, script string) {
 
 // LogStepEnd outputs a step completion or failure banner with execution duration.
 func (sl *StepLogger) LogStepEnd(stepName string, success bool, duration time.Duration) {
+	if sl == nil {
+		return
+	}
 	sl.mu.Lock()
 	defer sl.mu.Unlock()
 
@@ -218,6 +233,9 @@ func (sl *StepLogger) LogStepEnd(stepName string, success bool, duration time.Du
 
 // NewWriter returns a thread-safe io.Writer wrapping standard output or standard error.
 func (sl *StepLogger) NewWriter(streamName string) *StepWriter {
+	if sl == nil {
+		return NewLineWriter(nil)
+	}
 	return &StepWriter{
 		logger: sl,
 		stream: streamName,
@@ -243,8 +261,8 @@ type StepWriter struct {
 	masker *SecretMasker
 }
 
-// ensureMasker guarantees a non-nil masker is returned.
-func (sw *StepWriter) ensureMasker() *SecretMasker {
+// ensureMaskerLocked guarantees a non-nil masker is returned. sw.mu must be held.
+func (sw *StepWriter) ensureMaskerLocked() *SecretMasker {
 	if sw.masker != nil {
 		return sw.masker
 	}
@@ -258,11 +276,19 @@ func (sw *StepWriter) ensureMasker() *SecretMasker {
 
 // Masker returns the secret masker.
 func (sw *StepWriter) Masker() *SecretMasker {
-	return sw.ensureMasker()
+	if sw == nil {
+		return nil
+	}
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	return sw.ensureMaskerLocked()
 }
 
 // WithMasker attaches a custom secret masker to the StepWriter.
 func (sw *StepWriter) WithMasker(masker *SecretMasker) *StepWriter {
+	if sw == nil {
+		return nil
+	}
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
 	sw.masker = masker
@@ -271,16 +297,36 @@ func (sw *StepWriter) WithMasker(masker *SecretMasker) *StepWriter {
 
 // AddMask registers a secret string to be redacted.
 func (sw *StepWriter) AddMask(secret string) {
-	sw.ensureMasker().AddMask(secret)
+	if sw == nil {
+		return
+	}
+	sw.mu.Lock()
+	m := sw.ensureMaskerLocked()
+	sw.mu.Unlock()
+	if m != nil {
+		m.AddMask(secret)
+	}
 }
 
 // Mask replaces all occurrences of registered secrets with ***.
 func (sw *StepWriter) Mask(s string) string {
-	return sw.ensureMasker().Mask(s)
+	if sw == nil {
+		return s
+	}
+	sw.mu.Lock()
+	m := sw.ensureMaskerLocked()
+	sw.mu.Unlock()
+	if m != nil {
+		return m.Mask(s)
+	}
+	return s
 }
 
 // WithCallback registers a callback invoked for each unformatted line.
 func (sw *StepWriter) WithCallback(onLine func(string)) *StepWriter {
+	if sw == nil {
+		return nil
+	}
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
 	sw.onLine = onLine
@@ -289,6 +335,9 @@ func (sw *StepWriter) WithCallback(onLine func(string)) *StepWriter {
 
 // Write processes input bytes, splitting on newlines and formatting complete lines.
 func (sw *StepWriter) Write(p []byte) (n int, err error) {
+	if sw == nil {
+		return 0, nil
+	}
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
 
@@ -312,6 +361,9 @@ func (sw *StepWriter) Write(p []byte) (n int, err error) {
 
 // Flush writes any remaining buffered line content.
 func (sw *StepWriter) Flush() {
+	if sw == nil {
+		return
+	}
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
 
@@ -326,7 +378,9 @@ func (sw *StepWriter) writeFormattedLine(line string) {
 	trimmed := strings.TrimRight(line, "\r")
 	if secret, ok := parseAddMask(trimmed); ok {
 		if secret != "" {
-			sw.AddMask(secret)
+			if m := sw.ensureMaskerLocked(); m != nil {
+				m.AddMask(secret)
+			}
 		}
 		return
 	}
@@ -334,7 +388,11 @@ func (sw *StepWriter) writeFormattedLine(line string) {
 		return
 	}
 
-	masked := sw.Mask(trimmed)
+	m := sw.ensureMaskerLocked()
+	masked := trimmed
+	if m != nil {
+		masked = m.Mask(trimmed)
+	}
 	if sw.onLine != nil {
 		sw.onLine(masked)
 	}

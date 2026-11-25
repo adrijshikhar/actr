@@ -5,6 +5,7 @@ package host
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -39,9 +40,19 @@ func TestLinuxLimiter_DirectCgroupV2(t *testing.T) {
 		Pids:   50,
 	}
 
-	pid := os.Getpid()
+	cmd := exec.Command("sleep", "30")
+	require.NoError(t, cmd.Start())
+	defer func() {
+		_ = cmd.Process.Kill()
+	}()
+
+	pid := cmd.Process.Pid
 	cleanup, err := limiter.tryCgroupsV2(pid, limits)
 	require.NoError(t, err)
+
+	subtree, err := os.ReadFile(filepath.Join(tmpCgroup, "actr", "cgroup.subtree_control"))
+	require.NoError(t, err)
+	assert.Equal(t, "+cpu +memory +pids", string(subtree))
 
 	cgroupDir := filepath.Join(tmpCgroup, "actr", fmt.Sprintf("job-%d", pid))
 	cpuMax, err := os.ReadFile(filepath.Join(cgroupDir, "cpu.max"))
@@ -56,9 +67,11 @@ func TestLinuxLimiter_DirectCgroupV2(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "50\n", string(pidsMax))
 
-	// Write mock oom_kill event before cleanup
+	// Write mock oom_kill event and mock lingering procs before cleanup
 	require.NoError(t, os.WriteFile(filepath.Join(cgroupDir, "memory.events"), []byte("oom_kill 1\n"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(cgroupDir, "cgroup.procs"), []byte(fmt.Sprintf("%d\n999999\n", pid)), 0644))
 
 	cleanup()
+	assert.Error(t, cmd.Wait(), "sacrificial child process should have been terminated by cleanup")
 	assert.True(t, limiter.IsOOMKilled(pid))
 }

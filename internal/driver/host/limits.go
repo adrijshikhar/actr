@@ -117,23 +117,39 @@ func (w *processWatchdog) run() {
 }
 
 func getProcessTreeRSS(pid int) (uint64, error) {
-	p, err := process.NewProcess(int32(pid))
+	root, err := process.NewProcess(int32(pid))
 	if err != nil {
 		return 0, err
 	}
-	memInfo, err := p.MemoryInfo()
+	memInfo, err := root.MemoryInfo()
 	if err != nil {
 		return 0, err
 	}
 	totalRSS := memInfo.RSS
 
-	children, err := p.Children()
-	if err == nil {
+	seen := map[int32]bool{int32(pid): true}
+	queue := []*process.Process{root}
+
+	for len(queue) > 0 {
+		curr := queue[0]
+		queue = queue[1:]
+
+		children, err := curr.Children()
+		if err != nil {
+			continue
+		}
 		for _, ch := range children {
+			childPID := ch.Pid
+			if seen[childPID] {
+				continue
+			}
+			seen[childPID] = true
 			if cMem, err := ch.MemoryInfo(); err == nil && cMem != nil {
 				totalRSS += cMem.RSS
 			}
+			queue = append(queue, ch)
 		}
 	}
+
 	return totalRSS, nil
 }

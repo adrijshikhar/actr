@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"strings"
 )
@@ -28,6 +29,7 @@ func ParseCommandFile(path string) (map[string]string, error) {
 
 	for scanner.Scan() {
 		line := scanner.Text()
+		line = strings.TrimRight(line, "\r")
 		if inMultiLine {
 			if line == delimiter {
 				results[currentKey] = strings.TrimSuffix(multiLine.String(), "\n")
@@ -44,13 +46,22 @@ func ParseCommandFile(path string) (map[string]string, error) {
 
 		if heredocIdx != -1 && (eqIdx == -1 || heredocIdx < eqIdx) {
 			currentKey = strings.TrimSpace(line[:heredocIdx])
+			if currentKey == "" {
+				continue
+			}
 			delimiter = strings.TrimSpace(line[heredocIdx+2:])
+			if delimiter == "" {
+				return nil, fmt.Errorf("empty heredoc delimiter for key %q", currentKey)
+			}
 			inMultiLine = true
 			continue
 		}
 
 		if eqIdx != -1 {
 			k := strings.TrimSpace(line[:eqIdx])
+			if k == "" {
+				continue
+			}
 			v := line[eqIdx+1:]
 			results[k] = v
 		}
@@ -58,6 +69,10 @@ func ParseCommandFile(path string) (map[string]string, error) {
 
 	if err := scanner.Err(); err != nil {
 		return nil, err
+	}
+
+	if inMultiLine {
+		return nil, fmt.Errorf("unterminated heredoc delimiter %q for key %q", delimiter, currentKey)
 	}
 
 	return results, nil

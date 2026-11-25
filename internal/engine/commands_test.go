@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestParseEnvAndOutputFile(t *testing.T) {
@@ -209,3 +212,24 @@ func TestParsePathFile_LargeLine128KB(t *testing.T) {
 		t.Errorf("expected 1 path with length %d, got %d", len(largePath), len(paths[0]))
 	}
 }
+
+func TestParseCommandFile_RejectsUnterminatedHeredocAndEmptyKey(t *testing.T) {
+	dir := t.TempDir()
+	p1 := filepath.Join(dir, "unterminated")
+	require.NoError(t, os.WriteFile(p1, []byte("KEY<<EOF\nhello\n"), 0o600))
+	_, err := ParseCommandFile(p1)
+	require.Error(t, err)
+
+	p2 := filepath.Join(dir, "emptykey")
+	require.NoError(t, os.WriteFile(p2, []byte("=bad\r\nGOOD=val\r\n"), 0o600))
+	m, err := ParseCommandFile(p2)
+	require.NoError(t, err)
+	assert.NotContains(t, m, "")
+	assert.Equal(t, "val", m["GOOD"])
+
+	p3 := filepath.Join(dir, "emptydelim")
+	require.NoError(t, os.WriteFile(p3, []byte("KEY<<\nhello\n"), 0o600))
+	_, err = ParseCommandFile(p3)
+	require.Error(t, err)
+}
+
