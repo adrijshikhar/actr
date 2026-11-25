@@ -101,7 +101,8 @@ func (d *Driver) ExecuteStep(ctx context.Context, step *driver.StepSpec, stdout,
 		scriptDir = osTemp
 	}
 
-	absScriptFile := filepath.Join(scriptDir, fmt.Sprintf("step_%s_%d.sh", step.ID, time.Now().UnixNano()))
+	cleanStepID := strings.ReplaceAll(strings.ReplaceAll(step.ID, "/", "_"), "\\", "_")
+	absScriptFile := filepath.Join(scriptDir, fmt.Sprintf("step_%s_%d.sh", cleanStepID, time.Now().UnixNano()))
 	if err := os.WriteFile(absScriptFile, []byte(step.Script), 0o755); err != nil {
 		return nil, fmt.Errorf("write script file: %w", err)
 	}
