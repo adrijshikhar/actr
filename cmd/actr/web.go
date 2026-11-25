@@ -663,10 +663,8 @@ func (a *historyRunStoreAdapter) GetRunMetrics(ctx context.Context, runID string
 		return samples, nil
 	}
 
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	// If live daemon client is connected, try to sample live telemetry
+	// If live daemon client is connected, try to sample live telemetry OUTSIDE mutex lock
+	var liveSample *monitor.TelemetrySample
 	if a.client != nil {
 		if snap, err := a.client.GetSnapshot(ctx); err == nil && snap != nil && snap.Telemetry != nil {
 			isActiveForRun := false
@@ -676,19 +674,36 @@ func (a *historyRunStoreAdapter) GetRunMetrics(ctx context.Context, runID string
 					break
 				}
 			}
-			if !isActiveForRun && len(snap.ActiveJobs) <= 1 {
-				isActiveForRun = true
-			}
-			if isActiveForRun {
-				existing := a.samples[runID]
-				if len(existing) == 0 || !existing[len(existing)-1].Timestamp.Equal(snap.Telemetry.Timestamp) {
-					existing = append(existing, snap.Telemetry)
-					if len(existing) > 60 {
-						existing = existing[len(existing)-60:]
-					}
-					a.samples[runID] = existing
+			if !isActiveForRun && len(snap.ActiveJobs) == 1 {
+				singleJob := snap.ActiveJobs[0]
+				if singleJob != nil && (runID == "" || singleJob.ID == runID || strings.HasPrefix(runID, singleJob.ID)) {
+					isActiveForRun = true
 				}
 			}
+			if isActiveForRun {
+				liveSample = snap.Telemetry
+			}
+		}
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if liveSample != nil {
+		existing := a.samples[runID]
+		if len(existing) == 0 || !existing[len(existing)-1].Timestamp.Equal(liveSample.Timestamp) {
+			existing = append(existing, liveSample)
+			if len(existing) > 60 {
+				existing = existing[len(existing)-60:]
+			}
+			// Cap total tracked runs in a.samples to prevent unbounded growth
+			if len(a.samples) >= 50 && a.samples[runID] == nil {
+				for k := range a.samples {
+					delete(a.samples, k)
+					break
+				}
+			}
+			a.samples[runID] = existing
 		}
 	}
 

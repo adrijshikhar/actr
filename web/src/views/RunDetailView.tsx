@@ -185,6 +185,10 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
           // Handle run status updates
           if (evt.job || evt.type === 'job_complete' || evt.type === 'run_finished') {
             setRun((prev) => (prev ? { ...prev, status: evt.job?.status || 'completed' } : prev));
+            // Automatically refresh run data so final metrics_summary, duration, and steps are loaded
+            setTimeout(() => {
+              loadRunData();
+            }, 600);
           }
         },
         {
@@ -244,7 +248,11 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
       return run.metrics_summary.total_disk_written_bytes;
     }
     if (metrics.length > 0) {
-      return metrics[metrics.length - 1].disk_write_rate || 0;
+      const latest = metrics[metrics.length - 1];
+      if (latest.disk_written_bytes) {
+        return latest.disk_written_bytes;
+      }
+      return latest.disk_write_rate || 0;
     }
     return 0;
   }, [metrics, run?.metrics_summary]);
@@ -256,6 +264,9 @@ export function RunDetailView({ runId, onBack }: RunDetailViewProps) {
     }
     if (metrics.length > 0) {
       const latest = metrics[metrics.length - 1];
+      if (latest.net_rx_bytes || latest.net_tx_bytes) {
+        return (latest.net_rx_bytes || 0) + (latest.net_tx_bytes || 0);
+      }
       return (latest.net_rx_rate || 0) + (latest.net_tx_rate || 0);
     }
     return 0;
