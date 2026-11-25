@@ -27,6 +27,8 @@ func ValidateRepoAlias(alias string) error {
 	return nil
 }
 
+// verifyDirContained checks that targetDir does not escape absBaseDir via traversal or symlinks.
+// Note: Explicit absolute config_dir paths configured by an administrator are trusted.
 func verifyDirContained(absBaseDir, targetDir string) error {
 	absTarget, err := filepath.Abs(targetDir)
 	if err != nil {
@@ -38,6 +40,15 @@ func verifyDirContained(absBaseDir, targetDir string) error {
 	}
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
 		return fmt.Errorf("repo config_dir %q escapes config base directory %q", targetDir, absBaseDir)
+	}
+
+	if evalBase, err := filepath.EvalSymlinks(absBaseDir); err == nil {
+		if evalTarget, err := filepath.EvalSymlinks(absTarget); err == nil {
+			symRel, err := filepath.Rel(evalBase, evalTarget)
+			if err != nil || symRel == ".." || strings.HasPrefix(symRel, ".."+string(filepath.Separator)) || filepath.IsAbs(symRel) {
+				return fmt.Errorf("repo config_dir %q escapes config base directory %q", targetDir, absBaseDir)
+			}
+		}
 	}
 	return nil
 }
@@ -181,6 +192,13 @@ func LoadSupervisorConfig(configPath string) (*SupervisorConfig, error) {
 
 // SaveSupervisorConfig writes the supervisor configuration to configPath atomically.
 func SaveSupervisorConfig(configPath string, cfg *SupervisorConfig) error {
+	if cfg != nil {
+		for alias := range cfg.Repos {
+			if err := ValidateRepoAlias(alias); err != nil {
+				return fmt.Errorf("invalid repository alias %q: %w", alias, err)
+			}
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(configPath), 0700); err != nil {
 		return fmt.Errorf("create supervisor config dir: %w", err)
 	}

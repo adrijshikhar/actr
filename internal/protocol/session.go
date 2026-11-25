@@ -54,15 +54,18 @@ func DecryptAESKey(priv *rsa.PrivateKey, encKey []byte) ([]byte, error) {
 		}
 		return key, nil
 	}
-	sessionKey := make([]byte, 32)
-	if _, err := rand.Read(sessionKey); err != nil {
-		return nil, fmt.Errorf("generate fallback session key: %w", err)
-	}
+
+	// Try PKCS#1 v1.5 with direct decrypt to verify padding and return true key length
 	//nolint:staticcheck // GitHub Actions broker protocol supports PKCS#1 v1.5 session key exchange
-	if err := rsa.DecryptPKCS1v15SessionKey(rand.Reader, priv, encKey, sessionKey); err != nil {
-		return nil, err
+	decrypted, err := rsa.DecryptPKCS1v15(rand.Reader, priv, encKey)
+	if err == nil {
+		if !isValidAESKeyLen(len(decrypted)) {
+			return nil, fmt.Errorf("invalid AES key length %d: must be 16, 24, or 32", len(decrypted))
+		}
+		return decrypted, nil
 	}
-	return sessionKey, nil
+
+	return nil, fmt.Errorf("failed to decrypt AES session key with RSA-OAEP or PKCS#1 v1.5: %w", err)
 }
 
 // DecryptPayload decrypts AES-CBC encrypted ciphertext using the provided AES key and IV,
@@ -90,11 +93,15 @@ func DecryptPayload(aesKey, iv, ciphertext []byte) ([]byte, error) {
 }
 
 func pkcs7Pad(b []byte, blockSize int) []byte {
+	if blockSize <= 0 || blockSize > 255 {
+		blockSize = 16
+	}
 	padding := blockSize - (len(b) % blockSize)
+	padByte := byte(padding & 0xFF)
 	out := make([]byte, len(b)+padding)
 	copy(out, b)
 	for i := len(b); i < len(out); i++ {
-		out[i] = byte(padding)
+		out[i] = padByte
 	}
 	return out
 }

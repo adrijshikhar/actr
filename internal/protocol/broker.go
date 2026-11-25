@@ -354,13 +354,13 @@ func (b *BrokerClient) CreateSession(ctx context.Context, agentName string, agen
 		}
 		defer drainAndClose(resp.Body)
 
-		if resp.StatusCode == http.StatusConflict {
-			return resp.StatusCode, nil, nil
-		}
-
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		if err != nil {
 			return resp.StatusCode, nil, fmt.Errorf("read session response: %w", err)
+		}
+
+		if resp.StatusCode == http.StatusConflict {
+			return resp.StatusCode, body, nil
 		}
 		return resp.StatusCode, body, nil
 	}
@@ -709,9 +709,7 @@ func (b *BrokerClient) DeleteSession(ctx context.Context) error {
 		return resp.StatusCode, usedToken, nil
 	}
 
-	if err := b.maybeRefreshExpiredToken(ctx); err != nil {
-		return err
-	}
+	_ = b.maybeRefreshExpiredToken(ctx)
 
 	statusCode, usedToken, err := doDelete()
 	if statusCode == http.StatusUnauthorized && b.authURL != "" && b.privateKey != nil {

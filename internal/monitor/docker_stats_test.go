@@ -470,7 +470,11 @@ func TestTelemetrySampler_CancelStopsStaleWritesAndClosesOnce(t *testing.T) {
 
 	// Cancel container target; stats must remain cleared and reader closed exactly once
 	sampler.SetTargetContainer("", nil)
-	time.Sleep(30 * time.Millisecond)
+	require.Eventually(t, func() bool {
+		reader.mu.Lock()
+		defer reader.mu.Unlock()
+		return reader.closed >= 1
+	}, 2*time.Second, 10*time.Millisecond)
 
 	sampler.cStatsMu.RLock()
 	cStats := sampler.containerStats

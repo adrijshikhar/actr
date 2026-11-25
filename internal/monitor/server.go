@@ -346,6 +346,9 @@ func (s *Server) enforceRetentionBoundsLocked() {
 			if hasSlash && s.isActiveJobLocked(jobID) {
 				continue
 			}
+			if !hasSlash && len(s.activeJobs) > 0 {
+				continue
+			}
 			delete(s.stepLogs, k)
 		}
 	}
@@ -380,7 +383,21 @@ func (s *Server) sortRecentJobsLocked() {
 func (s *Server) enqueuePersist(fn func(), wait bool) <-chan struct{} {
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
+
+	const maxPersistQueue = 10000
+	for len(s.persistQueue) >= maxPersistQueue && !s.persistClosed {
+		s.persistCond.Wait()
+	}
+
 	if s.persistClosed {
+		if fn != nil {
+			fn()
+		}
+		if wait {
+			done := make(chan struct{})
+			close(done)
+			return done
+		}
 		return nil
 	}
 	if s.persistCond == nil {
@@ -402,6 +419,7 @@ func (s *Server) enqueuePersist(fn func(), wait bool) <-chan struct{} {
 				if len(s.persistQueue) == 0 && cap(s.persistQueue) > 1024 {
 					s.persistQueue = nil
 				}
+				s.persistCond.Broadcast()
 				s.persistMu.Unlock()
 
 				if task.fn != nil {
@@ -824,11 +842,13 @@ func (s *Server) Publish(ev Event) {
 			if !found {
 				s.recentJobs = append(s.recentJobs, jobToSave)
 			}
-			s.sortRecentJobsLocked()
 		}
 		s.activeJobs = updatedActive
 		if len(s.activeJobs) == 0 {
 			s.telemetry = nil
+		}
+		if jobToSave != nil {
+			s.sortRecentJobsLocked()
 		}
 
 		if store != nil && jobID != "" {

@@ -101,11 +101,14 @@ func (s *DiskStore) backupCorruptIndex(indexPath string) error {
 		return err
 	}
 	timestamp := fmt.Sprintf("%d", time.Now().UTC().UnixNano())
-	backupPath := fmt.Sprintf("%s.corrupt.%s", indexPath, timestamp)
+	backupPath := filepath.Clean(fmt.Sprintf("%s.corrupt.%s", indexPath, timestamp))
 	if err := os.Rename(indexPath, backupPath); err != nil {
 		if data, rErr := os.ReadFile(indexPath); rErr == nil {
-			_ = os.WriteFile(backupPath, data, 0600)
-			_ = os.Remove(indexPath)
+			if wErr := os.WriteFile(backupPath, data, 0600); wErr == nil {
+				if rmErr := os.Remove(indexPath); rmErr == nil {
+					return nil
+				}
+			}
 		}
 		return err
 	}
@@ -264,7 +267,7 @@ func (s *DiskStore) StartRun(job *monitor.JobInfo, limits *config.LimitsConfig, 
 
 	found := false
 	for i, r := range catalog.Runs {
-		if r.ID == summary.ID {
+		if r != nil && r.ID == summary.ID {
 			catalog.Runs[i] = summary
 			found = true
 			break
@@ -404,7 +407,7 @@ func (s *DiskStore) FinishRun(jobID string, status monitor.StepStatus, metrics *
 
 	var target *RunSummary
 	for _, r := range catalog.Runs {
-		if r.ID == jobID {
+		if r != nil && r.ID == jobID {
 			target = r
 			break
 		}

@@ -55,7 +55,7 @@ func ParseMemory(s string) (int64, error) {
 	var numParts strings.Builder
 	var unitParts strings.Builder
 	for i, r := range cleaned {
-		if unicode.IsDigit(r) || (r == '.' && i > 0) {
+		if unicode.IsDigit(r) || (r == '.' && i > 0) || ((r == 'e' || r == 'E') && i > 0) {
 			if unitParts.Len() > 0 {
 				return 0, fmt.Errorf("invalid memory string: %s", s)
 			}

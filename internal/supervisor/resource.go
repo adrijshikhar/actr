@@ -95,6 +95,29 @@ func (r *ResourceManager) Reserve(ctx context.Context) (Reservation, error) {
 	return &reservation{rm: r}, nil
 }
 
+// WaitAvailable blocks until there is unallocated execution capacity without claiming a slot.
+func (r *ResourceManager) WaitAvailable(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		r.mu.Lock()
+		if r.activeJobs < r.maxJobs {
+			r.mu.Unlock()
+			return nil
+		}
+		ch := r.waitCh
+		r.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ch:
+		}
+	}
+}
+
 func (r *ResourceManager) waitAndClaim(ctx context.Context, asReservation bool) error {
 	for {
 		if err := ctx.Err(); err != nil {

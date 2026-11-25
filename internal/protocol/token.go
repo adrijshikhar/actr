@@ -135,11 +135,10 @@ func ParseRSAPrivateKey(params *RSAParameters) (*rsa.PrivateKey, error) {
 		key.Precomputed.Qinv = new(big.Int).SetBytes(invqBytes)
 	}
 
-	if err := key.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid RSA private key: %w", err)
-	}
-
 	if len(key.Primes) >= 2 {
+		if err := key.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid RSA private key: %w", err)
+		}
 		key.Precompute()
 	}
 
@@ -284,7 +283,12 @@ func acquireOAuthTokenWithExpiry(ctx context.Context, client *http.Client, authU
 
 	var expiresAt time.Time
 	if tokenResp.ExpiresIn > 0 {
-		expiresAt = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
+		maxSeconds := int64(math.MaxInt64 / time.Second)
+		expSec := tokenResp.ExpiresIn
+		if expSec > maxSeconds {
+			expSec = maxSeconds
+		}
+		expiresAt = time.Now().Add(time.Duration(expSec) * time.Second)
 	}
 
 	return tokenResp.AccessToken, expiresAt, nil

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,6 +54,19 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 		Path:     filepath.ToSlash(dbPath),
 		RawQuery: "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)",
 	}
+	if dbPath != ":memory:" && !strings.HasPrefix(dbPath, "file:") {
+		dir := filepath.Dir(dbPath)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return nil, fmt.Errorf("create sqlite database dir: %w", err)
+		}
+		f, err := os.OpenFile(dbPath, os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			return nil, fmt.Errorf("create sqlite database file with 0600 permissions: %w", err)
+		}
+		_ = f.Close()
+		_ = os.Chmod(dbPath, 0600)
+	}
+
 	db, err := sql.Open("sqlite", u.String())
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite database at %s: %w", dbPath, err)
@@ -73,9 +87,10 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	}
 
 	// Restrict file permissions to user-only read/write after schema creation creates dbPath on disk.
-	if err := os.Chmod(dbPath, 0600); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("failed to restrict sqlite database permissions on %s: %w", dbPath, err)
+	if dbPath != ":memory:" && !strings.HasPrefix(dbPath, "file:") {
+		_ = os.Chmod(dbPath, 0600)
+		_ = os.Chmod(dbPath+"-wal", 0600)
+		_ = os.Chmod(dbPath+"-shm", 0600)
 	}
 
 	return store, nil
@@ -167,9 +182,9 @@ func (s *SQLiteStore) RecordRun(meta *monitor.RunMetadata) error {
 	if meta == nil || meta.ID == "" {
 		return errors.New("empty run metadata or ID")
 	}
-	for _, st := range meta.Steps {
+	for i, st := range meta.Steps {
 		if st != nil && st.ID == "" {
-			return errors.New("empty step ID")
+			st.ID = fmt.Sprintf("step_%d", i+1)
 		}
 	}
 	s.mu.Lock()
@@ -616,8 +631,12 @@ func (s *SQLiteStore) StartRun(job *monitor.JobInfo, limits *config.LimitsConfig
 				stepDur = 0
 			}
 		}
+		stepID := st.ID
+		if stepID == "" {
+			stepID = fmt.Sprintf("step_%d", i+1)
+		}
 		steps = append(steps, &monitor.StepMetadata{
-			ID:          st.ID,
+			ID:          stepID,
 			Number:      num,
 			Name:        st.Name,
 			Status:      st.Status,

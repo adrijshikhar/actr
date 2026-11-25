@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -113,4 +114,9 @@ func TestParseMemory_RejectsBoundaryInt64Overflow(t *testing.T) {
 	require.Error(t, err)
 	_, err = ParseMemory("1e309B") // Inf
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "out of range")
+	digits310 := strings.Repeat("9", 310) + "B"
+	_, err = ParseMemory(digits310)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "out of range")
 }

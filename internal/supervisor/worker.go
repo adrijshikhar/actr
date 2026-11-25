@@ -152,11 +152,10 @@ func NewRepoWorker(alias string, repoCfg config.RepoConfig, resMgr *ResourceMana
 		if strings.EqualFold(repoCfg.Driver, "docker") {
 			cli, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation())
 			if err != nil {
-				logger.Warn("failed to initialize docker client; falling back to host driver", "repo", alias, "error", err)
-			} else {
-				dockerDrv = docker.NewDriver(cli, true)
-				primaryDriver = dockerDrv
+				return nil, fmt.Errorf("initialize docker client for repo %q: %w", alias, err)
 			}
+			dockerDrv = docker.NewDriver(cli, true)
+			primaryDriver = dockerDrv
 		}
 
 		coord := engine.NewCoordinator(primaryDriver, protoRunClient, w.workFolder).
@@ -267,6 +266,12 @@ func (w *RepoWorker) Start(ctx context.Context, pollingCtx context.Context) erro
 
 	go func() {
 		defer close(w.doneCh)
+		defer func() {
+			w.mu.Lock()
+			w.running = false
+			w.stopping = false
+			w.mu.Unlock()
+		}()
 		w.runLoop(ctx, pollCtx)
 		w.jobWg.Wait()
 	}()
@@ -304,6 +309,10 @@ func (w *RepoWorker) Stop(ctx context.Context) error {
 		drainErr = ctx.Err()
 	}
 
+	if drainErr != nil {
+		return drainErr
+	}
+
 	if broker != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
@@ -317,7 +326,7 @@ func (w *RepoWorker) Stop(ctx context.Context) error {
 	w.stopping = false
 	w.mu.Unlock()
 
-	return drainErr
+	return nil
 }
 
 // executeWithGuards acquires a global execution permit from ResourceManager and releases it
@@ -393,16 +402,14 @@ func (w *RepoWorker) runLoop(ctx context.Context, pollingCtx context.Context) {
 			return
 		}
 
-		// Reserve global execution slot before polling to avoid holding unacked messages when saturated
-		res, err := w.resMgr.Reserve(pollingCtx)
-		if err != nil {
+		// Wait until global execution capacity is available before polling
+		if err := w.resMgr.WaitAvailable(pollingCtx); err != nil {
 			<-w.repoSem
 			return
 		}
 
 		msg, err := broker.GetMessage(pollingCtx, runnerVersion, osName, archName)
 		if err != nil {
-			res.Release()
 			<-w.repoSem
 			if pollingCtx.Err() != nil || ctx.Err() != nil {
 				return
@@ -433,7 +440,6 @@ func (w *RepoWorker) runLoop(ctx context.Context, pollingCtx context.Context) {
 		backoff = minBackoff
 
 		if msg == nil || (!strings.EqualFold(msg.MessageType, "RunnerJobRequest") && !strings.EqualFold(msg.MessageType, "PipelineAgentJobRequest")) {
-			res.Release()
 			<-w.repoSem
 			if msg == nil {
 				select {
@@ -457,8 +463,13 @@ func (w *RepoWorker) runLoop(ctx context.Context, pollingCtx context.Context) {
 			reqRef.RunnerRequestID = strconv.FormatInt(msg.MessageID, 10)
 		}
 
-		// Promote reservation to active execution permit and dispatch job
-		permit := res.Activate()
+		// Acquire global execution permit after receiving job and before acknowledging
+		permit, err := w.resMgr.Acquire(ctx)
+		if err != nil {
+			<-w.repoSem
+			return
+		}
+
 		w.executingJobs.Add(1)
 		w.jobWg.Add(1)
 		go func(ref protocol.JobRequestReference, p Permit) {

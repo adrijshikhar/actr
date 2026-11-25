@@ -190,8 +190,19 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	}
 	s.drainWg.Wait()
 
-	// 3. Cancel job context after drain completes or times out, then wait for status updater
+	// 3. Cancel job context after drain completes or times out
 	jobCancel()
+
+	// Bounded wait for all worker done channels to complete wind-down after job cancellation
+	windDownCtx, windDownCancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	for _, w := range workersToDrain {
+		select {
+		case <-w.doneCh:
+		case <-windDownCtx.Done():
+		}
+	}
+	windDownCancel()
+
 	s.statusWg.Wait()
 
 	// 4. Stop monitor server
@@ -259,20 +270,34 @@ func (s *Supervisor) Reload(newCfg *config.SupervisorConfig) error {
 	}
 
 	// Collect removed and replaced workers for drain
-	var workersToStop []*RepoWorker
+	var workersToRemove []*RepoWorker
+	var replacedOldWorkers []*RepoWorker
 	for alias, w := range s.workers {
 		if _, exists := newCfg.Repos[alias]; !exists {
-			workersToStop = append(workersToStop, w)
+			workersToRemove = append(workersToRemove, w)
 			delete(s.workers, alias)
 		} else if _, replaced := replacementWorkers[alias]; replaced {
-			workersToStop = append(workersToStop, w)
+			replacedOldWorkers = append(replacedOldWorkers, w)
+			delete(s.workers, alias)
+		}
+	}
+
+	isRunning := s.running
+	baseJobCtx := s.jobCtx
+
+	// For replaced workers, stop the old worker before starting the replacement worker on the same repo
+	if isRunning && len(replacedOldWorkers) > 0 {
+		for _, oldWorker := range replacedOldWorkers {
+			drainCtx, drainCancel := context.WithTimeout(context.WithoutCancel(baseJobCtx), 30*time.Second)
+			_ = oldWorker.Stop(drainCtx)
+			drainCancel()
 		}
 	}
 
 	// Apply added and replacement workers
 	for alias, w := range replacementWorkers {
 		s.workers[alias] = w
-		if s.running {
+		if isRunning {
 			if err := w.Start(s.jobCtx, s.pollingCtx); err != nil {
 				logger.Error("failed to start worker", "repo", alias, "error", err)
 			}
@@ -280,26 +305,24 @@ func (s *Supervisor) Reload(newCfg *config.SupervisorConfig) error {
 	}
 
 	s.cfg = newCfg
-	isRunning := s.running
-	baseJobCtx := s.jobCtx
-	if isRunning && len(workersToStop) > 0 {
-		s.drainWg.Add(len(workersToStop))
+	if isRunning && len(workersToRemove) > 0 {
+		s.drainWg.Add(len(workersToRemove))
 	}
 	s.mu.Unlock()
 
-	// Drain removed/replaced workers concurrently, tracked by drainWg so Start cannot exit prematurely
-	if isRunning && len(workersToStop) > 0 {
+	// Drain removed workers concurrently, tracked by drainWg so Start cannot exit prematurely
+	if isRunning && len(workersToRemove) > 0 {
 		parentCtx := context.Background()
 		if baseJobCtx != nil {
 			parentCtx = context.WithoutCancel(baseJobCtx)
 		}
-		for _, w := range workersToStop {
+		for _, w := range workersToRemove {
 			go func(worker *RepoWorker) {
 				defer s.drainWg.Done()
 				drainCtx, drainCancel := context.WithTimeout(parentCtx, 30*time.Second)
 				defer drainCancel()
 				if err := worker.Stop(drainCtx); err != nil {
-					logger.Warn("failed to cleanly stop removed/replaced worker", "repo", worker.repoAlias, "error", err)
+					logger.Warn("failed to cleanly stop removed worker", "repo", worker.repoAlias, "error", err)
 				}
 			}(w)
 		}

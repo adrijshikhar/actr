@@ -52,6 +52,7 @@ func (s *DiskStore) Prune(maxRuns int, maxDiskBytes ...int64) (int, error) {
 	}
 
 	prunedCount := 0
+	var pruneErrs []error
 
 	// 1. Count pruning: remove oldest completed runs beyond maxRuns limit
 	if maxRuns > 0 && len(completedRuns) > maxRuns {
@@ -66,7 +67,8 @@ func (s *DiskStore) Prune(maxRuns int, maxDiskBytes ...int64) (int, error) {
 				continue
 			}
 			if err := os.RemoveAll(runDir); err != nil {
-				return prunedCount, fmt.Errorf("remove pruned run %s: %w", run.ID, err)
+				pruneErrs = append(pruneErrs, fmt.Errorf("remove pruned run %s: %w", run.ID, err))
+				continue
 			}
 			prunedCount++
 		}
@@ -96,7 +98,8 @@ func (s *DiskStore) Prune(maxRuns int, maxDiskBytes ...int64) (int, error) {
 			}
 			sz, err := dirSize(runDir)
 			if err != nil {
-				return prunedCount, fmt.Errorf("calculate size for run %s: %w", r.ID, err)
+				pruneErrs = append(pruneErrs, fmt.Errorf("calculate size for run %s: %w", r.ID, err))
+				continue
 			}
 			runSizes[r.ID] = sz
 			totalSize += sz
@@ -112,7 +115,8 @@ func (s *DiskStore) Prune(maxRuns int, maxDiskBytes ...int64) (int, error) {
 				if oldest != nil && strings.TrimSpace(oldest.ID) != "" {
 					if runDir, err := s.runDir(oldest.ID); err == nil {
 						if err := os.RemoveAll(runDir); err != nil {
-							return prunedCount, fmt.Errorf("remove pruned run %s: %w", oldest.ID, err)
+							pruneErrs = append(pruneErrs, fmt.Errorf("remove pruned run %s: %w", oldest.ID, err))
+							continue
 						}
 						totalSize -= runSizes[oldest.ID]
 						prunedCount++
@@ -133,6 +137,10 @@ func (s *DiskStore) Prune(maxRuns int, maxDiskBytes ...int64) (int, error) {
 		if err := writeJSONAtomic(indexPath, catalog); err != nil {
 			return prunedCount, fmt.Errorf("failed to save index catalog after pruning: %w", err)
 		}
+	}
+
+	if len(pruneErrs) > 0 {
+		return prunedCount, errors.Join(pruneErrs...)
 	}
 
 	return prunedCount, nil
@@ -171,10 +179,12 @@ func (s *DiskStore) RecoverInterruptedRuns() (int, error) {
 	now := time.Now().UTC()
 	recoveredCount := 0
 
+	cleanedRuns := make([]*RunSummary, 0, len(catalog.Runs))
 	for _, run := range catalog.Runs {
-		if run == nil {
+		if run == nil || strings.TrimSpace(run.ID) == "" {
 			continue
 		}
+		cleanedRuns = append(cleanedRuns, run)
 		if run.Status == monitor.StatusRunning || run.Status == monitor.StatusQueued {
 			run.Status = StatusInterrupted
 			run.EndedAt = now
@@ -187,9 +197,6 @@ func (s *DiskStore) RecoverInterruptedRuns() (int, error) {
 			}
 			recoveredCount++
 
-			if strings.TrimSpace(run.ID) == "" {
-				continue
-			}
 			runDir, err := s.runDir(run.ID)
 			if err != nil {
 				continue
@@ -222,7 +229,12 @@ func (s *DiskStore) RecoverInterruptedRuns() (int, error) {
 		}
 	}
 
-	if recoveredCount > 0 {
+	needsSave := recoveredCount > 0 || len(cleanedRuns) != len(catalog.Runs)
+	if len(cleanedRuns) != len(catalog.Runs) {
+		catalog.Runs = cleanedRuns
+	}
+
+	if needsSave {
 		catalog.UpdatedAt = now
 		indexPath := filepath.Join(s.baseDir, "index.json")
 		if err := writeJSONAtomic(indexPath, catalog); err != nil {

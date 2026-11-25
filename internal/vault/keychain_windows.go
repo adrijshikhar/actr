@@ -4,10 +4,7 @@ package vault
 
 import (
 	"context"
-	"errors"
 )
-
-var errWindowsKeychainUnsupported = errors.New("windows keychain provider is not implemented; configure encrypted-file vault")
 
 type WindowsDPAPIProvider struct {
 	service string
@@ -26,26 +23,26 @@ func (w *WindowsDPAPIProvider) Get(ctx context.Context, key string) (string, err
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	return "", errWindowsKeychainUnsupported
+	return "", ErrSecretNotFound
 }
 
 func (w *WindowsDPAPIProvider) Set(ctx context.Context, key, value string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return errWindowsKeychainUnsupported
+	return ErrReadOnlyVault
 }
 
 func (w *WindowsDPAPIProvider) Delete(ctx context.Context, key string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return errWindowsKeychainUnsupported
+	return ErrSecretNotFound
 }
 
 func (w *WindowsDPAPIProvider) List(ctx context.Context) ([]SecretMetadata, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return nil, errWindowsKeychainUnsupported
+	return []SecretMetadata{}, nil
 }

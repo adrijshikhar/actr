@@ -182,11 +182,15 @@ func TestPKCS7Pad_DoesNotMutateInputBackingArray(t *testing.T) {
 	buf := make([]byte, 5, 32)
 	copy(buf, "hello")
 	origCap := buf[:cap(buf)]
-	origCap[5] = 0xAA
+	if len(origCap) > 5 {
+		origCap[5] = 0xAA
+	}
 
 	padded := pkcs7Pad(buf, 16)
 	assert.Len(t, padded, 16)
-	assert.Equal(t, byte(0xAA), origCap[5], "input slice spare capacity must not be overwritten")
+	if len(origCap) > 5 {
+		assert.Equal(t, byte(0xAA), origCap[5], "input slice spare capacity must not be overwritten")
+	}
 }
 
 func TestDecryptAESKey_RejectsInvalidAESKeyLength(t *testing.T) {

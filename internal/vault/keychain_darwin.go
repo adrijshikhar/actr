@@ -57,13 +57,19 @@ func buildDarwinKeychainSetCommand(service, key, value string) (string, error) {
 	escapedKey := escapeArg(key)
 	escapedSvc := escapeArg(service)
 
+	var cmd string
 	if strings.ContainsAny(value, "\r\n") {
 		hexVal := hex.EncodeToString([]byte(value))
-		return fmt.Sprintf("add-generic-password -U -s \"%s\" -a \"%s\" -X \"%s\"\n", escapedSvc, escapedKey, hexVal), nil
+		cmd = fmt.Sprintf("add-generic-password -U -s \"%s\" -a \"%s\" -X \"%s\"\n", escapedSvc, escapedKey, hexVal)
+	} else {
+		escapedVal := escapeArg(value)
+		cmd = fmt.Sprintf("add-generic-password -U -s \"%s\" -a \"%s\" -w \"%s\"\n", escapedSvc, escapedKey, escapedVal)
 	}
 
-	escapedVal := escapeArg(value)
-	return fmt.Sprintf("add-generic-password -U -s \"%s\" -a \"%s\" -w \"%s\"\n", escapedSvc, escapedKey, escapedVal), nil
+	if len(cmd) >= 4096 {
+		return "", fmt.Errorf("secret value exceeds keychain interactive command buffer limit (%d >= 4096 bytes)", len(cmd))
+	}
+	return cmd, nil
 }
 
 func (k *DarwinKeychainProvider) Set(ctx context.Context, key, value string) error {

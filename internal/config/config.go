@@ -70,7 +70,11 @@ type Credentials struct {
 }
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
-	dir := filepath.Dir(path)
+	targetPath := path
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		targetPath = resolved
+	}
+	dir := filepath.Dir(targetPath)
 	tmp, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
@@ -100,7 +104,7 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 		return fmt.Errorf("close temp file: %w", err)
 	}
 	closed = true
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := os.Rename(tmpName, targetPath); err != nil {
 		return fmt.Errorf("rename temp file: %w", err)
 	}
 	cleanup = false

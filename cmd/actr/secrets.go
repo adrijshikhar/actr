@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -123,7 +124,11 @@ func newSecretsCommand() *cobra.Command {
 			}
 			list, err := v.List(cmd.Context())
 			if err != nil {
-				return err
+				if errors.Is(err, vault.ErrReadOnlyVault) {
+					list = nil
+				} else {
+					return err
+				}
 			}
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 3, ' ', 0)
 			_, _ = fmt.Fprintln(w, "KEY\tPROVIDER\tUPDATED")

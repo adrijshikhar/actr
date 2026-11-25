@@ -12,7 +12,10 @@ import (
 	"github.com/adrijshikhar/actr/internal/config"
 )
 
-const defaultVaultKeyBytes = 32
+const (
+	defaultVaultKeyBytes  = 32
+	legacyDefaultVaultKey = "default-actr-key"
+)
 
 // NewProviderFromConfig constructs a Provider or ChainedProvider based on VaultYAMLConfig.
 // If cfg is nil or has no providers configured, it returns the platform default provider:
@@ -25,14 +28,34 @@ func NewProviderFromConfig(cfg *config.VaultYAMLConfig, defaultDir string) (Prov
 			return NewKeychainProvider("com.github.actr.secrets"), nil
 		}
 		passphrase := []byte(os.Getenv("ACTR_VAULT_PASSPHRASE"))
+		vaultPath := filepath.Join(defaultDir, "vault.enc")
+		keyPath := filepath.Join(defaultDir, "vault.key")
+
 		if len(passphrase) == 0 {
+			// Check if vault.enc exists and vault.key does not exist: attempt migration from legacy default key
+			if _, vErr := os.Stat(vaultPath); vErr == nil {
+				if _, kErr := os.Stat(keyPath); os.IsNotExist(kErr) {
+					if legacyFp, err := NewFileProvider(vaultPath, []byte(legacyDefaultVaultKey)); err == nil {
+						newKey, err := loadOrCreateDefaultVaultKey(defaultDir)
+						if err == nil {
+							legacyFp.mu.Lock()
+							legacyFp.passphrase = append([]byte(nil), newKey...)
+							saveErr := legacyFp.save()
+							legacyFp.mu.Unlock()
+							if saveErr == nil {
+								return legacyFp, nil
+							}
+						}
+					}
+				}
+			}
+
 			var err error
 			passphrase, err = loadOrCreateDefaultVaultKey(defaultDir)
 			if err != nil {
 				return nil, err
 			}
 		}
-		vaultPath := filepath.Join(defaultDir, "vault.enc")
 		fp, err := NewFileProvider(vaultPath, passphrase)
 		if err != nil {
 			return nil, err
@@ -56,6 +79,11 @@ func NewProviderFromConfig(cfg *config.VaultYAMLConfig, defaultDir string) (Prov
 			}
 			passphrase, err := resolveFileVaultPassphrase(pcfg.Auth)
 			if err != nil {
+				if len(cfg.Providers) > 1 {
+					// In a chained configuration, skip missing passphrase provider with a warning
+					// so remaining providers still operate.
+					continue
+				}
 				return nil, err
 			}
 			fp, err := NewFileProvider(p, passphrase)
@@ -76,6 +104,9 @@ func NewProviderFromConfig(cfg *config.VaultYAMLConfig, defaultDir string) (Prov
 		}
 	}
 
+	if len(providers) == 0 {
+		return nil, errors.New("no valid vault providers configured")
+	}
 	if len(providers) == 1 {
 		return providers[0], nil
 	}
@@ -122,8 +153,29 @@ func loadOrCreateDefaultVaultKey(defaultDir string) ([]byte, error) {
 		return nil, fmt.Errorf("generate default vault key: %w", err)
 	}
 
-	f, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	tmpFile, err := os.CreateTemp(defaultDir, ".vault.key-*")
 	if err != nil {
+		return nil, fmt.Errorf("create temp vault key file: %w", err)
+	}
+	tmpName := tmpFile.Name()
+	defer func() {
+		_ = os.Remove(tmpName)
+	}()
+
+	if _, err := tmpFile.Write(key); err != nil {
+		_ = tmpFile.Close()
+		return nil, fmt.Errorf("write default vault key: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return nil, fmt.Errorf("sync default vault key: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return nil, fmt.Errorf("close default vault key: %w", err)
+	}
+	_ = os.Chmod(tmpName, 0o600)
+
+	if err := os.Link(tmpName, keyPath); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			existing, readErr := os.ReadFile(keyPath)
 			if readErr != nil {
@@ -134,22 +186,18 @@ func loadOrCreateDefaultVaultKey(defaultDir string) ([]byte, error) {
 			}
 			return existing, nil
 		}
+		// If link failed (e.g. cross-device or not supported), try rename if keyPath doesn't exist
+		if _, statErr := os.Stat(keyPath); os.IsNotExist(statErr) {
+			if renameErr := os.Rename(tmpName, keyPath); renameErr != nil {
+				return nil, fmt.Errorf("rename default vault key file: %w", renameErr)
+			}
+			return key, nil
+		}
+		existing, readErr := os.ReadFile(keyPath)
+		if readErr == nil && len(existing) > 0 {
+			return existing, nil
+		}
 		return nil, fmt.Errorf("create default vault key file: %w", err)
-	}
-
-	if _, err := f.Write(key); err != nil {
-		_ = f.Close()
-		_ = os.Remove(keyPath)
-		return nil, fmt.Errorf("write default vault key: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(keyPath)
-		return nil, fmt.Errorf("sync default vault key: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(keyPath)
-		return nil, fmt.Errorf("close default vault key: %w", err)
 	}
 
 	return key, nil
