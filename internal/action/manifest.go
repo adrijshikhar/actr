@@ -40,7 +40,11 @@ func (ai *ActionInput) UnmarshalYAML(value *yaml.Node) error {
 	// Extract default as literal text directly from yaml.Node to avoid float64 precision loss (e.g. 3.10 -> 3.1)
 	for i := 0; i < len(value.Content)-1; i += 2 {
 		if value.Content[i].Value == "default" {
-			ai.Default = value.Content[i+1].Value
+			if value.Content[i+1].Tag == "!!null" {
+				ai.Default = ""
+			} else {
+				ai.Default = value.Content[i+1].Value
+			}
 			break
 		}
 	}
@@ -106,13 +110,34 @@ func ParseManifest(data []byte) (*ActionManifest, error) {
 // ParseManifestFile looks for action.yml or action.yaml in dir and parses it.
 // action.yml takes precedence over action.yaml.
 func ParseManifestFile(dir string) (*ActionManifest, error) {
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get absolute path for %s: %w", dir, err)
+	}
+	evalDir, err := filepath.EvalSymlinks(absDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("%w in directory: %s", ErrManifestNotFound, dir)
+		}
+		return nil, fmt.Errorf("failed to evaluate symlinks for %s: %w", dir, err)
+	}
+	cleanDir := filepath.Clean(evalDir)
+
 	candidates := []string{"action.yml", "action.yaml"}
 
 	for _, filename := range candidates {
-		targetPath := filepath.Join(dir, filename)
+		targetPath := filepath.Join(cleanDir, filename)
 		info, err := os.Stat(targetPath)
 		if err == nil && !info.IsDir() {
-			data, err := os.ReadFile(targetPath)
+			evalTarget, err := filepath.EvalSymlinks(targetPath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to evaluate symlink for %s: %w", targetPath, err)
+			}
+			cleanTarget := filepath.Clean(evalTarget)
+			if !strings.HasPrefix(cleanTarget, cleanDir+string(filepath.Separator)) && cleanTarget != cleanDir {
+				return nil, fmt.Errorf("%w: action manifest %s escapes action directory", ErrPathTraversal, targetPath)
+			}
+			data, err := os.ReadFile(cleanTarget)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read action manifest %s: %w", targetPath, err)
 			}

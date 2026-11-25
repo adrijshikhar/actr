@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -110,8 +111,11 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 	if version == "" {
 		version = "main"
 	}
+	if version == "." || version == ".." || strings.ContainsAny(version, `/\`) || filepath.VolumeName(version) != "" {
+		return "", ErrPathTraversal
+	}
 	cleanVersion := filepath.Clean(version)
-	if strings.HasPrefix(cleanVersion, "..") || filepath.IsAbs(cleanVersion) {
+	if cleanVersion == "." || strings.HasPrefix(cleanVersion, "..") || filepath.IsAbs(cleanVersion) {
 		return "", ErrPathTraversal
 	}
 
@@ -119,12 +123,40 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 	if absBase, err := filepath.Abs(baseDir); err == nil {
 		baseDir = absBase
 	}
-	destDir := filepath.Join(baseDir, "_actions", owner, repo, version)
-	markerFile := filepath.Join(baseDir, "_actions", owner, repo, version+".completed")
+	destDir := filepath.Join(baseDir, "_actions", owner, repo, cleanVersion)
+	markerFile := filepath.Join(baseDir, "_actions", owner, repo, cleanVersion+".completed")
+
+	verifyWithinDest := func(candidate string) (string, error) {
+		absDest, err := filepath.Abs(destDir)
+		if err != nil {
+			return "", err
+		}
+		evalDest, err := filepath.EvalSymlinks(absDest)
+		if err != nil {
+			return "", err
+		}
+		evalCand, err := filepath.EvalSymlinks(candidate)
+		if err != nil {
+			return "", err
+		}
+		cleanDest := filepath.Clean(evalDest)
+		cleanCand := filepath.Clean(evalCand)
+		if !strings.HasPrefix(cleanCand, cleanDest+string(filepath.Separator)) && cleanCand != cleanDest {
+			return "", ErrPathTraversal
+		}
+		return cleanCand, nil
+	}
 
 	// Fast path: check if already downloaded and completed
 	if _, err := os.Stat(markerFile); err == nil {
-		return filepath.Abs(filepath.Join(destDir, subpath))
+		resolved, err := filepath.Abs(filepath.Join(destDir, subpath))
+		if err != nil {
+			return "", err
+		}
+		if _, err := verifyWithinDest(resolved); err != nil {
+			return "", err
+		}
+		return resolved, nil
 	}
 
 	// Ensure parent directory exists for lock and marker files
@@ -133,7 +165,7 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 		return "", fmt.Errorf("failed to create action directory %s: %w", lockDir, err)
 	}
 
-	lockFilePath := filepath.Join(r.BaseDir, "_actions", owner, repo, version+".lock")
+	lockFilePath := filepath.Join(baseDir, "_actions", owner, repo, cleanVersion+".lock")
 	lockF, err := os.OpenFile(lockFilePath, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return "", fmt.Errorf("failed to open lock file %s: %w", lockFilePath, err)
@@ -154,7 +186,14 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 
 	// Re-check markerFile after acquiring the lock (another process might have completed it)
 	if _, err := os.Stat(markerFile); err == nil {
-		return filepath.Abs(filepath.Join(destDir, subpath))
+		resolved, err := filepath.Abs(filepath.Join(destDir, subpath))
+		if err != nil {
+			return "", err
+		}
+		if _, err := verifyWithinDest(resolved); err != nil {
+			return "", err
+		}
+		return resolved, nil
 	}
 
 	baseURL := r.BaseURL
@@ -162,7 +201,7 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 		baseURL = "https://codeload.github.com"
 	}
 	baseURL = strings.TrimRight(baseURL, "/")
-	reqURL := fmt.Sprintf("%s/%s/%s/tar.gz/%s", baseURL, owner, repo, version)
+	reqURL := fmt.Sprintf("%s/%s/%s/tar.gz/%s", baseURL, owner, repo, cleanVersion)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
@@ -176,19 +215,19 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to download action %s/%s@%s: %w", owner, repo, version, err)
+		return "", fmt.Errorf("failed to download action %s/%s@%s: %w", owner, repo, cleanVersion, err)
 	}
 	defer func() {
 		_ = resp.Body.Close()
 	}()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("unexpected status %d (%s) downloading action %s/%s@%s", resp.StatusCode, resp.Status, owner, repo, version)
+		return "", fmt.Errorf("unexpected status %d (%s) downloading action %s/%s@%s", resp.StatusCode, resp.Status, owner, repo, cleanVersion)
 	}
 
 	gz, err := gzip.NewReader(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("failed to create gzip reader for %s/%s@%s: %w", owner, repo, version, err)
+		return "", fmt.Errorf("failed to create gzip reader for %s/%s@%s: %w", owner, repo, cleanVersion, err)
 	}
 	defer func() {
 		_ = gz.Close()
@@ -196,7 +235,9 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 
 	tr := tar.NewReader(gz)
 
-	_ = os.RemoveAll(destDir)
+	if err := os.RemoveAll(destDir); err != nil {
+		return "", fmt.Errorf("clean destination %s: %w", destDir, err)
+	}
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create destination directory: %w", err)
 	}
@@ -245,13 +286,13 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 			continue
 		}
 
-		cleanName := filepath.Clean(hdr.Name)
-		if cleanName == "." || cleanName == "" {
+		posixName := path.Clean(strings.ReplaceAll(hdr.Name, "\\", "/"))
+		if posixName == "." || posixName == "" {
 			continue
 		}
 
 		// Zip Slip validation on raw archive entry name
-		if strings.HasPrefix(cleanName, "..") || filepath.IsAbs(cleanName) {
+		if strings.HasPrefix(posixName, "..") || strings.HasPrefix(posixName, "/") {
 			return "", ErrPathTraversal
 		}
 
@@ -261,21 +302,22 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 		}
 
 		// Strip top-level directory segment if present (GitHub codeload tarballs wrap entries in repo-ref/)
-		var relPath string
-		if slashIdx := strings.Index(cleanName, "/"); slashIdx != -1 {
-			relPath = cleanName[slashIdx+1:]
+		var relPosix string
+		if slashIdx := strings.IndexByte(posixName, '/'); slashIdx != -1 {
+			relPosix = posixName[slashIdx+1:]
 		} else {
 			if hdr.Typeflag == tar.TypeDir {
 				// Root directory entry itself
 				continue
 			}
-			relPath = cleanName
+			relPosix = posixName
 		}
 
-		if relPath == "" || relPath == "." {
+		if relPosix == "" || relPosix == "." {
 			continue
 		}
 
+		relPath := filepath.FromSlash(relPosix)
 		target := filepath.Join(cleanDest, relPath)
 		cleanTarget := filepath.Clean(target)
 
@@ -341,36 +383,70 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 			_ = os.Chmod(cleanTarget, perm)
 
 		case tar.TypeSymlink:
+			linkClean := filepath.FromSlash(path.Clean(strings.ReplaceAll(hdr.Linkname, "\\", "/")))
 			var resolvedLinkTarget string
-			if filepath.IsAbs(hdr.Linkname) {
-				resolvedLinkTarget = filepath.Clean(hdr.Linkname)
-			} else {
-				resolvedLinkTarget = filepath.Clean(filepath.Join(filepath.Dir(cleanTarget), hdr.Linkname))
+			if filepath.IsAbs(hdr.Linkname) || filepath.IsAbs(linkClean) {
+				return "", fmt.Errorf("%w: absolute symlink %s -> %s rejected", ErrPathTraversal, hdr.Name, hdr.Linkname)
 			}
-
+			resolvedLinkTarget = filepath.Clean(filepath.Join(cleanEvalParent, linkClean))
 			if !strings.HasPrefix(resolvedLinkTarget, cleanDest+string(filepath.Separator)) && resolvedLinkTarget != cleanDest {
 				return "", fmt.Errorf("%w: symlink %s targets %s outside destination %s", ErrPathTraversal, hdr.Name, hdr.Linkname, cleanDest)
 			}
-
+			if evalParentOfLink, evalErr := filepath.EvalSymlinks(filepath.Dir(resolvedLinkTarget)); evalErr == nil {
+				finalEval := filepath.Clean(filepath.Join(evalParentOfLink, filepath.Base(resolvedLinkTarget)))
+				if !strings.HasPrefix(finalEval, cleanDest+string(filepath.Separator)) && finalEval != cleanDest {
+					return "", fmt.Errorf("%w: symlink %s escapes via parent chain", ErrPathTraversal, hdr.Name)
+				}
+			}
 			_ = os.Remove(cleanTarget)
-			if err := os.Symlink(hdr.Linkname, cleanTarget); err != nil {
+			if err := os.Symlink(linkClean, cleanTarget); err != nil {
 				return "", fmt.Errorf("failed to create symlink %s -> %s: %w", cleanTarget, hdr.Linkname, err)
+			}
+			// Verify resolved link target if resolvable, plus loop-safe containment check
+			if realTarget, err := filepath.EvalSymlinks(cleanTarget); err == nil {
+				cleanReal := filepath.Clean(realTarget)
+				if !strings.HasPrefix(cleanReal, cleanDest+string(filepath.Separator)) && cleanReal != cleanDest {
+					_ = os.Remove(cleanTarget)
+					return "", fmt.Errorf("%w: symlink %s resolves outside %s", ErrPathTraversal, hdr.Name, cleanDest)
+				}
 			}
 
 		case tar.TypeLink:
-			cleanLink := filepath.Clean(hdr.Linkname)
-			if strings.HasPrefix(cleanLink, "..") || filepath.IsAbs(cleanLink) {
+			posixLink := path.Clean(strings.ReplaceAll(hdr.Linkname, "\\", "/"))
+			if posixLink == "." || posixLink == "" || strings.HasPrefix(posixLink, "..") || strings.HasPrefix(posixLink, "/") {
 				return "", fmt.Errorf("%w: hard link %s targets outside destination", ErrPathTraversal, hdr.Name)
 			}
-			parts := strings.Split(cleanLink, string(filepath.Separator))
-			if len(parts) > 1 {
-				cleanLink = filepath.Join(parts[1:]...)
+			var relPosixLink string
+			if slashIdx := strings.IndexByte(posixLink, '/'); slashIdx != -1 {
+				relPosixLink = posixLink[slashIdx+1:]
+			} else {
+				relPosixLink = posixLink
 			}
-			resolvedLinkTarget := filepath.Join(cleanDest, cleanLink)
-			cleanResolvedLink := filepath.Clean(resolvedLinkTarget)
+			if relPosixLink == "" || relPosixLink == "." {
+				return "", fmt.Errorf("%w: hard link %s has invalid target", ErrPathTraversal, hdr.Name)
+			}
+			relLinkPath := filepath.FromSlash(relPosixLink)
+			cleanResolvedLink := filepath.Clean(filepath.Join(cleanDest, relLinkPath))
 
 			if !strings.HasPrefix(cleanResolvedLink, cleanDest+string(filepath.Separator)) && cleanResolvedLink != cleanDest {
 				return "", fmt.Errorf("%w: hard link %s targets outside destination", ErrPathTraversal, hdr.Name)
+			}
+
+			evalLinkDir, err := filepath.EvalSymlinks(filepath.Dir(cleanResolvedLink))
+			if err != nil {
+				return "", fmt.Errorf("failed to evaluate hard link parent %s: %w", filepath.Dir(cleanResolvedLink), err)
+			}
+			cleanEvalLinkDir := filepath.Clean(evalLinkDir)
+			if !strings.HasPrefix(cleanEvalLinkDir, cleanDest+string(filepath.Separator)) && cleanEvalLinkDir != cleanDest {
+				return "", fmt.Errorf("%w: hard link target parent %s escapes destination", ErrPathTraversal, filepath.Dir(cleanResolvedLink))
+			}
+
+			fi, err := os.Lstat(cleanResolvedLink)
+			if err != nil {
+				return "", fmt.Errorf("hard link target %s not found: %w", cleanResolvedLink, err)
+			}
+			if fi.Mode()&os.ModeSymlink != 0 {
+				return "", fmt.Errorf("%w: hard link %s targets a symlink", ErrPathTraversal, hdr.Name)
 			}
 
 			_ = os.Remove(cleanTarget)
@@ -390,5 +466,12 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 	}
 
 	success = true
-	return filepath.Abs(filepath.Join(destDir, subpath))
+	resolved, err := filepath.Abs(filepath.Join(destDir, subpath))
+	if err != nil {
+		return "", err
+	}
+	if _, err := verifyWithinDest(resolved); err != nil {
+		return "", err
+	}
+	return resolved, nil
 }
