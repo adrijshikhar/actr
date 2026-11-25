@@ -47,8 +47,16 @@ func (k *DarwinKeychainProvider) Set(ctx context.Context, key, value string) err
 		return err
 	}
 
-	// #nosec G204 -- /usr/bin/security is hardcoded and arguments are passed as discrete parameters without shell evaluation
-	cmd := exec.CommandContext(ctx, "/usr/bin/security", "add-generic-password", "-U", "-s", k.service, "-a", key, "-w", value)
+	// #nosec G204 -- /usr/bin/security is hardcoded and arguments are passed via stdin in interactive mode
+	// so sensitive secrets are never exposed in process argv (e.g. ps aux, sysctl KERN_PROCARGS2).
+	escapedVal := strings.ReplaceAll(strings.ReplaceAll(value, "\\", "\\\\"), "\"", "\\\"")
+	escapedKey := strings.ReplaceAll(strings.ReplaceAll(key, "\\", "\\\\"), "\"", "\\\"")
+	escapedSvc := strings.ReplaceAll(strings.ReplaceAll(k.service, "\\", "\\\\"), "\"", "\\\"")
+
+	input := fmt.Sprintf("add-generic-password -U -s \"%s\" -a \"%s\" -w \"%s\"\n", escapedSvc, escapedKey, escapedVal)
+
+	cmd := exec.CommandContext(ctx, "/usr/bin/security", "-i")
+	cmd.Stdin = strings.NewReader(input)
 	var errBuf bytes.Buffer
 	cmd.Stderr = &errBuf
 	if err := cmd.Run(); err != nil {

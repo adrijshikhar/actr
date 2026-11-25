@@ -341,3 +341,54 @@ func TestSQLiteStore_HistoryStoreInterfaceMethods(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"Starting setup..."}, logs)
 }
+
+func TestSQLiteStore_PruneDiskLimit(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_prune_disk.db")
+
+	store, err := NewSQLiteStore(dbPath)
+	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
+
+	now := time.Now().UTC()
+	for i := 1; i <= 5; i++ {
+		runID := fmt.Sprintf("job-disk-%d", i)
+		stepID := fmt.Sprintf("step-%d", i)
+		started := now.Add(time.Duration(i) * time.Minute)
+		ended := started.Add(10 * time.Second)
+
+		err := store.RecordRun(&monitor.RunMetadata{
+			ID:        runID,
+			RepoAlias: "test",
+			Name:      "disk test",
+			Status:    monitor.StatusSuccess,
+			StartedAt: started,
+			EndedAt:   ended,
+			Steps: []*monitor.StepMetadata{
+				{
+					ID:        stepID,
+					Name:      stepID,
+					Status:    monitor.StatusSuccess,
+					StartedAt: started,
+					EndedAt:   ended,
+				},
+			},
+		})
+		require.NoError(t, err)
+
+		logs := make([]string, 10)
+		for j := range logs {
+			logs[j] = "0123456789"
+		}
+		require.NoError(t, store.AppendStepLogs(runID, stepID, logs))
+	}
+
+	// 5 runs * ~110 bytes = ~550 bytes. Prune with limit 250 bytes.
+	pruned, err := store.Prune(10, 250)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, pruned, 3)
+
+	runs, err := store.ListRuns(10)
+	require.NoError(t, err)
+	require.LessOrEqual(t, len(runs), 2)
+}

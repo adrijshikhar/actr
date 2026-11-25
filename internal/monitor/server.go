@@ -444,7 +444,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	ch := make(chan Event, 100)
+	ch := make(chan Event, 1000)
 	s.subMu.Lock()
 	if s.closed {
 		s.subMu.Unlock()
@@ -847,8 +847,8 @@ func (s *Server) Publish(ev Event) {
 		select {
 		case ch <- broadcastEv:
 		default:
-			close(ch)
-			delete(s.subscribers, ch)
+			// Drop event if subscriber buffer is full to prevent log bursts from abruptly
+			// disconnecting clients. Subscribers are cleaned up via context cancellation when closed.
 		}
 	}
 }
