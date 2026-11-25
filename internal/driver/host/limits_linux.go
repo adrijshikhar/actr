@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -40,12 +39,7 @@ func (l *linuxLimiter) Apply(ctx context.Context, pid int, limits *config.Limits
 		return cl, nil
 	}
 
-	// Tier 2: systemd-run --user --scope
-	if cl, err := l.trySystemdScope(ctx, pid, limits); err == nil {
-		return cl, nil
-	}
-
-	// Tier 3: In-process userspace watchdog fallback
+	// Tier 2: In-process userspace watchdog fallback
 	return l.applyWatchdog(pid, limits)
 }
 
@@ -55,7 +49,13 @@ func (l *linuxLimiter) tryCgroupsV2(pid int, limits *config.LimitsConfig) (func(
 		return nil, fmt.Errorf("cgroup v2 controllers not found: %w", err)
 	}
 
-	cgroupDir := filepath.Join(l.cgroupRoot, "actr", fmt.Sprintf("job-%d", pid))
+	actrDir := filepath.Join(l.cgroupRoot, "actr")
+	if err := os.MkdirAll(actrDir, 0755); err == nil {
+		subtreeControl := filepath.Join(actrDir, "cgroup.subtree_control")
+		_ = os.WriteFile(subtreeControl, []byte("+cpu +memory +pids"), 0644)
+	}
+
+	cgroupDir := filepath.Join(actrDir, fmt.Sprintf("job-%d", pid))
 	if err := os.MkdirAll(cgroupDir, 0755); err != nil {
 		return nil, fmt.Errorf("create cgroup directory: %w", err)
 	}
@@ -97,42 +97,24 @@ func (l *linuxLimiter) tryCgroupsV2(pid int, limits *config.LimitsConfig) (func(
 					l.MarkOOMKilled(pid)
 				}
 			}
+
+			procsData, err := os.ReadFile(filepath.Join(cgroupDir, "cgroup.procs"))
+			if err == nil {
+				for _, line := range strings.Split(string(procsData), "\n") {
+					line = strings.TrimSpace(line)
+					if line == "" {
+						continue
+					}
+					if p, err := strconv.Atoi(line); err == nil && p > 0 {
+						killProcessGroupOrPID(p)
+					}
+				}
+			}
+
 			_ = os.Remove(cgroupDir)
 		})
 	}
 
-	return cleanup, nil
-}
-
-func (l *linuxLimiter) trySystemdScope(ctx context.Context, pid int, limits *config.LimitsConfig) (func(), error) {
-	systemdRun, err := exec.LookPath("systemd-run")
-	if err != nil {
-		return nil, fmt.Errorf("systemd-run not in PATH: %w", err)
-	}
-
-	unitName := fmt.Sprintf("actr-%d-%d.scope", pid, time.Now().UnixNano())
-	args := []string{"--user", "--scope", "--unit=" + unitName}
-	if limits.CPU > 0 {
-		args = append(args, fmt.Sprintf("-p=CPUQuota=%d%%", int(limits.CPU*100)))
-	}
-	if limits.Memory > 0 {
-		args = append(args, fmt.Sprintf("-p=MemoryMax=%d", limits.Memory))
-	}
-	if limits.Pids > 0 {
-		args = append(args, fmt.Sprintf("-p=TasksMax=%d", limits.Pids))
-	}
-
-	cmd := exec.CommandContext(ctx, systemdRun, args...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("systemd-run invocation failed: %s: %w", string(out), err)
-	}
-
-	var once sync.Once
-	cleanup := func() {
-		once.Do(func() {
-			_ = exec.Command("systemctl", "--user", "stop", unitName).Run()
-		})
-	}
 	return cleanup, nil
 }
 
