@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -71,11 +72,24 @@ func ParseRSAPrivateKey(params *RSAParameters) (*rsa.PrivateKey, error) {
 	}
 
 	n := new(big.Int).SetBytes(modBytes)
-	e := int(new(big.Int).SetBytes(expBytes).Int64())
-	if e == 0 {
-		return nil, errors.New("invalid exponent")
+	if n.Sign() <= 0 {
+		return nil, errors.New("invalid modulus: must be positive")
 	}
+
+	expBig := new(big.Int).SetBytes(expBytes)
+	if !expBig.IsInt64() {
+		return nil, errors.New("invalid exponent: exceeds int64 range")
+	}
+	exp64 := expBig.Int64()
+	if exp64 < 3 || exp64%2 == 0 || exp64 > int64(math.MaxInt) {
+		return nil, errors.New("invalid exponent: must be an odd integer >= 3")
+	}
+	e := int(exp64)
+
 	d := new(big.Int).SetBytes(dBytes)
+	if d.Sign() <= 0 {
+		return nil, errors.New("invalid d: must be positive")
+	}
 
 	var primes []*big.Int
 	if params.P != "" || params.Q != "" {
@@ -119,6 +133,10 @@ func ParseRSAPrivateKey(params *RSAParameters) (*rsa.PrivateKey, error) {
 		key.Precomputed.Dp = new(big.Int).SetBytes(dpBytes)
 		key.Precomputed.Dq = new(big.Int).SetBytes(dqBytes)
 		key.Precomputed.Qinv = new(big.Int).SetBytes(invqBytes)
+	}
+
+	if err := key.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid RSA private key: %w", err)
 	}
 
 	if len(key.Primes) >= 2 {
@@ -179,22 +197,33 @@ func generateUUID() (string, error) {
 
 // AcquireOAuthToken exchanges a PS256-signed JWT assertion for an OAuth access token from authURL.
 func AcquireOAuthToken(ctx context.Context, client *http.Client, authURL, clientID string, key *rsa.PrivateKey) (string, error) {
+	token, _, err := acquireOAuthTokenWithExpiry(ctx, client, authURL, clientID, key)
+	return token, err
+}
+
+func acquireOAuthTokenWithExpiry(ctx context.Context, client *http.Client, authURL, clientID string, key *rsa.PrivateKey) (string, time.Time, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if client == nil {
-		client = http.DefaultClient
+		client = newDefaultHTTPClient(30 * time.Second)
 	}
 	if authURL == "" {
-		return "", errors.New("empty auth URL")
+		return "", time.Time{}, errors.New("empty auth URL")
+	}
+	if _, err := validateRemoteURL(authURL); err != nil {
+		return "", time.Time{}, fmt.Errorf("invalid auth URL: %w", err)
 	}
 	if clientID == "" {
-		return "", errors.New("empty client ID")
+		return "", time.Time{}, errors.New("empty client ID")
 	}
 	if key == nil {
-		return "", errors.New("nil RSA private key")
+		return "", time.Time{}, errors.New("nil RSA private key")
 	}
 
 	jti, err := generateUUID()
 	if err != nil {
-		return "", fmt.Errorf("generate jti: %w", err)
+		return "", time.Time{}, fmt.Errorf("generate jti: %w", err)
 	}
 
 	now := time.Now().UTC().Unix()
@@ -211,7 +240,7 @@ func AcquireOAuthToken(ctx context.Context, client *http.Client, authURL, client
 	token := jwt.NewWithClaims(jwt.SigningMethodPS256, claims)
 	assertion, err := token.SignedString(key)
 	if err != nil {
-		return "", fmt.Errorf("sign assertion: %w", err)
+		return "", time.Time{}, fmt.Errorf("sign assertion: %w", err)
 	}
 
 	form := url.Values{}
@@ -221,24 +250,24 @@ func AcquireOAuthToken(ctx context.Context, client *http.Client, authURL, client
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, authURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", fmt.Errorf("create token request: %w", err)
+		return "", time.Time{}, fmt.Errorf("create token request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("execute token request: %w", err)
+		return "", time.Time{}, fmt.Errorf("execute token request: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer drainAndClose(resp.Body)
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", fmt.Errorf("read token response: %w", err)
+		return "", time.Time{}, fmt.Errorf("read token response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("token request returned status %d: %s", resp.StatusCode, string(body))
+		return "", time.Time{}, fmt.Errorf("token request returned status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var tokenResp struct {
@@ -247,11 +276,16 @@ func AcquireOAuthToken(ctx context.Context, client *http.Client, authURL, client
 		ExpiresIn   int64  `json:"expires_in"`
 	}
 	if err := json.Unmarshal(body, &tokenResp); err != nil {
-		return "", fmt.Errorf("unmarshal token response: %w", err)
+		return "", time.Time{}, fmt.Errorf("unmarshal token response: %w", err)
 	}
 	if tokenResp.AccessToken == "" {
-		return "", errors.New("empty access token in response")
+		return "", time.Time{}, errors.New("empty access token in response")
 	}
 
-	return tokenResp.AccessToken, nil
+	var expiresAt time.Time
+	if tokenResp.ExpiresIn > 0 {
+		expiresAt = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
+	}
+
+	return tokenResp.AccessToken, expiresAt, nil
 }

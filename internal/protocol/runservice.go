@@ -954,6 +954,9 @@ func (r *CompleteJobRequest) UnmarshalJSON(data []byte) error {
 	if len(raw.Outputs) > 0 {
 		r.Outputs = make(map[string]string, len(raw.Outputs))
 		for k, v := range raw.Outputs {
+			if v == nil {
+				continue
+			}
 			switch val := v.(type) {
 			case string:
 				r.Outputs[k] = val
@@ -975,19 +978,25 @@ type RunServiceClient struct {
 }
 
 // NewRunServiceClient creates a new RunServiceClient with the provided http.Client.
-// If client is nil, http.DefaultClient is used.
+// If client is nil, a default http.Client with hardened timeouts and TLS defaults is used.
 func NewRunServiceClient(client *http.Client) *RunServiceClient {
 	if client == nil {
-		client = http.DefaultClient
+		client = newDefaultHTTPClient(30 * time.Second)
 	}
 	return &RunServiceClient{client: client}
 }
 
 // AcquireJob requests and claims a job from the Run Service using the runnerRequestID.
 func (c *RunServiceClient) AcquireJob(ctx context.Context, runServiceURL, runnerRequestID, billingOwnerID, token string) (*JobSpecification, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cleanURL := strings.TrimRight(strings.TrimSpace(runServiceURL), "/")
 	if cleanURL == "" {
 		return nil, errors.New("empty run service URL")
+	}
+	if _, err := validateRemoteURL(cleanURL); err != nil {
+		return nil, fmt.Errorf("invalid run service URL: %w", err)
 	}
 	if strings.TrimSpace(runnerRequestID) == "" {
 		return nil, errors.New("empty runner request ID")
@@ -1026,7 +1035,7 @@ func (c *RunServiceClient) AcquireJob(ctx context.Context, runServiceURL, runner
 	if err != nil {
 		return nil, fmt.Errorf("execute acquire request: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer drainAndClose(resp.Body)
 
 	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 	if err != nil {
@@ -1052,9 +1061,15 @@ func ParseAcquiredJob(data []byte) (*JobSpecification, error) {
 // RenewJob renews the lock on an active job with the Run Service.
 // Returns the time until which the job is locked.
 func (c *RunServiceClient) RenewJob(ctx context.Context, runServiceURL, planID, jobID, token string) (time.Time, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cleanURL := strings.TrimRight(strings.TrimSpace(runServiceURL), "/")
 	if cleanURL == "" {
 		return time.Time{}, errors.New("empty run service URL")
+	}
+	if _, err := validateRemoteURL(cleanURL); err != nil {
+		return time.Time{}, fmt.Errorf("invalid run service URL: %w", err)
 	}
 	if strings.TrimSpace(planID) == "" {
 		return time.Time{}, errors.New("empty plan ID")
@@ -1096,7 +1111,7 @@ func (c *RunServiceClient) RenewJob(ctx context.Context, runServiceURL, planID, 
 	if err != nil {
 		return time.Time{}, fmt.Errorf("execute renew request: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer drainAndClose(resp.Body)
 
 	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
@@ -1175,9 +1190,15 @@ func parseTimeValue(val any) (time.Time, error) {
 
 // CompleteJob reports job execution results and completion status to the Run Service.
 func (c *RunServiceClient) CompleteJob(ctx context.Context, runServiceURL, token string, req *CompleteJobRequest) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cleanURL := strings.TrimRight(strings.TrimSpace(runServiceURL), "/")
 	if cleanURL == "" {
 		return errors.New("empty run service URL")
+	}
+	if _, err := validateRemoteURL(cleanURL); err != nil {
+		return fmt.Errorf("invalid run service URL: %w", err)
 	}
 	if req == nil {
 		return errors.New("nil complete job request")
@@ -1217,7 +1238,7 @@ func (c *RunServiceClient) CompleteJob(ctx context.Context, runServiceURL, token
 	if err != nil {
 		return fmt.Errorf("execute complete request: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))

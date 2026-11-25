@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -15,7 +16,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNewBrokerClient(t *testing.T) {
@@ -939,4 +945,241 @@ func TestBrokerClient_AcknowledgeMessage_TokenRefreshOn401(t *testing.T) {
 	if b.Token() != "refreshed-ack-token" {
 		t.Errorf("expected token updated to refreshed-ack-token, got %s", b.Token())
 	}
+}
+
+func TestBrokerClient_ConcurrentRefreshAndAckRace(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/token":
+			_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "tok-new", "expires_in": 60})
+		case strings.HasPrefix(r.URL.Path, "/session"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"sessionId": "sess-1"})
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	bc := NewBrokerClient(srv.Client(), srv.URL, srv.URL+"/token", "cid", key)
+	require.NoError(t, bc.CreateSession(context.Background(), "a", 1, 1))
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if i%2 == 0 {
+				_ = bc.RefreshToken(context.Background())
+			} else {
+				_ = bc.AcknowledgeMessage(context.Background(), "req-1")
+				_ = bc.Token()
+				_ = bc.SessionID()
+				_ = bc.SessionKey()
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestBrokerMessage_PreservesLargeInt64MessageID(t *testing.T) {
+	raw := []byte(`{"messageId": 9007199254740993, "messageType": "RunnerJobRequest"}`)
+	var msg BrokerMessage
+	require.NoError(t, json.Unmarshal(raw, &msg))
+	assert.Equal(t, int64(9007199254740993), msg.MessageID)
+}
+
+func TestBrokerMessage_RejectsInvalidMessageID(t *testing.T) {
+	var msg BrokerMessage
+	err := json.Unmarshal([]byte(`{"messageId":"not-a-number","messageType":"Job"}`), &msg)
+	require.Error(t, err)
+
+	err = json.Unmarshal([]byte(`{"messageId":12.34,"messageType":"Job"}`), &msg)
+	require.Error(t, err)
+}
+
+func TestJobRequestReference_UnmarshalJSON_Variants(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want JobRequestReference
+	}{
+		{
+			name: "snake_case",
+			raw:  `{"runner_request_id":"req-1","run_service_url":"https://run.example.com","billing_owner_id":"bill-1"}`,
+			want: JobRequestReference{RunnerRequestID: "req-1", RunServiceURL: "https://run.example.com", BillingOwnerID: "bill-1"},
+		},
+		{
+			name: "camelCase",
+			raw:  `{"runnerRequestId":"req-2","runServiceUrl":"https://run.example.com","billingOwnerId":"bill-2"}`,
+			want: JobRequestReference{RunnerRequestID: "req-2", RunServiceURL: "https://run.example.com", BillingOwnerID: "bill-2"},
+		},
+		{
+			name: "PascalCase and jobMessageId",
+			raw:  `{"jobMessageId":"req-3","RunServiceUrl":"https://run.example.com","BillingOwnerId":"bill-3"}`,
+			want: JobRequestReference{RunnerRequestID: "req-3", RunServiceURL: "https://run.example.com", BillingOwnerID: "bill-3"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got JobRequestReference
+			require.NoError(t, json.Unmarshal([]byte(tt.raw), &got))
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestValidateRemoteURL_And_Redirects(t *testing.T) {
+	for _, valid := range []string{
+		"https://broker.actions.githubusercontent.com/session",
+		"http://127.0.0.1:8080/test",
+		"http://localhost:3000/test",
+		"http://[::1]:9000/test",
+	} {
+		_, err := validateRemoteURL(valid)
+		assert.NoError(t, err, "expected %s to be valid", valid)
+	}
+
+	for _, invalid := range []string{
+		"",
+		"http://example.com/token",
+		"http://192.168.1.1/token",
+		"ftp://broker.example.com/file",
+		"not-a-url",
+	} {
+		_, err := validateRemoteURL(invalid)
+		assert.Error(t, err, "expected %s to be rejected", invalid)
+	}
+
+	reqCrossHost, _ := http.NewRequest(http.MethodGet, "https://evil.example.com/steal", nil)
+	prevHTTPS, _ := http.NewRequest(http.MethodGet, "https://api.github.com/start", nil)
+	assert.Error(t, checkSafeRedirect(reqCrossHost, []*http.Request{prevHTTPS}))
+
+	reqDowngrade, _ := http.NewRequest(http.MethodGet, "http://localhost/downgrade", nil)
+	prevLocalHTTPS, _ := http.NewRequest(http.MethodGet, "https://localhost/start", nil)
+	assert.Error(t, checkSafeRedirect(reqDowngrade, []*http.Request{prevLocalHTTPS}))
+
+	reqSameHost, _ := http.NewRequest(http.MethodGet, "https://api.github.com/next", nil)
+	assert.NoError(t, checkSafeRedirect(reqSameHost, []*http.Request{prevHTTPS}))
+}
+
+func TestNewDefaultHTTPClient_HardenedDefaults(t *testing.T) {
+	c := newDefaultHTTPClient(45 * time.Second)
+	require.NotNil(t, c)
+	assert.Equal(t, 45*time.Second, c.Timeout)
+	tr, ok := c.Transport.(*http.Transport)
+	require.True(t, ok)
+	assert.NotNil(t, tr.DialContext)
+	assert.Equal(t, 10*time.Second, tr.TLSHandshakeTimeout)
+	assert.Equal(t, 45*time.Second, tr.ResponseHeaderTimeout)
+	require.NotNil(t, tr.TLSClientConfig)
+	assert.Equal(t, uint16(tls.VersionTLS12), tr.TLSClientConfig.MinVersion)
+}
+
+func TestBrokerClient_SessionKeyDefensiveCopy(t *testing.T) {
+	b := NewBrokerClient(nil, "https://broker.example.com", "", "cid", nil)
+	b.mu.Lock()
+	b.sessionKey = []byte{1, 2, 3, 4}
+	b.mu.Unlock()
+
+	k := b.SessionKey()
+	require.Equal(t, []byte{1, 2, 3, 4}, k)
+	k[0] = 99
+	assert.Equal(t, []byte{1, 2, 3, 4}, b.SessionKey())
+}
+
+func TestBrokerClient_DeleteSession_TokenRefreshOn401(t *testing.T) {
+	key, err := GenerateRSAKeyPair(2048)
+	require.NoError(t, err)
+
+	authCalls := 0
+	authSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authCalls++
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "fresh-del-tok", "expires_in": 60})
+	}))
+	defer authSrv.Close()
+
+	delCalls := 0
+	brokerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		delCalls++
+		if r.Header.Get("Authorization") != "Bearer fresh-del-tok" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer brokerSrv.Close()
+
+	bc := NewBrokerClient(brokerSrv.Client(), brokerSrv.URL, authSrv.URL, "cid", key)
+	bc.mu.Lock()
+	bc.sessionID = "sess-del"
+	bc.token = "stale-del-tok"
+	bc.mu.Unlock()
+
+	require.NoError(t, bc.DeleteSession(context.Background()))
+	assert.Equal(t, 1, authCalls)
+	assert.Equal(t, 2, delCalls)
+	assert.Empty(t, bc.SessionID())
+	assert.Nil(t, bc.SessionKey())
+}
+
+func TestBrokerClient_RefreshIfNeeded_DeduplicatesConcurrent401(t *testing.T) {
+	key, err := GenerateRSAKeyPair(2048)
+	require.NoError(t, err)
+
+	var authCalls atomic.Int32
+	authSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authCalls.Add(1)
+		time.Sleep(20 * time.Millisecond)
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "dedup-tok", "expires_in": 60})
+	}))
+	defer authSrv.Close()
+
+	bc := NewBrokerClient(authSrv.Client(), "https://broker.example.com", authSrv.URL, "cid", key)
+	bc.mu.Lock()
+	bc.token = "expired-tok"
+	bc.mu.Unlock()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			assert.NoError(t, bc.refreshIfNeeded(context.Background(), "expired-tok"))
+		}()
+	}
+	wg.Wait()
+
+	assert.Equal(t, int32(1), authCalls.Load())
+	assert.Equal(t, "dedup-tok", bc.Token())
+}
+
+func TestBrokerClient_PropagatesRefreshErr(t *testing.T) {
+	key, err := GenerateRSAKeyPair(2048)
+	require.NoError(t, err)
+
+	authSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "auth unavailable", http.StatusServiceUnavailable)
+	}))
+	defer authSrv.Close()
+
+	brokerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer brokerSrv.Close()
+
+	bc := NewBrokerClient(brokerSrv.Client(), brokerSrv.URL, authSrv.URL, "cid", key)
+	bc.mu.Lock()
+	bc.sessionID = "sess-1"
+	bc.token = "old-tok"
+	bc.mu.Unlock()
+
+	_, err = bc.GetMessage(context.Background(), "3.0.0", "macOS", "ARM64")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "refresh oauth token")
+
+	err = bc.AcknowledgeMessage(context.Background(), "req-1")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "refresh oauth token")
 }

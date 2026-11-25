@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/adrijshikhar/actr/internal/config"
 )
@@ -142,9 +142,9 @@ func resolveRunnerRegistrationURL(repoURL string) (string, error) {
 		cleanURL = "https://" + cleanURL
 	}
 
-	parsed, err := url.Parse(cleanURL)
+	parsed, err := validateRemoteURL(cleanURL)
 	if err != nil {
-		return "", fmt.Errorf("parse URL %q: %w", repoURL, err)
+		return "", err
 	}
 
 	trimmedPath := strings.Trim(strings.TrimSuffix(parsed.Path, ".git"), "/")
@@ -157,7 +157,8 @@ func resolveRunnerRegistrationURL(repoURL string) (string, error) {
 		return "", fmt.Errorf("invalid repository or organization URL: %s", repoURL)
 	}
 
-	if parsed.Host == "github.com" || parsed.Host == "www.github.com" {
+	host := parsed.Hostname()
+	if strings.EqualFold(host, "github.com") || strings.EqualFold(host, "www.github.com") {
 		return "https://api.github.com/actions/runner-registration", nil
 	}
 
@@ -222,7 +223,7 @@ func RegisterRunner(
 		ctx = context.Background()
 	}
 	if client == nil {
-		client = http.DefaultClient
+		client = newDefaultHTTPClient(30 * time.Second)
 	}
 	if strings.TrimSpace(repoURL) == "" {
 		return nil, nil, nil, errors.New("empty repository or organization URL")
@@ -264,7 +265,7 @@ func RegisterRunner(
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("execute runner auth request: %w", err)
 	}
-	defer func() { _ = resp1.Body.Close() }()
+	defer drainAndClose(resp1.Body)
 
 	body1, err := io.ReadAll(io.LimitReader(resp1.Body, 1<<20))
 	if err != nil {
@@ -296,7 +297,11 @@ func RegisterRunner(
 	}
 
 	// Step 2: Register agent with distributedtask pool
-	tenantURL := strings.TrimRight(authResp.URL, "/")
+	tenantParsed, err := validateRemoteURL(authResp.URL)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("invalid tenant URL: %w", err)
+	}
+	tenantURL := strings.TrimRight(tenantParsed.String(), "/")
 	agentsURL := fmt.Sprintf("%s/_apis/distributedtask/pools/1/agents?api-version=6.0-preview.2", tenantURL)
 
 	agentReq := TaskAgentRegisterRequest{
@@ -342,7 +347,7 @@ func RegisterRunner(
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("execute agent registration request: %w", err)
 	}
-	defer func() { _ = resp2.Body.Close() }()
+	defer drainAndClose(resp2.Body)
 
 	body2, err := io.ReadAll(io.LimitReader(resp2.Body, 1<<20))
 	if err != nil {

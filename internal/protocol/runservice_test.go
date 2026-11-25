@@ -1359,3 +1359,26 @@ func TestParseAcquiredJob_EndpointsDeduplication(t *testing.T) {
 	assert.Equal(t, "SharedEP", job.Endpoints[0].Name)
 	assert.Equal(t, "OtherEP", job.Endpoints[1].Name)
 }
+
+func TestCompleteJobRequest_UnmarshalJSON_SkipsNilOutputs(t *testing.T) {
+	raw := `{"planId":"p1","jobId":"j1","conclusion":"succeeded","outputs":{"ok":"val","ignored":null}}`
+	var req protocol.CompleteJobRequest
+	require.NoError(t, json.Unmarshal([]byte(raw), &req))
+	assert.Equal(t, "val", req.Outputs["ok"])
+	_, exists := req.Outputs["ignored"]
+	assert.False(t, exists, "nil output value should be skipped")
+}
+
+func TestRunServiceClient_RejectsInsecureRemoteURL(t *testing.T) {
+	client := protocol.NewRunServiceClient(nil)
+	_, err := client.AcquireJob(context.Background(), "http://run.example.com", "req-1", "bill-1", "tok")
+	require.Error(t, err)
+	_, err = client.RenewJob(context.Background(), "http://run.example.com", "p1", "j1", "tok")
+	require.Error(t, err)
+	err = client.CompleteJob(context.Background(), "http://run.example.com", "tok", &protocol.CompleteJobRequest{
+		PlanID:     "p1",
+		JobID:      "j1",
+		Conclusion: "succeeded",
+	})
+	require.Error(t, err)
+}

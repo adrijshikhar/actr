@@ -8,6 +8,8 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestCryptoRoundtrip(t *testing.T) {
@@ -174,4 +176,40 @@ func TestDecryptAESKeyOAEP_Invalid(t *testing.T) {
 	if _, err := DecryptAESKeyOAEP(nil, []byte("some-data")); err == nil {
 		t.Error("expected error with nil private key, got nil")
 	}
+}
+
+func TestPKCS7Pad_DoesNotMutateInputBackingArray(t *testing.T) {
+	buf := make([]byte, 5, 32)
+	copy(buf, "hello")
+	origCap := buf[:cap(buf)]
+	origCap[5] = 0xAA
+
+	padded := pkcs7Pad(buf, 16)
+	assert.Len(t, padded, 16)
+	assert.Equal(t, byte(0xAA), origCap[5], "input slice spare capacity must not be overwritten")
+}
+
+func TestDecryptAESKey_RejectsInvalidAESKeyLength(t *testing.T) {
+	key, err := GenerateRSAKeyPair(2048)
+	if err != nil {
+		t.Fatalf("generate RSA: %v", err)
+	}
+	badAESKey := make([]byte, 10) // not 16, 24, or 32
+	enc, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, &key.PublicKey, badAESKey, nil)
+	if err != nil {
+		t.Fatalf("encrypt OAEP: %v", err)
+	}
+	_, err = DecryptAESKeyOAEP(key, enc)
+	assert.Error(t, err)
+	_, err = DecryptAESKey(key, enc)
+	assert.Error(t, err)
+}
+
+func TestPKCS7Unpad_ConstantErrorMessage(t *testing.T) {
+	_, err1 := pkcs7Unpad([]byte{}, 16)
+	_, err2 := pkcs7Unpad([]byte("123456789012345\x00"), 16)
+	_, err3 := pkcs7Unpad([]byte("12345678901234\x01\x02"), 16)
+	assert.EqualError(t, err1, "decryption failed")
+	assert.EqualError(t, err2, "decryption failed")
+	assert.EqualError(t, err3, "decryption failed")
 }

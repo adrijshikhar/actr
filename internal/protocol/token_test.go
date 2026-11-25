@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/stretchr/testify/require"
 )
 
 func TestRSAParametersRoundtrip(t *testing.T) {
@@ -255,4 +257,58 @@ func TestAcquireOAuthToken_Errors(t *testing.T) {
 			t.Fatal("expected error for cancelled context")
 		}
 	})
+}
+
+func TestParseRSAPrivateKey_RejectsInvalidPrimesWithoutPanic(t *testing.T) {
+	_, err := ParseRSAPrivateKey(&RSAParameters{
+		Modulus:  base64.RawURLEncoding.EncodeToString([]byte{0x0f}),
+		Exponent: base64.RawURLEncoding.EncodeToString([]byte{0x01, 0x00, 0x01}),
+		D:        base64.RawURLEncoding.EncodeToString([]byte{0x03}),
+		P:        base64.RawURLEncoding.EncodeToString([]byte{0x01}), // invalid prime == 1
+		Q:        base64.RawURLEncoding.EncodeToString([]byte{0x01}),
+	})
+	require.Error(t, err)
+}
+
+func TestParseRSAPrivateKey_ValidationChecks(t *testing.T) {
+	validExp := base64.RawURLEncoding.EncodeToString([]byte{0x01, 0x00, 0x01})
+	// Exponent = 2 (even)
+	_, err := ParseRSAPrivateKey(&RSAParameters{
+		Modulus:  base64.RawURLEncoding.EncodeToString([]byte{0x0f}),
+		Exponent: base64.RawURLEncoding.EncodeToString([]byte{0x02}),
+		D:        base64.RawURLEncoding.EncodeToString([]byte{0x03}),
+	})
+	require.Error(t, err)
+
+	// Exponent > int64
+	_, err = ParseRSAPrivateKey(&RSAParameters{
+		Modulus:  base64.RawURLEncoding.EncodeToString([]byte{0x0f}),
+		Exponent: base64.RawURLEncoding.EncodeToString([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}),
+		D:        base64.RawURLEncoding.EncodeToString([]byte{0x03}),
+	})
+	require.Error(t, err)
+
+	// Zero modulus
+	_, err = ParseRSAPrivateKey(&RSAParameters{
+		Modulus:  base64.RawURLEncoding.EncodeToString([]byte{0x00}),
+		Exponent: validExp,
+		D:        base64.RawURLEncoding.EncodeToString([]byte{0x03}),
+	})
+	require.Error(t, err)
+
+	// Zero D
+	_, err = ParseRSAPrivateKey(&RSAParameters{
+		Modulus:  base64.RawURLEncoding.EncodeToString([]byte{0x0f}),
+		Exponent: validExp,
+		D:        base64.RawURLEncoding.EncodeToString([]byte{0x00}),
+	})
+	require.Error(t, err)
+}
+
+func TestAcquireOAuthToken_RejectsInsecureRemoteURL(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	_, err = AcquireOAuthToken(context.Background(), nil, "http://auth.example.com/token", "cid", key)
+	require.Error(t, err)
 }
