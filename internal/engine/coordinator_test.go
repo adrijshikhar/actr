@@ -1072,9 +1072,9 @@ func TestCoordinator_ExecuteJob_ProcessStartPIDAndJobEvents(t *testing.T) {
 				if step.OnProcessStart != nil {
 					step.OnProcessStart(12345, 12345)
 				}
-				// wait briefly for telemetry sampler (ticker runs every 500ms)
-				time.Sleep(550 * time.Millisecond)
 			}
+			// wait briefly for telemetry sampler (ticker runs every 500ms)
+			time.Sleep(550 * time.Millisecond)
 			return &driver.StepResult{ExitCode: 0}, nil
 		},
 	}
