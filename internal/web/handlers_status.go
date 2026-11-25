@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"net/http"
 	"time"
 
@@ -39,6 +40,16 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 				resp.DaemonConnected = true
 			}
 		}
+	}
+
+	// If daemon controller is not reporting active (e.g. CLI runner or manual daemon run),
+	// check if MetricsProvider (daemon socket) is reachable with a short bounded timeout.
+	if !resp.DaemonConnected && s.cfg.MetricsProvider != nil {
+		checkCtx, cancel := context.WithTimeout(r.Context(), 500*time.Millisecond)
+		if _, err := s.cfg.MetricsProvider.GetCurrentMetrics(checkCtx); err == nil {
+			resp.DaemonConnected = true
+		}
+		cancel()
 	}
 
 	// Query RunStore for active and queued job counts
