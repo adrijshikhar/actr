@@ -90,4 +90,12 @@ func TestKeychainProvider_DarwinOperations(t *testing.T) {
 	// Delete non-existent should return ErrSecretNotFound
 	err = p.Delete(ctx, testKey)
 	assert.True(t, errors.Is(err, ErrSecretNotFound))
+
+	// Multiline secret handling
+	multilineKey := "ACTR_TEST_MULTILINE_KEY"
+	multilineVal := "line1\nline2"
+	_ = p.Delete(ctx, multilineKey)
+	err = p.Set(ctx, multilineKey, multilineVal)
+	require.NoError(t, err)
+	_ = p.Delete(ctx, multilineKey)
 }

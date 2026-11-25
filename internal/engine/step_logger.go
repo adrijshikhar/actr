@@ -45,9 +45,10 @@ func NewSecretMasker() *SecretMasker {
 }
 
 // AddMask registers a secret string to be redacted from log outputs.
+// Secrets shorter than 3 characters are ignored to prevent pathological over-redaction of common characters.
 func (sm *SecretMasker) AddMask(secret string) {
 	secret = strings.TrimSpace(secret)
-	if secret == "" {
+	if len(secret) < 3 {
 		return
 	}
 	sm.mu.Lock()

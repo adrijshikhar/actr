@@ -452,7 +452,7 @@ func TestServer_Start_SocketAlreadyInUse(t *testing.T) {
 	}
 }
 
-func TestServer_Publish_SlowSubscriberChannelClosed(t *testing.T) {
+func TestServer_Publish_SlowSubscriberDoesNotDisconnect(t *testing.T) {
 	sockPath := testSocketPath(t)
 
 	server := NewServer(sockPath, "test-slow-sub")
@@ -477,25 +477,19 @@ func TestServer_Publish_SlowSubscriberChannelClosed(t *testing.T) {
 		t.Fatal("timed out waiting for initial event")
 	}
 
-	// Flood publish without reading to fill buffer (channel capacity is 100)
-	for i := 0; i < 500; i++ {
+	// Flood publish without reading to exceed buffer capacity (1000)
+	for i := 0; i < 1500; i++ {
 		server.Publish(Event{Type: EventStepLog, StepID: "s1", LogLine: fmt.Sprintf("line %d", i)})
 	}
 
-	// The subscriber channel should be closed when full
-	closed := false
-	timer := time.NewTimer(3 * time.Second)
-	defer timer.Stop()
-
-	for !closed {
-		select {
-		case _, ok := <-events:
-			if !ok {
-				closed = true
-			}
-		case <-timer.C:
-			t.Fatal("timed out waiting for slow subscriber stream to close")
+	// The subscriber channel should remain OPEN and functional despite the burst
+	select {
+	case _, ok := <-events:
+		if !ok {
+			t.Fatal("expected subscriber channel to remain open during burst, but it was closed")
 		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out reading event from buffered subscriber stream")
 	}
 }
 

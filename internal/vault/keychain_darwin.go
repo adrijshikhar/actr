@@ -47,8 +47,32 @@ func (k *DarwinKeychainProvider) Set(ctx context.Context, key, value string) err
 		return err
 	}
 
-	// #nosec G204 -- /usr/bin/security is hardcoded and arguments are passed as discrete parameters without shell evaluation
-	cmd := exec.CommandContext(ctx, "/usr/bin/security", "add-generic-password", "-U", "-s", k.service, "-a", key, "-w", value)
+	// If value, key, or service contains newlines, security -i cannot be used because
+	// newlines act as command delimiters in interactive mode. In that case, fall back to direct argv execution.
+	if strings.ContainsAny(value, "\r\n") || strings.ContainsAny(key, "\r\n") || strings.ContainsAny(k.service, "\r\n") {
+		// #nosec G204 -- /usr/bin/security is hardcoded and arguments are passed as discrete parameters without shell evaluation
+		cmd := exec.CommandContext(ctx, "/usr/bin/security", "add-generic-password", "-U", "-s", k.service, "-a", key, "-w", value)
+		var errBuf bytes.Buffer
+		cmd.Stderr = &errBuf
+		if err := cmd.Run(); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("keychain set %s: %w (%s)", key, err, strings.TrimSpace(errBuf.String()))
+		}
+		return nil
+	}
+
+	// #nosec G204 -- /usr/bin/security is hardcoded and arguments are passed via stdin in interactive mode
+	// so sensitive secrets are never exposed in process argv (e.g. ps aux, sysctl KERN_PROCARGS2).
+	escapedVal := strings.ReplaceAll(strings.ReplaceAll(value, "\\", "\\\\"), "\"", "\\\"")
+	escapedKey := strings.ReplaceAll(strings.ReplaceAll(key, "\\", "\\\\"), "\"", "\\\"")
+	escapedSvc := strings.ReplaceAll(strings.ReplaceAll(k.service, "\\", "\\\\"), "\"", "\\\"")
+
+	input := fmt.Sprintf("add-generic-password -U -s \"%s\" -a \"%s\" -w \"%s\"\n", escapedSvc, escapedKey, escapedVal)
+
+	cmd := exec.CommandContext(ctx, "/usr/bin/security", "-i")
+	cmd.Stdin = strings.NewReader(input)
 	var errBuf bytes.Buffer
 	cmd.Stderr = &errBuf
 	if err := cmd.Run(); err != nil {

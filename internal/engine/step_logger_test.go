@@ -268,6 +268,20 @@ func TestSecretMasker_LongerSecretsMaskedFirst(t *testing.T) {
 	}
 }
 
+func TestSecretMasker_ShortSecretsIgnored(t *testing.T) {
+	sm := NewSecretMasker()
+	sm.AddMask("a")
+	sm.AddMask("12")
+	sm.AddMask("   ")
+	sm.AddMask("validsecret")
+
+	result := sm.Mask("a and 12 should not be masked, but validsecret must be")
+	expected := "a and 12 should not be masked, but *** must be"
+	if result != expected {
+		t.Errorf("expected %q, got %q", expected, result)
+	}
+}
+
 func TestParseAddMask_AnchoredToLineStart(t *testing.T) {
 	tests := []struct {
 		name     string

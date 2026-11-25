@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"time"
 )
 
 // Client interacts with the IPC Server over a Unix domain socket.
@@ -21,9 +22,12 @@ func NewClient(sockPath string) *Client {
 		httpClient: &http.Client{
 			Transport: &http.Transport{
 				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-					var d net.Dialer
+					d := net.Dialer{
+						Timeout: 5 * time.Second,
+					}
 					return d.DialContext(ctx, "unix", sockPath)
 				},
+				ResponseHeaderTimeout: 10 * time.Second,
 			},
 		},
 	}
@@ -31,6 +35,12 @@ func NewClient(sockPath string) *Client {
 
 // GetSnapshot retrieves the current runner state snapshot from the daemon.
 func (c *Client) GetSnapshot(ctx context.Context) (*Snapshot, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://unix/snapshot", nil)
 	if err != nil {
 		return nil, err
