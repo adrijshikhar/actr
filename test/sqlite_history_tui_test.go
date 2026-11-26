@@ -468,7 +468,10 @@ func TestSQLiteHistory_TUI_EndToEndIntegration(t *testing.T) {
 	assert.NoError(t, err, "CopyText must succeed without error")
 
 	// 8b. Dashboard 'c' keyboard copy shortcut
-	resModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	resModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	if cmd != nil {
+		resModel, _ = resModel.Update(cmd())
+	}
 	m = resModel.(*tui.DashboardModel)
 
 	expectedToast := fmt.Sprintf("✓ Copied %d lines to clipboard", len(aimLogLines))

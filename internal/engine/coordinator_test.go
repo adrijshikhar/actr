@@ -2866,11 +2866,11 @@ func TestCoordinator_GitHubContextAndEnvSync(t *testing.T) {
 
 	env := d.stepsRun[0].Environment
 	expected := map[string]string{
-		"GITHUB_RUN_ID":     "12345678",
-		"GITHUB_RUN_NUMBER": "42",
+		"GITHUB_RUN_ID":      "12345678",
+		"GITHUB_RUN_NUMBER":  "42",
 		"GITHUB_RUN_ATTEMPT": "1",
-		"GITHUB_ACTOR":      "test-actor",
-		"GITHUB_REPOSITORY": "org/repo",
+		"GITHUB_ACTOR":       "test-actor",
+		"GITHUB_REPOSITORY":  "org/repo",
 	}
 
 	for k, expectedVal := range expected {
@@ -3327,8 +3327,8 @@ func TestExecuteJob_ForbiddenEnvKeys_DroppedFromJobAndStep(t *testing.T) {
 				ID:   "s1",
 				Name: "check-env",
 				Environment: map[string]string{
-					"LD_PRELOAD":     "/malicious.so",
-					"STEP_SAFE_VAR":  "step_val",
+					"LD_PRELOAD":    "/malicious.so",
+					"STEP_SAFE_VAR": "step_val",
 				},
 				Script: "echo ok",
 			},
@@ -3609,7 +3609,3 @@ func TestExpressionEvaluator_BuiltinsAndOperators(t *testing.T) {
 	require.NoError(t, os.Symlink(outsideSecret, filepath.Join(ws, "leaked.txt")))
 	assert.Equal(t, "", evaluateExpression("hashFiles('leaked.txt')", ctx))
 }
-
-
-
-

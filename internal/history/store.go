@@ -531,7 +531,7 @@ func (s *DiskStore) loadIndexLocked() (*IndexCatalog, error) {
 
 	var catalog IndexCatalog
 	if err := json.Unmarshal(data, &catalog); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrCorruptedIndex, err)
+		return nil, fmt.Errorf("%w: %w", ErrCorruptedIndex, err)
 	}
 	if catalog.Runs == nil {
 		catalog.Runs = []*RunSummary{}

@@ -478,4 +478,3 @@ func TestCompletion_Install(t *testing.T) {
 		t.Errorf("expected /custom/homebrew, got %q", prefix)
 	}
 }
-

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"syscall"
@@ -35,7 +36,9 @@ func terminateProcess(pid int) error {
 	if err != nil {
 		return err
 	}
-	_ = proc.Signal(syscall.SIGTERM)
+	if err := proc.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) && !errors.Is(err, syscall.ESRCH) {
+		return err
+	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if !isProcessAlive(pid) {
@@ -43,6 +46,8 @@ func terminateProcess(pid int) error {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	_ = proc.Signal(syscall.SIGKILL)
+	if err := proc.Signal(syscall.SIGKILL); err != nil && !errors.Is(err, os.ErrProcessDone) && !errors.Is(err, syscall.ESRCH) {
+		return err
+	}
 	return nil
 }

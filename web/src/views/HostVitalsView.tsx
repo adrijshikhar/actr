@@ -29,7 +29,7 @@ export interface HostVitalsViewProps {
   onRefresh?: () => void;
 }
 
-const MAX_BUFFER_CAPACITY = 900; // 15 minutes of 1-second samples
+const MAX_BUFFER_CAPACITY = 86400; // retain up to 24h of 1s samples, or days of compacted samples
 
 const TIME_WINDOWS = [
   { value: 30, label: 'Last 30s' },
@@ -37,13 +37,26 @@ const TIME_WINDOWS = [
   { value: 120, label: 'Last 2m' },
   { value: 300, label: 'Last 5m' },
   { value: 900, label: 'Last 15m' },
+  { value: 1800, label: 'Last 30m' },
+  { value: 3600, label: 'Last 1h' },
+  { value: 10800, label: 'Last 3h' },
+  { value: 21600, label: 'Last 6h' },
+  { value: 43200, label: 'Last 12h' },
+  { value: 86400, label: 'Last 24h' },
+  { value: 259200, label: 'Last 3d' },
+  { value: 604800, label: 'Last 7d' },
 ];
 
-const REFRESH_INTERVALS = [
-  { value: '1', label: '1s (Live)' },
-  { value: '2', label: '2s' },
+export type RefreshCadence = '5' | '10' | '15' | '30' | '60' | '300' | '600' | 'off';
+
+const REFRESH_INTERVALS: { value: RefreshCadence; label: string }[] = [
   { value: '5', label: '5s' },
   { value: '10', label: '10s' },
+  { value: '15', label: '15s' },
+  { value: '30', label: '30s' },
+  { value: '60', label: '1m' },
+  { value: '300', label: '5m' },
+  { value: '600', label: '10m' },
   { value: 'off', label: 'Off (Paused)' },
 ];
 
@@ -92,19 +105,20 @@ export function HostVitalsView({
   const [streamActive, setStreamActive] = useState(false);
   const [lastTick, setLastTick] = useState<string | null>(null);
   const [layoutMode, setLayoutMode] = useState<'grid' | 'stacked'>('grid');
+  const [sampleCount, setSampleCount] = useState<number>(() => (status ? 1 : 0));
 
-  // Grafana-style Time Window control: 30s, 60s (default 1m), 120s (2m), 300s (5m), 900s (15m)
+  // Grafana-style Time Window control: 30s up to 604800s (Last 7d)
   const [timeWindow, setTimeWindow] = useState<number>(60);
 
-  // Grafana-style Auto-Refresh control: '1' (live), '2', '5', '10', 'off' (paused)
-  const [refreshCadence, setRefreshCadence] = useState<'1' | '2' | '5' | '10' | 'off'>('1');
+  // Grafana-style Auto-Refresh control: '5', '10', '15', '30', '60' (1m), '300' (5m), '600' (10m), 'off' (paused)
+  const [refreshCadence, setRefreshCadence] = useState<RefreshCadence>('5');
   const [isPaused, setIsPaused] = useState<boolean>(false);
   const [isPolling, setIsPolling] = useState<boolean>(false);
 
   // High-frequency mutable refs to retain full telemetry stream without dropping samples during inspection
   const allSamplesRef = useRef<TelemetrySample[]>(metricsHistory);
   const isPausedRef = useRef<boolean>(false);
-  const cadenceRef = useRef<'1' | '2' | '5' | '10' | 'off'>('1');
+  const cadenceRef = useRef<RefreshCadence>('5');
   const lastRenderMsRef = useRef<number>(0);
   const statusRef = useRef<StatusResponse | null | undefined>(status);
 
@@ -118,6 +132,7 @@ export function HostVitalsView({
         host_mem_total: status.host_mem_total || 0,
       });
       allSamplesRef.current = [initial];
+      setSampleCount(1);
       setMetricsHistory([initial]);
     }
   }, [status]);
@@ -155,11 +170,14 @@ export function HostVitalsView({
           process_count: m.process_count ?? 0,
         });
 
-        // Push to retained background buffer (up to 15m)
+        // Push to retained background buffer (compact older half if buffer reaches limit to retain up to 7d)
         allSamplesRef.current.push(sample);
         if (allSamplesRef.current.length > MAX_BUFFER_CAPACITY) {
-          allSamplesRef.current = allSamplesRef.current.slice(-MAX_BUFFER_CAPACITY);
+          const half = Math.floor(allSamplesRef.current.length / 2);
+          const compactedOlder = allSamplesRef.current.slice(0, half).filter((_, i) => i % 2 === 0);
+          allSamplesRef.current = [...compactedOlder, ...allSamplesRef.current.slice(half)];
         }
+        setSampleCount(allSamplesRef.current.length);
 
         // When paused: freeze chart updates completely so user can inspect without layout shift
         if (isPausedRef.current) {
@@ -169,9 +187,9 @@ export function HostVitalsView({
         // Apply selected auto-refresh cadence
         const currentCadence = cadenceRef.current;
         const now = Date.now();
-        const cadenceSeconds = currentCadence === 'off' ? 1 : Number(currentCadence);
+        const cadenceSeconds = currentCadence === 'off' ? 5 : Number(currentCadence);
 
-        if (cadenceSeconds <= 1 || now - lastRenderMsRef.current >= cadenceSeconds * 1000 - 100) {
+        if (now - lastRenderMsRef.current >= cadenceSeconds * 1000 - 100) {
           lastRenderMsRef.current = now;
           setMetricsHistory([...allSamplesRef.current]);
         }
@@ -196,9 +214,10 @@ export function HostVitalsView({
       if (nextPaused) {
         setRefreshCadence('off');
       } else {
-        setRefreshCadence('1');
-        cadenceRef.current = '1';
+        setRefreshCadence('5');
+        cadenceRef.current = '5';
         lastRenderMsRef.current = Date.now();
+        setSampleCount(allSamplesRef.current.length);
         setMetricsHistory([...allSamplesRef.current]);
       }
       return nextPaused;
@@ -207,7 +226,7 @@ export function HostVitalsView({
 
   // Cadence selector change handler
   const handleCadenceChange = useCallback((value: string) => {
-    const val = value as '1' | '2' | '5' | '10' | 'off';
+    const val = value as RefreshCadence;
     setRefreshCadence(val);
     cadenceRef.current = val;
     if (val === 'off') {
@@ -217,6 +236,7 @@ export function HostVitalsView({
       setIsPaused(false);
       isPausedRef.current = false;
       lastRenderMsRef.current = Date.now();
+      setSampleCount(allSamplesRef.current.length);
       setMetricsHistory([...allSamplesRef.current]);
     }
   }, []);
@@ -229,16 +249,52 @@ export function HostVitalsView({
         await onRefresh();
       }
       lastRenderMsRef.current = Date.now();
+      setSampleCount(allSamplesRef.current.length);
       setMetricsHistory([...allSamplesRef.current]);
     } finally {
       setTimeout(() => setIsPolling(false), 400);
     }
   }, [onRefresh]);
 
-  // Sliced time-series data matching the selected time window (30s, 1m, 2m, 5m, 15m)
+  // Time-filtered time-series data matching the selected time window (30s up to 7d)
   const visibleMetrics = useMemo(() => {
     if (metricsHistory.length === 0) return [];
-    return metricsHistory.slice(-timeWindow);
+
+    const newest = metricsHistory[metricsHistory.length - 1];
+    const newestTime = newest?.timestamp ? new Date(newest.timestamp).getTime() : 0;
+    const baseTime = !isNaN(newestTime) && newestTime > 0 ? newestTime : Date.now();
+    const cutoffMs = baseTime - timeWindow * 1000;
+
+    let startIndex = metricsHistory.length - 1;
+    while (startIndex >= 0) {
+      const ts = metricsHistory[startIndex]?.timestamp;
+      if (ts) {
+        const t = new Date(ts).getTime();
+        if (!isNaN(t) && t < cutoffMs) {
+          startIndex++;
+          break;
+        }
+      }
+      startIndex--;
+    }
+    if (startIndex < 0) startIndex = 0;
+
+    let filtered = metricsHistory.slice(startIndex);
+    if (filtered.length === 0) {
+      filtered = metricsHistory.slice(-Math.min(timeWindow, metricsHistory.length));
+    }
+
+    // Downsample if more than 300 points to keep SVG charts rendering smooth at 60 FPS
+    if (filtered.length > 300) {
+      const step = (filtered.length - 1) / 299;
+      const sampled: TelemetrySample[] = [];
+      for (let i = 0; i < 300; i++) {
+        sampled.push(filtered[Math.min(Math.round(i * step), filtered.length - 1)]);
+      }
+      return sampled;
+    }
+
+    return filtered;
   }, [metricsHistory, timeWindow]);
 
   const latest = metricsHistory[metricsHistory.length - 1];
@@ -292,9 +348,7 @@ export function HostVitalsView({
                 {isPaused
                   ? 'Paused'
                   : streamActive
-                  ? refreshCadence === '1'
-                    ? 'Live (1s)'
-                    : `${refreshCadence}s Stream`
+                  ? `${REFRESH_INTERVALS.find((r) => r.value === refreshCadence)?.label || refreshCadence} Stream`
                   : 'Connecting'}
               </Badge>
             </div>
@@ -302,9 +356,9 @@ export function HostVitalsView({
             <div className="flex items-center gap-2 text-[11px] font-mono tracking-tight text-geist-faint truncate tabular-nums">
               <span className="text-geist-secondary font-sans truncate">Continuous kernel I/O & hardware telemetry</span>
               <span>·</span>
-              <span className="whitespace-nowrap">Window: <span className="text-white font-medium">{visibleMetrics.length}s</span></span>
+              <span className="whitespace-nowrap">Window: <span className="text-white font-medium">{TIME_WINDOWS.find((w) => w.value === timeWindow)?.label || `${timeWindow}s`}</span></span>
               <span>·</span>
-              <span className="whitespace-nowrap">Buffer: <span className="text-white font-medium">{allSamplesRef.current.length}s</span></span>
+              <span className="whitespace-nowrap">Buffer: <span className="text-white font-medium">{sampleCount} samples</span></span>
               {lastTick && (
                 <>
                   <span>·</span>
@@ -627,7 +681,7 @@ export function HostVitalsView({
               /api/metrics/stream
             </span>
             <span className="text-[11px] text-geist-faint block">
-              Cadence {isPaused ? 'Paused' : `${refreshCadence}s`} · Window {timeWindow}s
+              Cadence {isPaused ? 'Paused' : `${REFRESH_INTERVALS.find((r) => r.value === refreshCadence)?.label || refreshCadence}`} · Window {TIME_WINDOWS.find((w) => w.value === timeWindow)?.label || `${timeWindow}s`}
             </span>
           </div>
         </div>

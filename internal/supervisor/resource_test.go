@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -38,7 +39,7 @@ func TestResourceManager_AcquireRelease(t *testing.T) {
 	ctxTimeout, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
 	_, err = rm.Acquire(ctxTimeout)
-	if err != context.DeadlineExceeded {
+	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("expected context.DeadlineExceeded, got %v", err)
 	}
 
@@ -115,7 +116,7 @@ func TestResourceManager_ContextCancellation(t *testing.T) {
 	cancel()
 
 	_, err = rm.Acquire(canceledCtx)
-	if err != context.Canceled {
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}
 	if rm.ActiveCount() != 0 {
@@ -133,7 +134,7 @@ func TestResourceManager_ContextCancellation(t *testing.T) {
 	ctxWait, cancelWait := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancelWait()
 	_, err = rm.Acquire(ctxWait)
-	if err != context.DeadlineExceeded {
+	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected context.DeadlineExceeded, got %v", err)
 	}
 	if rm.ActiveCount() != 1 {

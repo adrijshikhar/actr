@@ -273,7 +273,7 @@ retention:
 	assert.Equal(t, "30m", cfg.Limits.Timeout)
 	assert.Equal(t, "host", cfg.Driver.Default)
 	assert.Equal(t, "/var/run/docker.sock", cfg.Driver.Docker.Socket)
-	assert.True(t, cfg.Driver.Docker.AutoPull)
+	assert.True(t, cfg.Driver.Docker.AutoPull != nil && *cfg.Driver.Docker.AutoPull)
 	assert.Equal(t, "catthehacker/ubuntu:act-latest", cfg.Driver.Docker.ImageMappings["ubuntu-latest"])
 	assert.Equal(t, "node:20-bookworm", cfg.Driver.Docker.ImageMappings["node-20"])
 	assert.Equal(t, 25, cfg.Retention.MaxRuns)

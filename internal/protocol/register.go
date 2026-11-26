@@ -261,7 +261,7 @@ func RegisterRunner(
 	httpReq1.Header.Set("Accept", "application/json")
 	httpReq1.Header.Set("User-Agent", "actr")
 
-	resp1, err := client.Do(httpReq1)
+	resp1, err := client.Do(httpReq1) //nolint:bodyclose // drainAndClose drains and closes resp1.Body
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("execute runner auth request: %w", err)
 	}
@@ -343,7 +343,7 @@ func RegisterRunner(
 	httpReq2.Header.Set("Accept", "application/json; api-version=6.0-preview.2")
 	httpReq2.Header.Set("User-Agent", "actr")
 
-	resp2, err := client.Do(httpReq2)
+	resp2, err := client.Do(httpReq2) //nolint:bodyclose // drainAndClose drains and closes resp2.Body
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("execute agent registration request: %w", err)
 	}

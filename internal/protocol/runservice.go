@@ -1031,7 +1031,7 @@ func (c *RunServiceClient) AcquireJob(ctx context.Context, runServiceURL, runner
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.client.Do(req)
+	resp, err := c.client.Do(req) //nolint:bodyclose // drainAndClose drains and closes resp.Body
 	if err != nil {
 		return nil, fmt.Errorf("execute acquire request: %w", err)
 	}
@@ -1107,7 +1107,7 @@ func (c *RunServiceClient) RenewJob(ctx context.Context, runServiceURL, planID, 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.client.Do(req)
+	resp, err := c.client.Do(req) //nolint:bodyclose // drainAndClose drains and closes resp.Body
 	if err != nil {
 		return time.Time{}, fmt.Errorf("execute renew request: %w", err)
 	}
@@ -1234,7 +1234,7 @@ func (c *RunServiceClient) CompleteJob(ctx context.Context, runServiceURL, token
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json")
 
-	resp, err := c.client.Do(httpReq)
+	resp, err := c.client.Do(httpReq) //nolint:bodyclose // drainAndClose drains and closes resp.Body
 	if err != nil {
 		return fmt.Errorf("execute complete request: %w", err)
 	}

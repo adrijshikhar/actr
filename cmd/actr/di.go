@@ -191,7 +191,7 @@ func DetectDockerDriver(ctx context.Context, socketOverride string, autoPull boo
 	var opts []client.Opt
 	if socketOverride != "" {
 		sock := socketOverride
-		if !strings.HasPrefix(sock, "unix://") && !strings.HasPrefix(sock, "tcp://") {
+		if !strings.Contains(sock, "://") {
 			sock = "unix://" + sock
 		}
 		opts = append(opts, client.WithHost(sock))

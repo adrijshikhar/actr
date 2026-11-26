@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 // Clipboard defines the capability to copy text to the system clipboard.
@@ -47,7 +49,7 @@ func CopyText(text string) error {
 		cmd.Stdin = strings.NewReader(text)
 		if pbErr := cmd.Run(); pbErr != nil {
 			if oscErr != nil {
-				return fmt.Errorf("copy to clipboard failed: pbcopy: %w; osc52: %v", pbErr, oscErr)
+				return fmt.Errorf("copy to clipboard failed: pbcopy: %w; osc52: %w", pbErr, oscErr)
 			}
 			return pbErr
 		}
@@ -74,4 +76,24 @@ func SetExecCommandForTest(fn func(name string, arg ...string) *exec.Cmd) func()
 	orig := execCommand
 	execCommand = fn
 	return func() { execCommand = orig }
+}
+
+// ClipboardResultMsg delivers the outcome of an asynchronous clipboard copy command.
+type ClipboardResultMsg struct {
+	Err         error
+	Lines       int
+	IsSelection bool
+}
+
+// CopyTextCmd returns a tea.Cmd that copies text asynchronously using the given Clipboard.
+func CopyTextCmd(c Clipboard, text string, lines int, isSelection bool) tea.Cmd {
+	return func() tea.Msg {
+		var err error
+		if c != nil {
+			err = c.Copy(text)
+		} else {
+			err = DefaultClipboard.Copy(text)
+		}
+		return ClipboardResultMsg{Err: err, Lines: lines, IsSelection: isSelection}
+	}
 }

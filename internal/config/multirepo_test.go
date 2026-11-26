@@ -56,7 +56,7 @@ repos:
 	assert.Equal(t, 50, cfg.Global.Retention.MaxRuns)
 	assert.Equal(t, int64(500), cfg.Global.Retention.MaxDiskMB)
 	assert.Equal(t, "/var/run/docker.sock", cfg.Global.Docker.Socket)
-	assert.True(t, cfg.Global.Docker.AutoPull)
+	assert.True(t, cfg.Global.Docker.AutoPull != nil && *cfg.Global.Docker.AutoPull)
 	require.Len(t, cfg.Repos, 2)
 
 	aimRepo := cfg.Repos["aim"]

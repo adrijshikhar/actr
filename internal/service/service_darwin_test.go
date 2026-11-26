@@ -3,6 +3,7 @@
 package service
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,8 +23,8 @@ func TestDarwinInstallAndStatus(t *testing.T) {
 	plistPathFunc = func() (string, error) {
 		return fakePlist, nil
 	}
-	execCommand = func(name string, args ...string) *exec.Cmd {
-		return exec.Command("false")
+	execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "false")
 	}
 
 	// Status before install
@@ -81,8 +82,8 @@ func TestDarwinStatus_RunningAndStopped(t *testing.T) {
 	}
 
 	// Mock execCommand to simulate running (with PID)
-	execCommand = func(name string, args ...string) *exec.Cmd {
-		return exec.Command("echo", "{\n\t\"PID\" = 12345;\n\t\"Label\" = \"com.github.actr\";\n}")
+	execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "echo", "{\n\t\"PID\" = 12345;\n\t\"Label\" = \"com.github.actr\";\n}")
 	}
 	status, err := Status()
 	if err != nil {
@@ -93,8 +94,8 @@ func TestDarwinStatus_RunningAndStopped(t *testing.T) {
 	}
 
 	// Mock execCommand to simulate stopped/crashed (without PID)
-	execCommand = func(name string, args ...string) *exec.Cmd {
-		return exec.Command("echo", "{\n\t\"LastExitStatus\" = 256;\n\t\"Label\" = \"com.github.actr\";\n}")
+	execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "echo", "{\n\t\"LastExitStatus\" = 256;\n\t\"Label\" = \"com.github.actr\";\n}")
 	}
 	status, err = Status()
 	if err != nil {

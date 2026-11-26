@@ -76,7 +76,7 @@ func (c *Client) StreamEvents(ctx context.Context) (<-chan Event, <-chan error) 
 		return events, errs
 	}
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.httpClient.Do(req) //nolint:bodyclose // Body is closed inside the streaming goroutine on stream completion
 	if err != nil {
 		errs <- fmt.Errorf("open stream: %w", err)
 		close(events)

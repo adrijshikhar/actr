@@ -3,20 +3,28 @@
 package service
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/adrijshikhar/actr/internal/config"
 )
 
-const ServiceUnitName = "actr.service"
+const (
+	ServiceUnitName       = "actr.service"
+	defaultCommandTimeout = 10 * time.Second
+)
 
 var (
 	unitPathFunc = defaultUnitPath
-	execCommand  = exec.Command
+	execCommand  = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, name, args...)
+	}
 )
 
 func defaultUnitPath() (string, error) {
@@ -53,12 +61,23 @@ func Install(binPath string, configDirs ...string) error {
 	}
 
 	unitContent := GenerateLinuxUnit(resolvedBin, workDir)
-	if err := os.WriteFile(unitPath, []byte(unitContent), 0644); err != nil {
+	if err := os.WriteFile(unitPath, []byte(unitContent), 0600); err != nil {
 		return fmt.Errorf("write systemd unit: %w", err)
 	}
 
-	_ = execCommand("systemctl", "--user", "daemon-reload").Run()
-	_ = execCommand("systemctl", "--user", "enable", ServiceUnitName).Run()
+	ctxReload, cancelReload := context.WithTimeout(context.Background(), defaultCommandTimeout)
+	defer cancelReload()
+	if out, err := execCommand(ctxReload, "systemctl", "--user", "daemon-reload").CombinedOutput(); err != nil {
+		_ = os.Remove(unitPath)
+		return fmt.Errorf("systemctl daemon-reload failed: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+
+	ctxEnable, cancelEnable := context.WithTimeout(context.Background(), defaultCommandTimeout)
+	defer cancelEnable()
+	if out, err := execCommand(ctxEnable, "systemctl", "--user", "enable", ServiceUnitName).CombinedOutput(); err != nil {
+		_ = os.Remove(unitPath)
+		return fmt.Errorf("systemctl enable failed: %s: %w", strings.TrimSpace(string(out)), err)
+	}
 	return nil
 }
 
@@ -69,11 +88,13 @@ func Status() (string, error) {
 		return "", err
 	}
 
-	if _, err := os.Stat(unitPath); os.IsNotExist(err) {
+	if _, err := os.Stat(unitPath); errors.Is(err, os.ErrNotExist) {
 		return "not installed", nil
 	}
 
-	out, err := execCommand("systemctl", "--user", "is-active", ServiceUnitName).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), defaultCommandTimeout)
+	defer cancel()
+	out, err := execCommand(ctx, "systemctl", "--user", "is-active", ServiceUnitName).Output()
 	if err == nil && strings.TrimSpace(string(out)) == "active" {
 		return "running", nil
 	}
@@ -83,7 +104,9 @@ func Status() (string, error) {
 
 // Start starts the systemd service.
 func Start() error {
-	cmd := execCommand("systemctl", "--user", "start", ServiceUnitName)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultCommandTimeout)
+	defer cancel()
+	cmd := execCommand(ctx, "systemctl", "--user", "start", ServiceUnitName)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("systemctl start failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
@@ -92,7 +115,9 @@ func Start() error {
 
 // Stop stops the systemd service.
 func Stop() error {
-	cmd := execCommand("systemctl", "--user", "stop", ServiceUnitName)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultCommandTimeout)
+	defer cancel()
+	cmd := execCommand(ctx, "systemctl", "--user", "stop", ServiceUnitName)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("systemctl stop failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
@@ -102,15 +127,19 @@ func Stop() error {
 // Uninstall stops, disables, and removes the systemd unit file.
 func Uninstall() error {
 	_ = Stop()
-	_ = execCommand("systemctl", "--user", "disable", ServiceUnitName).Run()
+	ctxDisable, cancelDisable := context.WithTimeout(context.Background(), defaultCommandTimeout)
+	defer cancelDisable()
+	_ = execCommand(ctxDisable, "systemctl", "--user", "disable", ServiceUnitName).Run()
 
 	unitPath, err := unitPathFunc()
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(unitPath); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(unitPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove unit file: %w", err)
 	}
-	_ = execCommand("systemctl", "--user", "daemon-reload").Run()
+	ctxReload, cancelReload := context.WithTimeout(context.Background(), defaultCommandTimeout)
+	defer cancelReload()
+	_ = execCommand(ctxReload, "systemctl", "--user", "daemon-reload").Run()
 	return nil
 }

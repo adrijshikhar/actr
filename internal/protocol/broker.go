@@ -348,7 +348,7 @@ func (b *BrokerClient) CreateSession(ctx context.Context, agentName string, agen
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json")
 
-		resp, err := b.client.Do(req)
+		resp, err := b.client.Do(req) //nolint:bodyclose // drainAndClose drains and closes resp.Body
 		if err != nil {
 			return 0, nil, fmt.Errorf("execute session request: %w", err)
 		}
@@ -482,7 +482,7 @@ func (b *BrokerClient) fetchMessage(ctx context.Context, reqURL string) (*Broker
 	}
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := b.client.Do(req)
+	resp, err := b.client.Do(req) //nolint:bodyclose // drainAndClose drains and closes resp.Body
 	if err != nil {
 		return nil, 0, usedToken, fmt.Errorf("execute message request: %w", err)
 	}
@@ -634,7 +634,7 @@ func (b *BrokerClient) AcknowledgeMessage(ctx context.Context, runnerRequestID s
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json")
 
-		resp, err := b.client.Do(req)
+		resp, err := b.client.Do(req) //nolint:bodyclose // drainAndClose drains and closes resp.Body
 		if err != nil {
 			return 0, usedToken, fmt.Errorf("execute acknowledge request: %w", err)
 		}
@@ -696,7 +696,7 @@ func (b *BrokerClient) DeleteSession(ctx context.Context) error {
 		}
 		req.Header.Set("Accept", "application/json")
 
-		resp, err := b.client.Do(req)
+		resp, err := b.client.Do(req) //nolint:bodyclose // drainAndClose drains and closes resp.Body
 		if err != nil {
 			return 0, usedToken, fmt.Errorf("execute delete session request: %w", err)
 		}

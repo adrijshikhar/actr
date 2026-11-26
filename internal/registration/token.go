@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net"
+	"net/url"
 	"os/exec"
 	"strings"
 )
@@ -38,9 +40,9 @@ func FetchRegistrationTokenGH(ctx context.Context, target *TargetInfo, ghRunner 
 
 	var apiPath string
 	if target.Scope == ScopeOrg {
-		apiPath = fmt.Sprintf("/orgs/%s/actions/runners/registration-token", target.Owner)
+		apiPath = fmt.Sprintf("/orgs/%s/actions/runners/registration-token", url.PathEscape(target.Owner))
 	} else {
-		apiPath = fmt.Sprintf("/repos/%s/%s/actions/runners/registration-token", target.Owner, target.Repo)
+		apiPath = fmt.Sprintf("/repos/%s/%s/actions/runners/registration-token", url.PathEscape(target.Owner), url.PathEscape(target.Repo))
 	}
 
 	args := []string{"api", "--hostname", target.Host, "--method", "POST", apiPath, "--jq", ".token"}
@@ -61,8 +63,12 @@ func GetRunnerSettingsURL(target *TargetInfo) string {
 	if target == nil {
 		return ""
 	}
-	if target.Scope == ScopeOrg {
-		return fmt.Sprintf("https://%s/organizations/%s/settings/actions/runners/new", target.Host, target.Owner)
+	host := target.Host
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil && !strings.HasPrefix(host, "[") {
+		host = fmt.Sprintf("[%s]", host)
 	}
-	return fmt.Sprintf("https://%s/%s/%s/settings/actions/runners/new", target.Host, target.Owner, target.Repo)
+	if target.Scope == ScopeOrg {
+		return fmt.Sprintf("https://%s/organizations/%s/settings/actions/runners/new", host, target.Owner)
+	}
+	return fmt.Sprintf("https://%s/%s/%s/settings/actions/runners/new", host, target.Owner, target.Repo)
 }

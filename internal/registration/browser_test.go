@@ -50,6 +50,7 @@ func TestOpenBrowser(t *testing.T) {
 		invalidCases := []string{
 			"",
 			"   ",
+			"https:///missing-host",
 			"ftp://example.com",
 			"file:///etc/passwd",
 			"javascript:alert(1)",

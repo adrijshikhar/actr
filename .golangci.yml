@@ -6,9 +6,18 @@ linters:
     - staticcheck
     - unused
     - ineffassign
+    - bodyclose
+    - sqlclosecheck
+    - rowserrcheck
+    - errorlint
+    - nilerr
+    - noctx
   exclusions:
     rules:
       - linters:
           - errcheck
         path: cmd/
         text: Error return value of `fmt.Fprintf` is not checked|Error return value of `fmt.Fprintln` is not checked
+      - linters:
+          - noctx
+        path: _test\.go

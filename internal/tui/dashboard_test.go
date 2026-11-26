@@ -2243,12 +2243,15 @@ func TestDashboard_DragToCopySelection(t *testing.T) {
 	assert.Contains(t, vpView, selectedLogStyle.Render("Step 1: dependencies downloaded"))
 
 	// 3. Mouse release: copies lines 1..3 to clipboard, sets HUD toast
-	newModel, _ = m.Update(tea.MouseMsg{
+	newModel, cmd := m.Update(tea.MouseMsg{
 		X:      sidebarWidth + 5,
 		Y:      viewportTop + 3,
 		Action: tea.MouseActionRelease,
 		Button: tea.MouseButtonNone,
 	})
+	if cmd != nil {
+		newModel, _ = newModel.Update(cmd())
+	}
 	m = newModel.(*DashboardModel)
 
 	assert.False(t, m.IsSelecting(), "selection should end on release")
@@ -2307,7 +2310,10 @@ func TestDashboard_KeyboardCopyShortcut(t *testing.T) {
 	_ = m.updateActiveStepLogs()
 
 	// Press 'c' to copy entire step log
-	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	newModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	if cmd != nil {
+		newModel, _ = newModel.Update(cmd())
+	}
 	m = newModel.(*DashboardModel)
 
 	expectedToast := fmt.Sprintf("✓ Copied %d lines to clipboard", len(lines))
@@ -2562,7 +2568,10 @@ func TestDashboard_SidebarHeightStabilityAndPreciseClickInteraction(t *testing.T
 	// Verify copying via 'c' key copies pure logs without line numbers or gutter
 	mockClip := &mockClipboard{}
 	m.SetClipboard(mockClip)
-	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	if cmd != nil {
+		_ = cmd()
+	}
 	assert.Equal(t, "npm install\nnpm test", mockClip.copied, "clipboard must receive pure log lines without gutter numbers")
 }
 
@@ -2949,3 +2958,95 @@ func TestDashboard_HistoricalJobMetricsAndExpansion(t *testing.T) {
 	assert.Contains(t, expandedView, "Memory Profile")
 }
 
+func TestDashboard_IsolatesStepLogsAcrossJobsSharingStepID(t *testing.T) {
+	m := NewDashboardModel("/tmp/nonexistent.sock")
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	// Job 1 and Job 2 both have step "step_1"
+	snap := &monitor.Snapshot{
+		ActiveJobs: []*monitor.JobInfo{
+			{
+				ID:   "job-1",
+				Name: "Job 1",
+				Steps: []*monitor.StepInfo{
+					{ID: "step_1", Name: "Build Step", Status: monitor.StatusRunning},
+				},
+			},
+			{
+				ID:   "job-2",
+				Name: "Job 2",
+				Steps: []*monitor.StepInfo{
+					{ID: "step_1", Name: "Build Step", Status: monitor.StatusRunning},
+				},
+			},
+		},
+	}
+	_, _ = m.Update(SnapshotMsg(snap))
+
+	// Send step logs for job-1
+	_, _ = m.Update(EventMsg(monitor.Event{
+		Type:    monitor.EventStepLog,
+		JobID:   "job-1",
+		StepID:  "step_1",
+		LogLine: "Job 1 Line 1",
+	}))
+
+	// Send step logs for job-2
+	_, _ = m.Update(EventMsg(monitor.Event{
+		Type:    monitor.EventStepLog,
+		JobID:   "job-2",
+		StepID:  "step_1",
+		LogLine: "Job 2 Line 1",
+	}))
+
+	// Verify both log streams are stored under composite keys without aliasing
+	job1Logs := m.stepLogs["job-1/step_1"]
+	job2Logs := m.stepLogs["job-2/step_1"]
+
+	require.Len(t, job1Logs, 1)
+	assert.Equal(t, "Job 1 Line 1", job1Logs[0])
+
+	require.Len(t, job2Logs, 1)
+	assert.Equal(t, "Job 2 Line 1", job2Logs[0])
+}
+
+func TestStripMouseArtifacts_PreservesDurationTokens(t *testing.T) {
+	// Preserves time durations like "10m build", "5m", "15m remaining"
+	input := "completed in 10m build task"
+	stripped := stripMouseArtifacts(input)
+	assert.Equal(t, "completed in 10m build task", stripped)
+
+	// Strips actual mouse escape artifacts
+	sgrArtifact := "search \x1b[<35;12;24Mquery"
+	strippedArtifact := stripMouseArtifacts(sgrArtifact)
+	assert.Equal(t, "search query", strippedArtifact)
+
+	// Strips split brackets
+	splitArtifact := "prefix [<suffix"
+	strippedSplit := stripMouseArtifacts(splitArtifact)
+	assert.Equal(t, "prefix suffix", strippedSplit)
+
+	// Strips bare semicolon lists ending in M or m without dropping 10m
+	bareArtifact := "search 35;12;24Mquery and 35;12;24mword"
+	strippedBare := stripMouseArtifacts(bareArtifact)
+	assert.Equal(t, "search query and word", strippedBare)
+}
+
+func TestDashboardModel_StoreStepLogs_LRUEvictionAndProtection(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	m.activeStepID = "active-step"
+
+	for i := 0; i < 100; i++ {
+		m.storeStepLogs(fmt.Sprintf("step-%d", i), []string{fmt.Sprintf("log %d", i)})
+	}
+	assert.Len(t, m.stepLogKeys, 100)
+
+	m.storeStepLogs("step-0", []string{"log 0 refreshed"})
+	assert.Equal(t, "step-0", m.stepLogKeys[len(m.stepLogKeys)-1])
+
+	m.storeStepLogs("active-step", []string{"active log"})
+
+	assert.NotContains(t, m.stepLogs, "step-1")
+	assert.Contains(t, m.stepLogs, "step-0")
+	assert.Contains(t, m.stepLogs, "active-step")
+}

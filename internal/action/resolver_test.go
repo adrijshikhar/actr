@@ -182,7 +182,6 @@ func TestResolve_NormalizesWindowsBackslashesInTar(t *testing.T) {
 	assert.FileExists(t, filepath.Join(dest, "sub", "action.yml"))
 }
 
-
 type tarEntry struct {
 	Name     string
 	Content  string

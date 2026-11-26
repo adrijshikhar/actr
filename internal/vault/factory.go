@@ -19,9 +19,9 @@ const (
 
 // NewProviderFromConfig constructs a Provider or ChainedProvider based on VaultYAMLConfig.
 // If cfg is nil or has no providers configured, it returns the platform default provider:
-// - macOS: KeychainProvider (service: "com.github.actr.secrets")
-// - other OS: FileVaultProvider (path: defaultDir/vault.enc) keyed by ACTR_VAULT_PASSPHRASE
-//   or a randomly generated 32-byte key stored in defaultDir/vault.key.
+//   - macOS: KeychainProvider (service: "com.github.actr.secrets")
+//   - other OS: FileVaultProvider (path: defaultDir/vault.enc) keyed by ACTR_VAULT_PASSPHRASE
+//     or a randomly generated 32-byte key stored in defaultDir/vault.key.
 func NewProviderFromConfig(cfg *config.VaultYAMLConfig, defaultDir string) (Provider, error) {
 	if cfg == nil || len(cfg.Providers) == 0 {
 		if runtime.GOOS == "darwin" {

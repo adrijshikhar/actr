@@ -3,20 +3,28 @@
 package service
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/adrijshikhar/actr/internal/config"
 )
 
-const ServiceLabel = "com.github.actr"
+const (
+	ServiceLabel          = "com.github.actr"
+	defaultCommandTimeout = 10 * time.Second
+)
 
 var (
 	plistPathFunc = defaultPlistPath
-	execCommand   = exec.Command
+	execCommand   = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, name, args...)
+	}
 )
 
 func defaultPlistPath() (string, error) {
@@ -53,7 +61,7 @@ func Install(binPath string, configDirs ...string) error {
 	}
 
 	plistContent := GenerateDarwinPlist(resolvedBin, workDir)
-	if err := os.WriteFile(plistPath, []byte(plistContent), 0644); err != nil {
+	if err := os.WriteFile(plistPath, []byte(plistContent), 0600); err != nil {
 		return fmt.Errorf("write launchd plist: %w", err)
 	}
 	return nil
@@ -66,11 +74,13 @@ func Status() (string, error) {
 		return "", err
 	}
 
-	if _, err := os.Stat(plistPath); os.IsNotExist(err) {
+	if _, err := os.Stat(plistPath); errors.Is(err, os.ErrNotExist) {
 		return "not installed", nil
 	}
 
-	out, err := execCommand("launchctl", "list", ServiceLabel).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), defaultCommandTimeout)
+	defer cancel()
+	out, err := execCommand(ctx, "launchctl", "list", ServiceLabel).Output()
 	if err == nil && len(out) > 0 && strings.Contains(string(out), "\"PID\" =") {
 		return "running", nil
 	}
@@ -84,11 +94,13 @@ func Start() error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(plistPath); os.IsNotExist(err) {
+	if _, err := os.Stat(plistPath); errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("service plist not found at %s (run install first)", plistPath)
 	}
 
-	cmd := execCommand("launchctl", "load", "-w", plistPath)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultCommandTimeout)
+	defer cancel()
+	cmd := execCommand(ctx, "launchctl", "load", "-w", plistPath)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("launchctl load failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
@@ -101,11 +113,13 @@ func Stop() error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(plistPath); os.IsNotExist(err) {
+	if _, err := os.Stat(plistPath); errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("service plist not found at %s", plistPath)
 	}
 
-	cmd := execCommand("launchctl", "unload", plistPath)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultCommandTimeout)
+	defer cancel()
+	cmd := execCommand(ctx, "launchctl", "unload", plistPath)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("launchctl unload failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
@@ -119,7 +133,7 @@ func Uninstall() error {
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(plistPath); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(plistPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove plist file: %w", err)
 	}
 	return nil

@@ -641,7 +641,7 @@ func TestRunUnconfigured_InteractivePromptAccept(t *testing.T) {
 	isTerminalFunc = func(fd uintptr) bool { return true }
 
 	registerCalled := false
-	runRegisterCmdFunc = func(cmd *cobra.Command) error {
+	runRegisterCmdFunc = func(cmd *cobra.Command, cfgDir ...string) error {
 		registerCalled = true
 		return fmt.Errorf("simulated registration failure")
 	}
@@ -1237,5 +1237,22 @@ func TestRunCommand_WiresSQLiteStoreAndPurgesLegacyRuns(t *testing.T) {
 	_, err = store.ListRuns(10)
 	if err != nil {
 		t.Fatalf("failed to query runs from history.db: %v", err)
+	}
+}
+
+func TestResolveConfigDir_HonorsACTRConfigDirOverCWD(t *testing.T) {
+	customDir := t.TempDir()
+	t.Setenv("ACTR_CONFIG_DIR", customDir)
+
+	resolved := resolveConfigDir("", false)
+	if resolved != customDir {
+		t.Fatalf("expected resolveConfigDir to return ACTR_CONFIG_DIR %q, got %q", customDir, resolved)
+	}
+
+	// Flag takes precedence over environment variable
+	flagDir := t.TempDir()
+	resolvedWithFlag := resolveConfigDir(flagDir, true)
+	if resolvedWithFlag != flagDir {
+		t.Fatalf("expected resolveConfigDir with explicit flag to return %q, got %q", flagDir, resolvedWithFlag)
 	}
 }

@@ -78,4 +78,7 @@ func TestGetRunnerSettingsURL(t *testing.T) {
 
 	orgTarget := &TargetInfo{Host: "github.com", Owner: "my-org", Scope: ScopeOrg}
 	assert.Equal(t, "https://github.com/organizations/my-org/settings/actions/runners/new", GetRunnerSettingsURL(orgTarget))
+
+	ipv6Target := &TargetInfo{Host: "::1", Owner: "owner", Repo: "repo", Scope: ScopeRepo}
+	assert.Equal(t, "https://[::1]/owner/repo/settings/actions/runners/new", GetRunnerSettingsURL(ipv6Target))
 }

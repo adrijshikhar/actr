@@ -6,8 +6,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-
-	"github.com/adrijshikhar/actr/internal/logger"
 )
 
 func dispatchWithContext(ctx context.Context, args []string, out, errOut io.Writer) int {
@@ -21,18 +19,19 @@ func dispatchWithContextAndIn(ctx context.Context, in io.Reader, args []string, 
 	}
 	rootCmd.SetArgs(args)
 
-	logger.Init(debugFlag, errOut)
-
 	if err := rootCmd.ExecuteContext(ctx); err != nil {
 		return 1
 	}
 	return 0
 }
 
-func main() {
+func runCLI() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	code := dispatchWithContext(ctx, os.Args[1:], os.Stdout, os.Stderr)
-	os.Exit(code)
+	return dispatchWithContext(ctx, os.Args[1:], os.Stdout, os.Stderr)
+}
+
+func main() {
+	os.Exit(runCLI())
 }

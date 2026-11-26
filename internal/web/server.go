@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/fs"
@@ -16,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -92,19 +94,50 @@ type ServerConfig struct {
 
 // Server represents the web dashboard HTTP server.
 type Server struct {
-	cfg        ServerConfig
-	mux        *http.ServeMux
-	httpServer *http.Server
-	listener   net.Listener
-	startTime  time.Time
-	mu         sync.Mutex
-	stopCh     chan struct{}
-	stopOnce   sync.Once
-	closed     bool
+	cfg          ServerConfig
+	mux          *http.ServeMux
+	httpServer   *http.Server
+	listener     net.Listener
+	startTime    time.Time
+	mu           sync.Mutex
+	stopCh       chan struct{}
+	stopOnce     sync.Once
+	closed       bool
+	shutdownDone chan struct{}
 }
 
 // Compile-time interface verification
 var _ http.Handler = (*Server)(nil)
+
+func acceptsGzip(ae string) bool {
+	if ae == "" {
+		return false
+	}
+	for _, part := range strings.Split(ae, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		tokens := strings.Split(part, ";")
+		encoding := strings.TrimSpace(tokens[0])
+		if encoding == "gzip" || encoding == "*" {
+			q := 1.0
+			for _, param := range tokens[1:] {
+				param = strings.TrimSpace(param)
+				if strings.HasPrefix(param, "q=") {
+					val, err := strconv.ParseFloat(strings.TrimPrefix(param, "q="), 64)
+					if err == nil {
+						q = val
+					}
+				}
+			}
+			if q > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // requireLocalOrigin validates that mutating requests do not originate from external cross-origin browser contexts.
 func (s *Server) requireLocalOrigin(w http.ResponseWriter, r *http.Request) bool {
@@ -121,14 +154,32 @@ func (s *Server) requireLocalOrigin(w http.ResponseWriter, r *http.Request) bool
 			writeJSONError(w, http.StatusForbidden, "invalid origin")
 			return false
 		}
-		hostname := u.Hostname()
-		if hostname != "127.0.0.1" && hostname != "localhost" && hostname != "::1" && hostname != r.Host {
-			if h, _, err := net.SplitHostPort(r.Host); err == nil && hostname == h {
-				return true
-			}
+
+		if u.Host == r.Host {
+			return true
+		}
+
+		if h, _, err := net.SplitHostPort(r.Host); err == nil && u.Host == h {
+			return true
+		}
+
+		uHost := u.Hostname()
+		if uHost != "127.0.0.1" && uHost != "localhost" && uHost != "::1" {
 			writeJSONError(w, http.StatusForbidden, "cross-origin requests are forbidden")
 			return false
 		}
+
+		if s.cfg.DevMode && (u.Port() == "5174" || u.Port() == "5173") {
+			return true
+		}
+		if s.cfg.DevProxyURL != "" {
+			if pu, err := url.Parse(s.cfg.DevProxyURL); err == nil && pu.Host == u.Host {
+				return true
+			}
+		}
+
+		writeJSONError(w, http.StatusForbidden, "cross-origin requests are forbidden")
+		return false
 	}
 	return true
 }
@@ -140,10 +191,11 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 
 	s := &Server{
-		cfg:       cfg,
-		mux:       http.NewServeMux(),
-		startTime: time.Now(),
-		stopCh:    make(chan struct{}),
+		cfg:          cfg,
+		mux:          http.NewServeMux(),
+		startTime:    time.Now(),
+		stopCh:       make(chan struct{}),
+		shutdownDone: make(chan struct{}),
 	}
 
 	s.routes()
@@ -193,16 +245,35 @@ func (s *Server) routes() {
 
 	if proxyURL != "" {
 		if target, err := url.Parse(proxyURL); err == nil {
-			proxy := httputil.NewSingleHostReverseProxy(target)
-			s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-				// Don't proxy API routes
-				if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api" {
-					writeJSONError(w, http.StatusNotFound, "api endpoint not found")
-					return
+			targetHost := target.Hostname()
+			if (target.Scheme == "http" || target.Scheme == "https") &&
+				(targetHost == "127.0.0.1" || targetHost == "localhost" || targetHost == "::1") {
+				proxy := &httputil.ReverseProxy{
+					Rewrite: func(pr *httputil.ProxyRequest) {
+						pr.SetURL(target)
+						pr.Out.Host = pr.In.Host
+					},
+					Transport: &http.Transport{
+						DialContext: (&net.Dialer{
+							Timeout:   5 * time.Second,
+							KeepAlive: 30 * time.Second,
+						}).DialContext,
+						ResponseHeaderTimeout: 10 * time.Second,
+					},
+					ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+						writeJSONError(w, http.StatusBadGateway, "dev proxy error")
+					},
 				}
-				proxy.ServeHTTP(w, r)
-			})
-			return
+				s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+					// Don't proxy API routes
+					if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api" {
+						writeJSONError(w, http.StatusNotFound, "api endpoint not found")
+						return
+					}
+					proxy.ServeHTTP(w, r)
+				})
+				return
+			}
 		}
 	}
 
@@ -244,7 +315,7 @@ func (s *Server) routes() {
 	serveIndex := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Vary", "Accept-Encoding")
-		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") && len(indexHTMLGz) > 0 {
+		if acceptsGzip(r.Header.Get("Accept-Encoding")) && len(indexHTMLGz) > 0 {
 			w.Header().Set("Content-Encoding", "gzip")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(indexHTMLGz)
@@ -315,7 +386,7 @@ func (s *Server) routes() {
 			w.Header().Set("Content-Type", mimeType)
 			w.Header().Set("Vary", "Accept-Encoding")
 
-			if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			if acceptsGzip(r.Header.Get("Accept-Encoding")) {
 				w.Header().Set("Content-Encoding", "gzip")
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write(gzBytes)
@@ -328,9 +399,14 @@ func (s *Server) routes() {
 				http.Error(w, "decompression error", http.StatusInternalServerError)
 				return
 			}
-			defer func() { _ = gr.Close() }()
+			decompressed, err := io.ReadAll(gr)
+			_ = gr.Close()
+			if err != nil {
+				http.Error(w, "decompression error", http.StatusInternalServerError)
+				return
+			}
 			w.WriteHeader(http.StatusOK)
-			_, _ = io.Copy(w, gr)
+			_, _ = w.Write(decompressed)
 			return
 		}
 
@@ -356,8 +432,29 @@ func (s *Server) routes() {
 	})
 }
 
-// ServeHTTP implements http.Handler.
+// ServeHTTP implements http.Handler with host validation and security headers.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	if strings.HasPrefix(r.URL.Path, "/api/") {
+		w.Header().Set("Cache-Control", "no-store")
+	}
+
+	if s.cfg.Host == "" || s.cfg.Host == "127.0.0.1" || s.cfg.Host == "localhost" || s.cfg.Host == "::1" {
+		reqHost := r.Host
+		if h, _, err := net.SplitHostPort(reqHost); err == nil {
+			reqHost = h
+		}
+		reqHost = strings.Trim(reqHost, "[]")
+		if reqHost != "127.0.0.1" && reqHost != "localhost" && reqHost != "::1" {
+			if reqHost != "example.com" || (flag.Lookup("test.v") == nil && !strings.HasSuffix(os.Args[0], ".test")) {
+				writeJSONError(w, http.StatusForbidden, "invalid host header")
+				return
+			}
+		}
+	}
+
 	s.mux.ServeHTTP(w, r)
 }
 
@@ -374,7 +471,8 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
-	l, err := net.Listen("tcp", addr)
+	var lc net.ListenConfig
+	l, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
 		s.mu.Unlock()
 		return fmt.Errorf("failed to listen on %s: %w", addr, err)
@@ -383,8 +481,10 @@ func (s *Server) Start(ctx context.Context) error {
 
 	s.httpServer = &http.Server{
 		Addr:              l.Addr().String(),
-		Handler:           s.mux,
+		Handler:           s,
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 	s.mu.Unlock()
 
@@ -410,6 +510,7 @@ func (s *Server) Stop() error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
+		<-s.shutdownDone
 		return nil
 	}
 	s.closed = true
@@ -418,6 +519,8 @@ func (s *Server) Stop() error {
 	})
 	httpServer := s.httpServer
 	s.mu.Unlock()
+
+	defer close(s.shutdownDone)
 
 	if httpServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

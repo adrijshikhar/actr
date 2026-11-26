@@ -19,11 +19,15 @@ var (
 )
 
 func newServiceCmd() *cobra.Command {
+	var configDirFlag string
+
 	cmd := &cobra.Command{
 		Use:       "service",
 		Short:     "Manage the background OS service daemon (launchd/systemd)",
 		ValidArgs: []string{"install", "start", "status", "stop", "uninstall"},
 	}
+
+	cmd.PersistentFlags().StringVar(&configDirFlag, "config-dir", "", "path to runner configuration directory")
 
 	cmd.AddCommand(&cobra.Command{
 		Use:   "status",
@@ -45,7 +49,7 @@ func newServiceCmd() *cobra.Command {
 		Short: "Install actr as a native OS service daemon",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := serviceInstallFunc(binPath); err != nil {
+			if err := serviceInstallFunc(binPath, configDirFlag); err != nil {
 				return fmt.Errorf("install service: %w", err)
 			}
 			fmt.Fprintln(cmd.OutOrStdout(), "Service installed successfully")
@@ -61,9 +65,13 @@ func newServiceCmd() *cobra.Command {
 		Short: "Start the background runner daemon service",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			runnerPath := filepath.Join(config.DefaultConfigDir(), ".runner")
-			multiRepoCfgYAML := filepath.Join(config.DefaultConfigDir(), "config.yaml")
-			multiRepoCfgYML := filepath.Join(config.DefaultConfigDir(), "config.yml")
+			cfgDir := config.DefaultConfigDir()
+			if configDirFlag != "" {
+				cfgDir = configDirFlag
+			}
+			runnerPath := filepath.Join(cfgDir, ".runner")
+			multiRepoCfgYAML := filepath.Join(cfgDir, "config.yaml")
+			multiRepoCfgYML := filepath.Join(cfgDir, "config.yml")
 			isConfigured := false
 			if _, err := os.Stat(runnerPath); err == nil {
 				isConfigured = true
@@ -86,18 +94,25 @@ func newServiceCmd() *cobra.Command {
 					if !registerNow {
 						return fmt.Errorf("runner is not registered; run 'actr register' first")
 					}
-					if err := runRegisterCmdFunc(cmd); err != nil {
+					if err := runRegisterCmdFunc(cmd, cfgDir); err != nil {
 						return err
 					}
 					// Ensure the background service is installed before starting if not already present
 					status, _ := serviceStatusFunc()
-					if status == "not installed" {
-						if err := serviceInstallFunc(""); err != nil {
+					if status == "not installed" || configDirFlag != "" {
+						if err := serviceInstallFunc("", cfgDir); err != nil {
 							return fmt.Errorf("install service: %w", err)
 						}
 					}
 				} else {
 					return fmt.Errorf("runner is not registered; run 'actr register' first")
+				}
+			} else if configDirFlag != "" {
+				status, _ := serviceStatusFunc()
+				if status == "not installed" || configDirFlag != "" {
+					if err := serviceInstallFunc("", cfgDir); err != nil {
+						return fmt.Errorf("install service: %w", err)
+					}
 				}
 			}
 

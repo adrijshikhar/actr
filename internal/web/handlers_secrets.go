@@ -20,6 +20,16 @@ type secretResponse struct {
 	Key    string `json:"key"`
 }
 
+func isValidSecretKey(k string) bool {
+	if k == "" || strings.TrimSpace(k) == "" {
+		return false
+	}
+	if strings.ContainsAny(k, "= \t\r\n\x00") {
+		return false
+	}
+	return true
+}
+
 // handleSecretsList returns a JSON list of metadata for all secrets in the vault.
 // It never exposes secret values. Returns 503 if SecretManager is not configured.
 func (s *Server) handleSecretsList(w http.ResponseWriter, r *http.Request) {
@@ -65,8 +75,8 @@ func (s *Server) handleSecretSet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req.Key = strings.TrimSpace(req.Key)
-	if req.Key == "" {
-		writeJSONError(w, http.StatusBadRequest, "secret key is required")
+	if !isValidSecretKey(req.Key) {
+		writeJSONError(w, http.StatusBadRequest, "invalid secret key")
 		return
 	}
 	if req.Value == "" {

@@ -15,14 +15,14 @@ import (
 func TestTelemetryWidget_RenderGauges(t *testing.T) {
 	tw := NewTelemetryWidget()
 	sample := &monitor.TelemetrySample{
-		Timestamp:    time.Now(),
-		PID:          12345,
-		PGID:         12345,
-		StepCPU:      42.5,
-		StepRSSBytes: 256 * 1024 * 1024, // 256MB
-		HostCPU:      15.0,
-		HostMemUsed:   8 * 1024 * 1024 * 1024,
-		HostMemTotal:  16 * 1024 * 1024 * 1024,
+		Timestamp:      time.Now(),
+		PID:            12345,
+		PGID:           12345,
+		StepCPU:        42.5,
+		StepRSSBytes:   256 * 1024 * 1024, // 256MB
+		HostCPU:        15.0,
+		HostMemUsed:    8 * 1024 * 1024 * 1024,
+		HostMemTotal:   16 * 1024 * 1024 * 1024,
 		DiskTotalBytes: 500 * 1024 * 1024 * 1024,
 		DiskUsedBytes:  100 * 1024 * 1024 * 1024,
 		DiskFreeBytes:  400 * 1024 * 1024 * 1024,

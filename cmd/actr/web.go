@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -77,7 +78,7 @@ func writeWebPID(cfgDir string, pid, port int) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(cfgDir, 0755); err != nil {
+	if err := os.MkdirAll(cfgDir, 0700); err != nil {
 		return err
 	}
 	return os.WriteFile(webPIDPath(cfgDir), data, 0600)
@@ -106,8 +107,14 @@ func removeWebPID(cfgDir string) error {
 }
 
 func checkServerHealth(port int) bool {
-	client := http.Client{Timeout: 400 * time.Millisecond}
-	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/status", port))
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/api/status", port), nil)
+	if err != nil {
+		return false
+	}
+	client := http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
 		return false
 	}
@@ -143,6 +150,9 @@ Examples:
   actr web --port 18490
   actr web --foreground`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if port < 0 || port > 65535 {
+				return fmt.Errorf("invalid port %d: port must be between 0 and 65535", port)
+			}
 			cfgDir := resolveConfigDir(configDirFlag, cmd.Flags().Changed("config-dir"))
 			if foreground {
 				return runWebForeground(cmd, port, devMode, noOpen, demoMode, cfgDir, sockPath)
@@ -186,6 +196,9 @@ func newWebStartCmd() *cobra.Command {
 		Use:   "start [flags]",
 		Short: "Start the actr web dashboard server",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if port < 0 || port > 65535 {
+				return fmt.Errorf("invalid port %d: port must be between 0 and 65535", port)
+			}
 			cfgDir := resolveConfigDir(configDirFlag, cmd.Flags().Changed("config-dir"))
 			if foreground {
 				return runWebForeground(cmd, port, devMode, noOpen, demoMode, cfgDir, sockPath)
@@ -221,7 +234,7 @@ func newWebStopCmd() *cobra.Command {
 			if err != nil || !isProcessAlive(info.PID) {
 				_ = removeWebPID(cfgDir)
 				fmt.Fprintln(cmd.OutOrStdout(), "actr web dashboard is not running.")
-				return nil
+				return nil //nolint:nilerr // Dashboard is already stopped, stopping is a no-op success
 			}
 
 			if err := terminateProcess(info.PID); err != nil {
@@ -311,14 +324,14 @@ func startWebBackground(cmd *cobra.Command, port int, devMode, noOpen, demoMode 
 	child := execCommand(exe, args...)
 	setSysProcAttr(child)
 
-	if err := os.MkdirAll(cfgDir, 0755); err != nil {
+	if err := os.MkdirAll(cfgDir, 0700); err != nil {
 		return fmt.Errorf("create config dir %s: %w", cfgDir, err)
 	}
 	logPath := webLogPath(cfgDir)
 	if fi, err := os.Stat(logPath); err == nil && fi.Size() > 5*1024*1024 {
 		_ = os.Rename(logPath, logPath+".1")
 	}
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err == nil {
 		child.Stdout = logFile
 		child.Stderr = logFile
@@ -354,7 +367,7 @@ func startWebBackground(cmd *cobra.Command, port int, devMode, noOpen, demoMode 
 		select {
 		case err := <-childErrChan:
 			if err != nil {
-				return fmt.Errorf("web dashboard exited unexpectedly (%v): check logs at %s", err, logPath)
+				return fmt.Errorf("web dashboard exited unexpectedly (%w): check logs at %s", err, logPath)
 			}
 			return fmt.Errorf("web dashboard exited unexpectedly: check logs at %s", logPath)
 		default:
@@ -381,6 +394,17 @@ func runWebForeground(cmd *cobra.Command, port int, devMode, noOpen, demoMode bo
 	if info, err := readWebPID(cfgDir); err == nil && isProcessAlive(info.PID) {
 		return fmt.Errorf("actr web dashboard is already running at http://127.0.0.1:%d (PID %d)", info.Port, info.PID)
 	}
+
+	if err := os.MkdirAll(cfgDir, 0700); err != nil {
+		return fmt.Errorf("create config dir %s: %w", cfgDir, err)
+	}
+
+	lockPath := filepath.Join(cfgDir, "web.lock")
+	wLock, err := acquireFileLock(lockPath)
+	if err != nil {
+		return fmt.Errorf("acquire web lock (%s): %w", lockPath, err)
+	}
+	defer func() { _ = wLock.Release() }()
 
 	serverCfg := web.ServerConfig{
 		Port:      port,
@@ -669,19 +693,14 @@ func (a *historyRunStoreAdapter) GetRunMetrics(ctx context.Context, runID string
 		if snap, err := a.client.GetSnapshot(ctx); err == nil && snap != nil && snap.Telemetry != nil {
 			isActiveForRun := false
 			for _, job := range snap.ActiveJobs {
-				if job != nil && (job.ID == runID || strings.HasPrefix(runID, job.ID) || strings.HasPrefix(job.ID, runID)) {
+				if job != nil && job.ID == runID {
 					isActiveForRun = true
 					break
 				}
 			}
-			if !isActiveForRun && len(snap.ActiveJobs) == 1 {
-				singleJob := snap.ActiveJobs[0]
-				if singleJob != nil && (runID == "" || singleJob.ID == runID || strings.HasPrefix(runID, singleJob.ID)) {
-					isActiveForRun = true
-				}
-			}
 			if isActiveForRun {
-				liveSample = snap.Telemetry
+				sampleCopy := *snap.Telemetry
+				liveSample = &sampleCopy
 			}
 		}
 	}
@@ -709,7 +728,10 @@ func (a *historyRunStoreAdapter) GetRunMetrics(ctx context.Context, runID string
 
 	if len(a.samples[runID]) > 0 {
 		out := make([]*monitor.TelemetrySample, len(a.samples[runID]))
-		copy(out, a.samples[runID])
+		for i, s := range a.samples[runID] {
+			sampleCopy := *s
+			out[i] = &sampleCopy
+		}
 		return out, nil
 	}
 
@@ -786,6 +808,9 @@ var _ web.EventSubscriber = (*monitorClientAdapter)(nil)
 var _ web.MetricsProvider = (*monitorClientAdapter)(nil)
 
 func (a *monitorClientAdapter) SubscribeEvents(ctx context.Context) (<-chan monitor.Event, func(), error) {
+	if a.client == nil {
+		return nil, nil, errors.New("monitor client is nil")
+	}
 	subCtx, cancel := context.WithCancel(ctx)
 	events, _ := a.client.StreamEvents(subCtx)
 	return events, cancel, nil

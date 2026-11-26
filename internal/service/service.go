@@ -1,11 +1,34 @@
 package service
 
 import (
+	"bytes"
+	"encoding/xml"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+func xmlEscape(s string) string {
+	var buf bytes.Buffer
+	_ = xml.EscapeText(&buf, []byte(s))
+	return buf.String()
+}
+
+func sanitizeSystemd(s string) string {
+	s = strings.ReplaceAll(s, "\r", "")
+	s = strings.ReplaceAll(s, "\n", "")
+	s = strings.ReplaceAll(s, "\x00", "")
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	s = strings.ReplaceAll(s, `$`, `$$`)
+	return strings.ReplaceAll(s, "%", "%%")
+}
+
+func escapeSystemdPath(p string) string {
+	p = sanitizeSystemd(p)
+	return strings.ReplaceAll(p, " ", `\x20`)
+}
 
 // GenerateDarwinPlist generates a launchd property list XML string for macOS.
 func GenerateDarwinPlist(binPath, workDir string) string {
@@ -31,6 +54,11 @@ func GenerateDarwinPlist(binPath, workDir string) string {
 			pathEnv = p + ":" + pathEnv
 		}
 	}
+
+	binEsc := xmlEscape(binPath)
+	workEsc := xmlEscape(workDir)
+	pathEsc := xmlEscape(pathEnv)
+	homeEsc := xmlEscape(home)
 
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -63,7 +91,7 @@ func GenerateDarwinPlist(binPath, workDir string) string {
     <key>KeepAlive</key>
     <true/>
 </dict>
-</plist>`, binPath, workDir, workDir, pathEnv, home, workDir, workDir)
+</plist>`, binEsc, workEsc, workEsc, pathEsc, homeEsc, workEsc, workEsc)
 }
 
 // GenerateLinuxUnit generates a systemd service unit string for Linux.
@@ -73,12 +101,18 @@ func GenerateLinuxUnit(binPath, workDir string) string {
 	if pathEnv == "" {
 		pathEnv = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 	}
+	binClean := sanitizeSystemd(binPath)
+	workClean := sanitizeSystemd(workDir)
+	workPath := escapeSystemdPath(workDir)
+	pathClean := sanitizeSystemd(pathEnv)
+	homeClean := sanitizeSystemd(home)
+
 	return fmt.Sprintf(`[Unit]
 Description=actr GitHub Actions Runner
 After=network.target
 
 [Service]
-ExecStart=%s run --config-dir %s
+ExecStart="%s" run --config-dir "%s"
 WorkingDirectory=%s
 Environment="PATH=%s"
 Environment="HOME=%s"
@@ -88,7 +122,7 @@ Restart=always
 RestartSec=5
 
 [Install]
-WantedBy=default.target`, binPath, workDir, workDir, pathEnv, home, workDir, workDir)
+WantedBy=default.target`, binClean, workClean, workPath, pathClean, homeClean, workClean, workClean)
 }
 
 func resolveBinPath(binPath string) (string, error) {

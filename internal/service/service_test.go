@@ -13,8 +13,20 @@ func TestServiceManifestGeneration(t *testing.T) {
 	}
 
 	unit := GenerateLinuxUnit("/usr/local/bin/actr", "/home/user/.actr")
-	if !strings.Contains(unit, "[Service]") || !strings.Contains(unit, "ExecStart=/usr/local/bin/actr run --config-dir /home/user/.actr") {
+	if !strings.Contains(unit, "[Service]") || !strings.Contains(unit, "/usr/local/bin/actr") || !strings.Contains(unit, "--config-dir") {
 		t.Fatalf("invalid systemd unit: %s", unit)
+	}
+}
+
+func TestServiceTemplates_EscapeSpecialCharactersAndSpaces(t *testing.T) {
+	plist := GenerateDarwinPlist("/opt/dir & <actr>/actr", "/tmp/work<bad>")
+	if !strings.Contains(plist, "&lt;actr&gt;") || !strings.Contains(plist, "&amp;") || strings.Contains(plist, "<bad>") {
+		t.Errorf("expected XML escaping in plist, got: %s", plist)
+	}
+
+	unit := GenerateLinuxUnit(`/opt/my dir/actr`, `/var/lib/actr%h`+"\nExecStartPre=/bin/evil")
+	if !strings.Contains(unit, `"/opt/my dir/actr"`) || !strings.Contains(unit, `%%h`) || strings.Contains(unit, "\nExecStartPre=/bin/evil") {
+		t.Errorf("expected escaping and newline stripping in systemd unit, got: %s", unit)
 	}
 }
 
