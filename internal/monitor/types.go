@@ -59,17 +59,17 @@ type JobInfo struct {
 type RunInfo = JobInfo
 
 type RunnerMetrics struct {
-	Timestamp      time.Time `json:"timestamp"`
-	PID            int32     `json:"pid"`
-	PGID           int32     `json:"pgid"`
-	ProcessCount   int       `json:"process_count"`
-	StepCPU             float64 `json:"step_cpu"`
-	StepRSSBytes        uint64  `json:"step_rss_bytes"`
-	StepWorkingSetBytes uint64  `json:"step_working_set_bytes,omitempty"` // Working Set Size (RSS + active memory cache, OOM risk metric)
-	StepElapsedSec      int64   `json:"step_elapsed_sec"`
-	ActiveStepName      string  `json:"active_step_name,omitempty"`
-	ThreadCount         int     `json:"thread_count,omitempty"`      // OS thread count
-	CPUThrottledSec     float64 `json:"cpu_throttled_sec,omitempty"` // CFS quota throttled time
+	Timestamp           time.Time `json:"timestamp"`
+	PID                 int32     `json:"pid"`
+	PGID                int32     `json:"pgid"`
+	ProcessCount        int       `json:"process_count"`
+	StepCPU             float64   `json:"step_cpu"`
+	StepRSSBytes        uint64    `json:"step_rss_bytes"`
+	StepWorkingSetBytes uint64    `json:"step_working_set_bytes,omitempty"` // Working Set Size (RSS + active memory cache, OOM risk metric)
+	StepElapsedSec      int64     `json:"step_elapsed_sec"`
+	ActiveStepName      string    `json:"active_step_name,omitempty"`
+	ThreadCount         int       `json:"thread_count,omitempty"`      // OS thread count
+	CPUThrottledSec     float64   `json:"cpu_throttled_sec,omitempty"` // CFS quota throttled time
 
 	// Storage
 	DiskUsedBytes    uint64  `json:"disk_used_bytes"`

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"net/url"
 	"os/exec"
 	"strings"
@@ -62,8 +63,12 @@ func GetRunnerSettingsURL(target *TargetInfo) string {
 	if target == nil {
 		return ""
 	}
-	if target.Scope == ScopeOrg {
-		return fmt.Sprintf("https://%s/organizations/%s/settings/actions/runners/new", target.Host, target.Owner)
+	host := target.Host
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil && !strings.HasPrefix(host, "[") {
+		host = fmt.Sprintf("[%s]", host)
 	}
-	return fmt.Sprintf("https://%s/%s/%s/settings/actions/runners/new", target.Host, target.Owner, target.Repo)
+	if target.Scope == ScopeOrg {
+		return fmt.Sprintf("https://%s/organizations/%s/settings/actions/runners/new", host, target.Owner)
+	}
+	return fmt.Sprintf("https://%s/%s/%s/settings/actions/runners/new", host, target.Owner, target.Repo)
 }

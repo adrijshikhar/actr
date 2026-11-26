@@ -232,4 +232,3 @@ func TestParseCommandFile_RejectsUnterminatedHeredocAndEmptyKey(t *testing.T) {
 	_, err = ParseCommandFile(p3)
 	require.Error(t, err)
 }
-

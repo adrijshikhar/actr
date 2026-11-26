@@ -159,7 +159,6 @@ func TestParseManifestFile_RejectsSymlinkOutsideDir(t *testing.T) {
 	assert.ErrorIs(t, err, action.ErrPathTraversal)
 }
 
-
 func TestParseManifestFile(t *testing.T) {
 	t.Run("prefers action.yml over action.yaml", func(t *testing.T) {
 		tmpDir := t.TempDir()

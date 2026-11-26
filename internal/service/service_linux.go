@@ -68,12 +68,14 @@ func Install(binPath string, configDirs ...string) error {
 	ctxReload, cancelReload := context.WithTimeout(context.Background(), defaultCommandTimeout)
 	defer cancelReload()
 	if out, err := execCommand(ctxReload, "systemctl", "--user", "daemon-reload").CombinedOutput(); err != nil {
+		_ = os.Remove(unitPath)
 		return fmt.Errorf("systemctl daemon-reload failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 
 	ctxEnable, cancelEnable := context.WithTimeout(context.Background(), defaultCommandTimeout)
 	defer cancelEnable()
 	if out, err := execCommand(ctxEnable, "systemctl", "--user", "enable", ServiceUnitName).CombinedOutput(); err != nil {
+		_ = os.Remove(unitPath)
 		return fmt.Errorf("systemctl enable failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	return nil

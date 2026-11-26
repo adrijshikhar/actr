@@ -395,6 +395,10 @@ func runWebForeground(cmd *cobra.Command, port int, devMode, noOpen, demoMode bo
 		return fmt.Errorf("actr web dashboard is already running at http://127.0.0.1:%d (PID %d)", info.Port, info.PID)
 	}
 
+	if err := os.MkdirAll(cfgDir, 0700); err != nil {
+		return fmt.Errorf("create config dir %s: %w", cfgDir, err)
+	}
+
 	lockPath := filepath.Join(cfgDir, "web.lock")
 	wLock, err := acquireFileLock(lockPath)
 	if err != nil {

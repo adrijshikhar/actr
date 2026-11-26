@@ -261,14 +261,11 @@ func RegisterRunner(
 	httpReq1.Header.Set("Accept", "application/json")
 	httpReq1.Header.Set("User-Agent", "actr")
 
-	resp1, err := client.Do(httpReq1)
+	resp1, err := client.Do(httpReq1) //nolint:bodyclose // drainAndClose drains and closes resp1.Body
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("execute runner auth request: %w", err)
 	}
-	defer func() {
-		drainAndClose(resp1.Body)
-		_ = resp1.Body.Close()
-	}()
+	defer drainAndClose(resp1.Body)
 
 	body1, err := io.ReadAll(io.LimitReader(resp1.Body, 1<<20))
 	if err != nil {
@@ -346,14 +343,11 @@ func RegisterRunner(
 	httpReq2.Header.Set("Accept", "application/json; api-version=6.0-preview.2")
 	httpReq2.Header.Set("User-Agent", "actr")
 
-	resp2, err := client.Do(httpReq2)
+	resp2, err := client.Do(httpReq2) //nolint:bodyclose // drainAndClose drains and closes resp2.Body
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("execute agent registration request: %w", err)
 	}
-	defer func() {
-		drainAndClose(resp2.Body)
-		_ = resp2.Body.Close()
-	}()
+	defer drainAndClose(resp2.Body)
 
 	body2, err := io.ReadAll(io.LimitReader(resp2.Body, 1<<20))
 	if err != nil {

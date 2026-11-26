@@ -271,4 +271,16 @@ func TestParseTargetURL_HandlesIPv6AndRejectsFlagAndTraversalPayloads(t *testing
 
 	_, err = ParseTargetURL("https://github.com/owner/..%2f..%2fvictim")
 	require.Error(t, err)
+
+	gitInfo, err := ParseTargetURL("git://github.com/org/repo")
+	require.NoError(t, err)
+	assert.Equal(t, "github.com", gitInfo.Host)
+	assert.Equal(t, "org", gitInfo.Owner)
+	assert.Equal(t, "repo", gitInfo.Repo)
+
+	gitSSHInfo, err := ParseTargetURL("git+ssh://github.com/org/repo")
+	require.NoError(t, err)
+	assert.Equal(t, "github.com", gitSSHInfo.Host)
+	assert.Equal(t, "org", gitSSHInfo.Owner)
+	assert.Equal(t, "repo", gitSSHInfo.Repo)
 }

@@ -19,7 +19,15 @@ func sanitizeSystemd(s string) string {
 	s = strings.ReplaceAll(s, "\r", "")
 	s = strings.ReplaceAll(s, "\n", "")
 	s = strings.ReplaceAll(s, "\x00", "")
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	s = strings.ReplaceAll(s, `$`, `$$`)
 	return strings.ReplaceAll(s, "%", "%%")
+}
+
+func escapeSystemdPath(p string) string {
+	p = sanitizeSystemd(p)
+	return strings.ReplaceAll(p, " ", `\x20`)
 }
 
 // GenerateDarwinPlist generates a launchd property list XML string for macOS.
@@ -95,6 +103,7 @@ func GenerateLinuxUnit(binPath, workDir string) string {
 	}
 	binClean := sanitizeSystemd(binPath)
 	workClean := sanitizeSystemd(workDir)
+	workPath := escapeSystemdPath(workDir)
 	pathClean := sanitizeSystemd(pathEnv)
 	homeClean := sanitizeSystemd(home)
 
@@ -104,7 +113,7 @@ After=network.target
 
 [Service]
 ExecStart="%s" run --config-dir "%s"
-WorkingDirectory="%s"
+WorkingDirectory=%s
 Environment="PATH=%s"
 Environment="HOME=%s"
 StandardOutput=append:%s/daemon.log
@@ -113,7 +122,7 @@ Restart=always
 RestartSec=5
 
 [Install]
-WantedBy=default.target`, binClean, workClean, workClean, pathClean, homeClean, workClean, workClean)
+WantedBy=default.target`, binClean, workClean, workPath, pathClean, homeClean, workClean, workClean)
 }
 
 func resolveBinPath(binPath string) (string, error) {

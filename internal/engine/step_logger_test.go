@@ -403,4 +403,3 @@ func TestSecretMasker_MultilineSecretSplitsLines(t *testing.T) {
 	assert.NotContains(t, out, "line1-secret")
 	assert.NotContains(t, out, "line2-token")
 }
-

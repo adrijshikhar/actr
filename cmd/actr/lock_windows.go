@@ -28,7 +28,7 @@ func acquireFileLock(path string) (*fileLock, error) {
 	modkernel32 := syscall.NewLazyDLL("kernel32.dll")
 	procLockFileEx := modkernel32.NewProc("LockFileEx")
 
-	r1, _, _ := procLockFileEx.Call(
+	r1, _, errSys := procLockFileEx.Call(
 		uintptr(h),
 		uintptr(flags),
 		0,
@@ -37,6 +37,15 @@ func acquireFileLock(path string) (*fileLock, error) {
 	)
 	if r1 == 0 {
 		_ = f.Close()
+		var errno syscall.Errno
+		if errors.As(errSys, &errno) {
+			if errno == 33 || errno == 997 {
+				return nil, ErrAlreadyLocked
+			}
+		}
+		if errSys != nil && errSys != syscall.Errno(0) {
+			return nil, fmt.Errorf("acquire lock on %s: %w", path, errSys)
+		}
 		return nil, ErrAlreadyLocked
 	}
 	return &fileLock{f: f}, nil
@@ -46,16 +55,22 @@ func (l *fileLock) Release() error {
 	if l == nil || l.f == nil {
 		return nil
 	}
-	defer l.f.Close()
+	defer func() {
+		_ = l.f.Close()
+		l.f = nil
+	}()
 	h := syscall.Handle(l.f.Fd())
 	var overlapped syscall.Overlapped
 	modkernel32 := syscall.NewLazyDLL("kernel32.dll")
 	procUnlockFileEx := modkernel32.NewProc("UnlockFileEx")
-	procUnlockFileEx.Call(
+	r1, _, errSys := procUnlockFileEx.Call(
 		uintptr(h),
 		0,
 		1, 0,
 		uintptr(unsafe.Pointer(&overlapped)),
 	)
+	if r1 == 0 && errSys != nil && errSys != syscall.Errno(0) {
+		return fmt.Errorf("unlock file: %w", errSys)
+	}
 	return nil
 }

@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -114,14 +115,25 @@ func acceptsGzip(ae string) bool {
 	}
 	for _, part := range strings.Split(ae, ",") {
 		part = strings.TrimSpace(part)
-		if strings.HasPrefix(part, "gzip") {
-			if strings.Contains(part, ";q=0") && !strings.Contains(part, ";q=0.") {
-				return false
+		if part == "" {
+			continue
+		}
+		tokens := strings.Split(part, ";")
+		encoding := strings.TrimSpace(tokens[0])
+		if encoding == "gzip" || encoding == "*" {
+			q := 1.0
+			for _, param := range tokens[1:] {
+				param = strings.TrimSpace(param)
+				if strings.HasPrefix(param, "q=") {
+					val, err := strconv.ParseFloat(strings.TrimPrefix(param, "q="), 64)
+					if err == nil {
+						q = val
+					}
+				}
 			}
-			if strings.Contains(part, ";q=0.0") {
-				return false
+			if q > 0 {
+				return true
 			}
-			return true
 		}
 	}
 	return false
@@ -142,15 +154,6 @@ func (s *Server) requireLocalOrigin(w http.ResponseWriter, r *http.Request) bool
 			writeJSONError(w, http.StatusForbidden, "invalid origin")
 			return false
 		}
-		uHost := u.Hostname()
-		if uHost != "127.0.0.1" && uHost != "localhost" && uHost != "::1" {
-			writeJSONError(w, http.StatusForbidden, "cross-origin requests are forbidden")
-			return false
-		}
-
-		if r.Host == "example.com" {
-			return true
-		}
 
 		if u.Host == r.Host {
 			return true
@@ -160,7 +163,13 @@ func (s *Server) requireLocalOrigin(w http.ResponseWriter, r *http.Request) bool
 			return true
 		}
 
-		if u.Port() == "5174" || u.Port() == "5173" {
+		uHost := u.Hostname()
+		if uHost != "127.0.0.1" && uHost != "localhost" && uHost != "::1" {
+			writeJSONError(w, http.StatusForbidden, "cross-origin requests are forbidden")
+			return false
+		}
+
+		if s.cfg.DevMode && (u.Port() == "5174" || u.Port() == "5173") {
 			return true
 		}
 		if s.cfg.DevProxyURL != "" {
@@ -474,7 +483,6 @@ func (s *Server) Start(ctx context.Context) error {
 		Addr:              l.Addr().String(),
 		Handler:           s,
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       15 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}

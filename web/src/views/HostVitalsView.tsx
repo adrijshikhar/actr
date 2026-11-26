@@ -105,6 +105,7 @@ export function HostVitalsView({
   const [streamActive, setStreamActive] = useState(false);
   const [lastTick, setLastTick] = useState<string | null>(null);
   const [layoutMode, setLayoutMode] = useState<'grid' | 'stacked'>('grid');
+  const [sampleCount, setSampleCount] = useState<number>(() => (status ? 1 : 0));
 
   // Grafana-style Time Window control: 30s up to 604800s (Last 7d)
   const [timeWindow, setTimeWindow] = useState<number>(60);
@@ -131,6 +132,7 @@ export function HostVitalsView({
         host_mem_total: status.host_mem_total || 0,
       });
       allSamplesRef.current = [initial];
+      setSampleCount(1);
       setMetricsHistory([initial]);
     }
   }, [status]);
@@ -175,6 +177,7 @@ export function HostVitalsView({
           const compactedOlder = allSamplesRef.current.slice(0, half).filter((_, i) => i % 2 === 0);
           allSamplesRef.current = [...compactedOlder, ...allSamplesRef.current.slice(half)];
         }
+        setSampleCount(allSamplesRef.current.length);
 
         // When paused: freeze chart updates completely so user can inspect without layout shift
         if (isPausedRef.current) {
@@ -214,6 +217,7 @@ export function HostVitalsView({
         setRefreshCadence('5');
         cadenceRef.current = '5';
         lastRenderMsRef.current = Date.now();
+        setSampleCount(allSamplesRef.current.length);
         setMetricsHistory([...allSamplesRef.current]);
       }
       return nextPaused;
@@ -232,6 +236,7 @@ export function HostVitalsView({
       setIsPaused(false);
       isPausedRef.current = false;
       lastRenderMsRef.current = Date.now();
+      setSampleCount(allSamplesRef.current.length);
       setMetricsHistory([...allSamplesRef.current]);
     }
   }, []);
@@ -244,6 +249,7 @@ export function HostVitalsView({
         await onRefresh();
       }
       lastRenderMsRef.current = Date.now();
+      setSampleCount(allSamplesRef.current.length);
       setMetricsHistory([...allSamplesRef.current]);
     } finally {
       setTimeout(() => setIsPolling(false), 400);
@@ -254,13 +260,26 @@ export function HostVitalsView({
   const visibleMetrics = useMemo(() => {
     if (metricsHistory.length === 0) return [];
 
-    const cutoffMs = Date.now() - timeWindow * 1000;
-    let filtered = metricsHistory.filter((s) => {
-      if (!s.timestamp) return true;
-      const t = new Date(s.timestamp).getTime();
-      return isNaN(t) || t >= cutoffMs;
-    });
+    const newest = metricsHistory[metricsHistory.length - 1];
+    const newestTime = newest?.timestamp ? new Date(newest.timestamp).getTime() : 0;
+    const baseTime = !isNaN(newestTime) && newestTime > 0 ? newestTime : Date.now();
+    const cutoffMs = baseTime - timeWindow * 1000;
 
+    let startIndex = metricsHistory.length - 1;
+    while (startIndex >= 0) {
+      const ts = metricsHistory[startIndex]?.timestamp;
+      if (ts) {
+        const t = new Date(ts).getTime();
+        if (!isNaN(t) && t < cutoffMs) {
+          startIndex++;
+          break;
+        }
+      }
+      startIndex--;
+    }
+    if (startIndex < 0) startIndex = 0;
+
+    let filtered = metricsHistory.slice(startIndex);
     if (filtered.length === 0) {
       filtered = metricsHistory.slice(-Math.min(timeWindow, metricsHistory.length));
     }
@@ -339,7 +358,7 @@ export function HostVitalsView({
               <span>·</span>
               <span className="whitespace-nowrap">Window: <span className="text-white font-medium">{TIME_WINDOWS.find((w) => w.value === timeWindow)?.label || `${timeWindow}s`}</span></span>
               <span>·</span>
-              <span className="whitespace-nowrap">Buffer: <span className="text-white font-medium">{allSamplesRef.current.length} samples</span></span>
+              <span className="whitespace-nowrap">Buffer: <span className="text-white font-medium">{sampleCount} samples</span></span>
               {lastTick && (
                 <>
                   <span>·</span>

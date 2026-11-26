@@ -44,7 +44,7 @@ func Prompt(reader *bufio.Reader, writer io.Writer, promptText, defaultValue str
 }
 
 // PromptConfirm displays a confirmation prompt (yes/no) and returns true for yes and false for no.
-// If the user enters empty input, defaultYes is returned.
+// If the user enters empty input, defaultYes is returned. If input is closed with no answer, an error wrapping io.EOF is returned.
 func PromptConfirm(reader *bufio.Reader, writer io.Writer, promptText string, defaultYes bool) (bool, error) {
 	var suffix string
 	if defaultYes {
@@ -63,7 +63,7 @@ func PromptConfirm(reader *bufio.Reader, writer io.Writer, promptText string, de
 
 	trimmed := strings.TrimSpace(line)
 	if err == io.EOF && trimmed == "" {
-		return false, io.EOF
+		return false, fmt.Errorf("no answer provided: input closed: %w", io.EOF)
 	}
 	if trimmed == "" {
 		return defaultYes, nil

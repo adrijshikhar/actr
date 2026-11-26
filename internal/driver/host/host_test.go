@@ -430,4 +430,3 @@ func TestSanitizeHostEnviron(t *testing.T) {
 	assert.NotContains(t, joined, "HOMEBREW_GITHUB_API_TOKEN")
 	assert.NotContains(t, joined, "MALFORMED_NO_EQUALS")
 }
-

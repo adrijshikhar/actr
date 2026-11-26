@@ -348,14 +348,11 @@ func (b *BrokerClient) CreateSession(ctx context.Context, agentName string, agen
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json")
 
-		resp, err := b.client.Do(req)
+		resp, err := b.client.Do(req) //nolint:bodyclose // drainAndClose drains and closes resp.Body //nolint:bodyclose // drainAndClose drains and closes resp.Body //nolint:bodyclose
 		if err != nil {
 			return 0, nil, fmt.Errorf("execute session request: %w", err)
 		}
-		defer func() {
-			drainAndClose(resp.Body)
-			_ = resp.Body.Close()
-		}()
+		defer drainAndClose(resp.Body)
 
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		if err != nil {
@@ -485,14 +482,11 @@ func (b *BrokerClient) fetchMessage(ctx context.Context, reqURL string) (*Broker
 	}
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := b.client.Do(req)
+	resp, err := b.client.Do(req) //nolint:bodyclose // drainAndClose drains and closes resp.Body
 	if err != nil {
 		return nil, 0, usedToken, fmt.Errorf("execute message request: %w", err)
 	}
-	defer func() {
-		drainAndClose(resp.Body)
-		_ = resp.Body.Close()
-	}()
+	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusAccepted {
 		return nil, resp.StatusCode, usedToken, nil
@@ -640,14 +634,11 @@ func (b *BrokerClient) AcknowledgeMessage(ctx context.Context, runnerRequestID s
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json")
 
-		resp, err := b.client.Do(req)
+		resp, err := b.client.Do(req) //nolint:bodyclose // drainAndClose drains and closes resp.Body //nolint:bodyclose // drainAndClose drains and closes resp.Body
 		if err != nil {
 			return 0, usedToken, fmt.Errorf("execute acknowledge request: %w", err)
 		}
-		defer func() {
-			drainAndClose(resp.Body)
-			_ = resp.Body.Close()
-		}()
+		defer drainAndClose(resp.Body)
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -705,14 +696,11 @@ func (b *BrokerClient) DeleteSession(ctx context.Context) error {
 		}
 		req.Header.Set("Accept", "application/json")
 
-		resp, err := b.client.Do(req)
+		resp, err := b.client.Do(req) //nolint:bodyclose // drainAndClose drains and closes resp.Body //nolint:bodyclose // drainAndClose drains and closes resp.Body
 		if err != nil {
 			return 0, usedToken, fmt.Errorf("execute delete session request: %w", err)
 		}
-		defer func() {
-			drainAndClose(resp.Body)
-			_ = resp.Body.Close()
-		}()
+		defer drainAndClose(resp.Body)
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))

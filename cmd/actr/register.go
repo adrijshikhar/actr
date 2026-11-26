@@ -358,6 +358,9 @@ func newRegisterCmd() *cobra.Command {
 
 			if alias != "" {
 				cfgPath := filepath.Join(configDir, "config.yaml")
+				if !config.IsMultiRepoConfig(cfgPath) && config.IsMultiRepoConfig(filepath.Join(configDir, "config.yml")) {
+					cfgPath = filepath.Join(configDir, "config.yml")
+				}
 				var supCfg *config.SupervisorConfig
 				if config.IsMultiRepoConfig(cfgPath) {
 					loaded, err := config.LoadSupervisorConfig(cfgPath)

@@ -420,13 +420,6 @@ func (m *DashboardModel) WithClipboard(c Clipboard) *DashboardModel {
 	return m
 }
 
-func (m *DashboardModel) copyText(text string) error {
-	if m != nil && m.clipboard != nil {
-		return m.clipboard.Copy(text)
-	}
-	return DefaultClipboard.Copy(text)
-}
-
 // ApplySnapshot applies a monitor.Snapshot to rebuild tree and update telemetry.
 func (m *DashboardModel) ApplySnapshot(snap *monitor.Snapshot) tea.Cmd {
 	if m == nil {
@@ -545,19 +538,55 @@ func (m *DashboardModel) SetHistoricalRunSummary(jobID string, summary *Historic
 	m.historicalSummaries[jobID] = summary
 }
 
+func (m *DashboardModel) isProtectedStepKey(key string) bool {
+	if m.activeStepID != "" && (key == m.activeStepID || strings.HasSuffix(key, "/"+m.activeStepID)) {
+		return true
+	}
+	sel := m.tree.SelectedNode()
+	if sel != nil {
+		if key == sel.ID {
+			return true
+		}
+		if parent := sel.FindParentJob(); parent != nil && key == parent.ID+"/"+sel.ID {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *DashboardModel) storeStepLogs(key string, logs []string) {
 	if len(logs) > maxStepLogLines {
-		dst := make([]string, maxStepLogLines)
-		copy(dst, logs[len(logs)-maxStepLogLines:])
-		logs = dst
+		logs = logs[len(logs)-maxStepLogLines:]
 	}
-	if _, exists := m.stepLogs[key]; !exists {
-		if len(m.stepLogKeys) >= 100 {
-			oldest := m.stepLogKeys[0]
-			m.stepLogKeys = m.stepLogKeys[1:]
-			delete(m.stepLogs, oldest)
+	if m.stepLogs == nil {
+		m.stepLogs = make(map[string][]string)
+	}
+
+	idx := -1
+	for i, k := range m.stepLogKeys {
+		if k == key {
+			idx = i
+			break
 		}
-		m.stepLogKeys = append(m.stepLogKeys, key)
+	}
+	if idx >= 0 {
+		m.stepLogKeys = append(m.stepLogKeys[:idx], m.stepLogKeys[idx+1:]...)
+	}
+	m.stepLogKeys = append(m.stepLogKeys, key)
+
+	if len(m.stepLogKeys) > 100 {
+		evictIdx := -1
+		for i, k := range m.stepLogKeys {
+			if !m.isProtectedStepKey(k) {
+				evictIdx = i
+				break
+			}
+		}
+		if evictIdx >= 0 {
+			toDelete := m.stepLogKeys[evictIdx]
+			m.stepLogKeys = append(m.stepLogKeys[:evictIdx], m.stepLogKeys[evictIdx+1:]...)
+			delete(m.stepLogs, toDelete)
+		}
 	}
 	m.stepLogs[key] = logs
 }
@@ -647,7 +676,7 @@ func fetchHistoricalLogsCmd(client *monitor.Client, runID, stepID string) tea.Cm
 	}
 }
 
-var mouseArtifactPattern = regexp.MustCompile(`(?:\x1b\[<?|<|\[<)[0-9]+(?:;[0-9]+)*[Mm]|\b[0-9]+M\b|\[<`)
+var mouseArtifactPattern = regexp.MustCompile(`(?:\x1b\[<?|<|\[<)[0-9]+(?:;[0-9]+)*[Mm]|\b[0-9]+(?:;[0-9]+)+[Mm]|\b[0-9]+M\b|\[<`)
 
 // stripMouseArtifacts removes split SGR mouse tracking escape sequence fragments
 // from user input buffers.
@@ -807,12 +836,7 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				for i, l := range logs {
 					cleanLogs[i] = ansi.Strip(l)
 				}
-				if err := m.copyText(strings.Join(cleanLogs, "\n")); err != nil {
-					cmd := m.setToast("✖ Failed to copy to clipboard")
-					return m, cmd
-				}
-				cmd := m.setToast(fmt.Sprintf("✓ Copied %d lines to clipboard", len(logs)))
-				return m, cmd
+				return m, CopyTextCmd(m.clipboard, strings.Join(cleanLogs, "\n"), len(logs), false)
 			}
 			return m, nil
 		case "s", "S":
@@ -1068,11 +1092,7 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 						selected := strings.Join(cleanLines, "\n")
 						if selected != "" {
-							if err := m.copyText(selected); err != nil {
-								cmd = m.setToast("✖ Failed to copy to clipboard")
-							} else {
-								cmd = m.setToast("✓ Copied selection to clipboard")
-							}
+							cmd = CopyTextCmd(m.clipboard, selected, len(cleanLines), true)
 						}
 					}
 				}
@@ -1144,7 +1164,6 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, cmd
 					}
 				}
-
 
 				if msg.Y >= treeTopOffset && (m.tree.Height <= 0 || msg.Y < treeTopOffset+m.tree.Height) {
 					row := m.tree.Offset + msg.Y - treeTopOffset

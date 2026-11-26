@@ -2243,12 +2243,15 @@ func TestDashboard_DragToCopySelection(t *testing.T) {
 	assert.Contains(t, vpView, selectedLogStyle.Render("Step 1: dependencies downloaded"))
 
 	// 3. Mouse release: copies lines 1..3 to clipboard, sets HUD toast
-	newModel, _ = m.Update(tea.MouseMsg{
+	newModel, cmd := m.Update(tea.MouseMsg{
 		X:      sidebarWidth + 5,
 		Y:      viewportTop + 3,
 		Action: tea.MouseActionRelease,
 		Button: tea.MouseButtonNone,
 	})
+	if cmd != nil {
+		newModel, _ = newModel.Update(cmd())
+	}
 	m = newModel.(*DashboardModel)
 
 	assert.False(t, m.IsSelecting(), "selection should end on release")
@@ -2307,7 +2310,10 @@ func TestDashboard_KeyboardCopyShortcut(t *testing.T) {
 	_ = m.updateActiveStepLogs()
 
 	// Press 'c' to copy entire step log
-	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	newModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	if cmd != nil {
+		newModel, _ = newModel.Update(cmd())
+	}
 	m = newModel.(*DashboardModel)
 
 	expectedToast := fmt.Sprintf("✓ Copied %d lines to clipboard", len(lines))
@@ -2562,7 +2568,10 @@ func TestDashboard_SidebarHeightStabilityAndPreciseClickInteraction(t *testing.T
 	// Verify copying via 'c' key copies pure logs without line numbers or gutter
 	mockClip := &mockClipboard{}
 	m.SetClipboard(mockClip)
-	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	newModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	if cmd != nil {
+		newModel, _ = newModel.Update(cmd())
+	}
 	assert.Equal(t, "npm install\nnpm test", mockClip.copied, "clipboard must receive pure log lines without gutter numbers")
 }
 
@@ -3016,6 +3025,28 @@ func TestStripMouseArtifacts_PreservesDurationTokens(t *testing.T) {
 	splitArtifact := "prefix [<suffix"
 	strippedSplit := stripMouseArtifacts(splitArtifact)
 	assert.Equal(t, "prefix suffix", strippedSplit)
+
+	// Strips bare semicolon lists ending in M or m without dropping 10m
+	bareArtifact := "search 35;12;24Mquery and 35;12;24mword"
+	strippedBare := stripMouseArtifacts(bareArtifact)
+	assert.Equal(t, "search query and word", strippedBare)
 }
 
+func TestDashboardModel_StoreStepLogs_LRUEvictionAndProtection(t *testing.T) {
+	m := NewDashboardModel("/tmp/test.sock")
+	m.activeStepID = "active-step"
 
+	for i := 0; i < 100; i++ {
+		m.storeStepLogs(fmt.Sprintf("step-%d", i), []string{fmt.Sprintf("log %d", i)})
+	}
+	assert.Len(t, m.stepLogKeys, 100)
+
+	m.storeStepLogs("step-0", []string{"log 0 refreshed"})
+	assert.Equal(t, "step-0", m.stepLogKeys[len(m.stepLogKeys)-1])
+
+	m.storeStepLogs("active-step", []string{"active log"})
+
+	assert.NotContains(t, m.stepLogs, "step-1")
+	assert.Contains(t, m.stepLogs, "step-0")
+	assert.Contains(t, m.stepLogs, "active-step")
+}

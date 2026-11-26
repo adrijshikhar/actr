@@ -99,13 +99,20 @@ func newServiceCmd() *cobra.Command {
 					}
 					// Ensure the background service is installed before starting if not already present
 					status, _ := serviceStatusFunc()
-					if status == "not installed" {
+					if status == "not installed" || configDirFlag != "" {
 						if err := serviceInstallFunc("", cfgDir); err != nil {
 							return fmt.Errorf("install service: %w", err)
 						}
 					}
 				} else {
 					return fmt.Errorf("runner is not registered; run 'actr register' first")
+				}
+			} else if configDirFlag != "" {
+				status, _ := serviceStatusFunc()
+				if status == "not installed" || configDirFlag != "" {
+					if err := serviceInstallFunc("", cfgDir); err != nil {
+						return fmt.Errorf("install service: %w", err)
+					}
 				}
 			}
 

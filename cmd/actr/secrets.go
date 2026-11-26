@@ -73,9 +73,13 @@ func newSecretsCommand() *cobra.Command {
 					}
 					val = string(pass)
 				} else {
-					data, err := io.ReadAll(io.LimitReader(in, 1<<20))
+					maxSecretBytes := int64(1 << 20)
+					data, err := io.ReadAll(io.LimitReader(in, maxSecretBytes+1))
 					if err != nil {
 						return fmt.Errorf("read secret value: %w", err)
+					}
+					if int64(len(data)) > maxSecretBytes {
+						return fmt.Errorf("secret value exceeds maximum size of 1 MiB")
 					}
 					val = strings.TrimRight(string(data), "\r\n")
 				}

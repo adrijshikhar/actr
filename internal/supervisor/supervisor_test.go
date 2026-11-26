@@ -454,8 +454,8 @@ func TestSupervisor_WithTracer(t *testing.T) {
 type drainCheckBroker struct{}
 
 func (b *drainCheckBroker) CreateSession(context.Context, string, int64, int64) error { return nil }
-func (b *drainCheckBroker) AcknowledgeMessage(context.Context, string) error         { return nil }
-func (b *drainCheckBroker) DeleteSession(context.Context) error                      { return nil }
+func (b *drainCheckBroker) AcknowledgeMessage(context.Context, string) error          { return nil }
+func (b *drainCheckBroker) DeleteSession(context.Context) error                       { return nil }
 func (b *drainCheckBroker) GetMessage(ctx context.Context, _, _, _ string) (*protocol.BrokerMessage, error) {
 	select {
 	case <-ctx.Done():

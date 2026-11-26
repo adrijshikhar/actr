@@ -1973,6 +1973,7 @@ func TestServer_CrossOriginProtection(t *testing.T) {
 	srv := NewServer(ServerConfig{
 		SecretManager:    mgr,
 		DaemonController: daemon,
+		DevMode:          true,
 	})
 
 	t.Run("external origin blocked with 403", func(t *testing.T) {
@@ -2000,6 +2001,7 @@ func TestServer_CrossOriginProtection(t *testing.T) {
 	t.Run("local 127.0.0.1 origin allowed", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodPost, "/api/service/start", nil)
+		req.Host = "127.0.0.1:18490"
 		req.Header.Set("Origin", "http://127.0.0.1:18490")
 		srv.ServeHTTP(rec, req)
 
@@ -2011,6 +2013,7 @@ func TestServer_CrossOriginProtection(t *testing.T) {
 	t.Run("localhost origin allowed", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodPost, "/api/service/stop", nil)
+		req.Host = "localhost:5174"
 		req.Header.Set("Origin", "http://localhost:5174")
 		srv.ServeHTTP(rec, req)
 
@@ -2073,3 +2076,26 @@ func TestServer_StopSynchronization(t *testing.T) {
 	wg.Wait()
 }
 
+func TestAcceptsGzip(t *testing.T) {
+	if !acceptsGzip("gzip") {
+		t.Errorf("expected gzip to be accepted")
+	}
+	if !acceptsGzip("gzip, deflate") {
+		t.Errorf("expected gzip, deflate to be accepted")
+	}
+	if !acceptsGzip("gzip;q=0.05") {
+		t.Errorf("expected gzip;q=0.05 to be accepted")
+	}
+	if acceptsGzip("gzip; q=0") {
+		t.Errorf("expected gzip; q=0 to be refused")
+	}
+	if acceptsGzip("gzip;q=0.0") {
+		t.Errorf("expected gzip;q=0.0 to be refused")
+	}
+	if acceptsGzip("identity") {
+		t.Errorf("expected identity to be refused")
+	}
+	if acceptsGzip("") {
+		t.Errorf("expected empty to be refused")
+	}
+}

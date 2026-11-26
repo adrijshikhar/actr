@@ -11,11 +11,23 @@ import (
 func TestLinuxInstallAndStatus(t *testing.T) {
 	tmpDir := t.TempDir()
 	origFunc := unitPathFunc
-	defer func() { unitPathFunc = origFunc }()
+	origExec := execCommand
+	defer func() {
+		unitPathFunc = origFunc
+		execCommand = origExec
+	}()
 
 	fakeUnit := filepath.Join(tmpDir, "actr.service")
 	unitPathFunc = func() (string, error) {
 		return fakeUnit, nil
+	}
+	execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		for _, arg := range args {
+			if arg == "is-active" {
+				return exec.CommandContext(ctx, "false")
+			}
+		}
+		return exec.CommandContext(ctx, "true")
 	}
 
 	// Status before install

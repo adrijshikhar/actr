@@ -91,7 +91,8 @@ func ParseTargetURL(raw string) (*TargetInfo, error) {
 		return nil, fmt.Errorf("parse url: %w", err)
 	}
 
-	if parsed.Scheme != "http" && parsed.Scheme != "https" && parsed.Scheme != "ssh" {
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" && scheme != "ssh" && scheme != "git" && scheme != "git+ssh" && scheme != "ssh+git" {
 		return nil, fmt.Errorf("unsupported url scheme %q in %q", parsed.Scheme, trimmed)
 	}
 
@@ -110,7 +111,7 @@ func ParseTargetURL(raw string) (*TargetInfo, error) {
 		host = parts[len(parts)-1]
 	}
 
-	if parsed.Scheme == "ssh" || port == "22" || port == "443" || port == "80" {
+	if scheme == "ssh" || scheme == "git" || scheme == "git+ssh" || scheme == "ssh+git" || port == "22" || port == "443" || port == "80" {
 		host = hostname
 	}
 

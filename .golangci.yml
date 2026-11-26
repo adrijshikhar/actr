@@ -21,6 +21,3 @@ linters:
       - linters:
           - noctx
         path: _test\.go
-      - linters:
-          - nilerr
-        path: internal/engine/expression\.go

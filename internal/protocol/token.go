@@ -254,14 +254,11 @@ func acquireOAuthTokenWithExpiry(ctx context.Context, client *http.Client, authU
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := client.Do(req)
+	resp, err := client.Do(req) //nolint:bodyclose // drainAndClose drains and closes resp.Body
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("execute token request: %w", err)
 	}
-	defer func() {
-		drainAndClose(resp.Body)
-		_ = resp.Body.Close()
-	}()
+	defer drainAndClose(resp.Body)
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
