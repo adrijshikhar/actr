@@ -991,3 +991,23 @@ func TestRegisterCmd_LimitsWithoutAlias(t *testing.T) {
 		t.Errorf("expected memory limit 2GB, got %v", repo.Limits.Memory)
 	}
 }
+
+func TestRegisterCmd_RejectsTraversalRepoAlias(t *testing.T) {
+	tmpDir := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	code := dispatchWithContext(context.Background(), []string{
+		"register",
+		"--url", "https://github.com/org/repo",
+		"--token", "test-token",
+		"--repo-alias", "../../../etc/cron.d/evil",
+		"--config-dir", tmpDir,
+	}, &stdout, &stderr)
+
+	if code == 0 {
+		t.Fatalf("expected register with traversal repo-alias to fail, but exited with 0. stdout: %s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "invalid repo alias") && !strings.Contains(stderr.String(), "invalid repository alias") {
+		t.Fatalf("expected error message to mention invalid repo alias, got: %s", stderr.String())
+	}
+}

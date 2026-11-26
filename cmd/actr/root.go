@@ -13,8 +13,6 @@ var (
 	Version   = "v0.2.0"
 	Commit    = "none"
 	Date      = "unknown"
-
-	debugFlag bool
 )
 
 func GetVersion() string {
@@ -30,6 +28,8 @@ func SetVersion(v string) {
 }
 
 func newRootCmd(out, errOut io.Writer) *cobra.Command {
+	var debugFlag bool
+
 	cmd := &cobra.Command{
 		Use:     "actr",
 		Short:   "Native, high-performance GitHub Actions self-hosted runner daemon",

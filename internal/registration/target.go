@@ -3,6 +3,7 @@ package registration
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/url"
 	"os/exec"
 	"regexp"
@@ -25,7 +26,35 @@ type TargetInfo struct {
 	Scope  ScopeType
 }
 
-var scpPattern = regexp.MustCompile(`^(?:[\w-]+@)?([^:]+):([^/]+)/(.+?)(?:\.git)?$`)
+var scpPattern = regexp.MustCompile(`^(?:[\w.-]+@)?([^:]+):([^/]+)/(.+?)(?:\.git)?$`)
+
+func isValidTargetHost(h string) bool {
+	if h == "" || strings.HasPrefix(h, "-") || strings.Contains(h, "..") {
+		return false
+	}
+	cleanIP := strings.Trim(h, "[]")
+	if net.ParseIP(cleanIP) != nil {
+		return true
+	}
+	if strings.ContainsAny(h, "/\\ \t\r\n?#@:;{}|^~`") {
+		return false
+	}
+	return true
+}
+
+func isValidTargetIdentifier(s string) bool {
+	if s == "" || strings.HasPrefix(s, "-") || strings.Contains(s, "..") {
+		return false
+	}
+	unescaped, err := url.PathUnescape(s)
+	if err == nil && (strings.Contains(unescaped, "..") || strings.HasPrefix(unescaped, "-")) {
+		return false
+	}
+	if strings.ContainsAny(s, "/\\ \t\r\n?#@:;{}|^~`[]") {
+		return false
+	}
+	return true
+}
 
 func ParseTargetURL(raw string) (*TargetInfo, error) {
 	trimmed := strings.TrimSpace(raw)
@@ -38,6 +67,9 @@ func ParseTargetURL(raw string) (*TargetInfo, error) {
 		host := matches[1]
 		owner := matches[2]
 		repo := strings.TrimRight(strings.TrimSuffix(strings.TrimRight(matches[3], "/"), ".git"), "/")
+		if !isValidTargetHost(host) || !isValidTargetIdentifier(owner) || !isValidTargetIdentifier(repo) {
+			return nil, fmt.Errorf("invalid scp git url target: %q", trimmed)
+		}
 		return &TargetInfo{
 			RawURL: trimmed,
 			WebURL: fmt.Sprintf("https://%s/%s/%s", host, owner, repo),
@@ -53,36 +85,61 @@ func ParseTargetURL(raw string) (*TargetInfo, error) {
 		trimmed = "https://" + trimmed
 	}
 
-	// 2. Standard URL parse: https:// or ssh://
+	// 2. Standard URL parse: https:// or ssh:// or http://
 	parsed, err := url.Parse(trimmed)
 	if err != nil {
 		return nil, fmt.Errorf("parse url: %w", err)
 	}
 
-	host := parsed.Host
-	if host == "" {
+	if parsed.Scheme != "http" && parsed.Scheme != "https" && parsed.Scheme != "ssh" {
+		return nil, fmt.Errorf("unsupported url scheme %q in %q", parsed.Scheme, trimmed)
+	}
+
+	hostname := parsed.Hostname()
+	if hostname == "" {
 		return nil, fmt.Errorf("invalid repository url: missing host in %q", trimmed)
 	}
-	// Strip userinfo if present in host
+	if !isValidTargetHost(hostname) {
+		return nil, fmt.Errorf("invalid repository url: invalid host %q", hostname)
+	}
+
+	port := parsed.Port()
+	host := parsed.Host
 	if strings.Contains(host, "@") {
 		parts := strings.Split(host, "@")
 		host = parts[len(parts)-1]
 	}
-	// Strip port if standard default port or ssh
-	if parsed.Scheme == "ssh" || strings.HasSuffix(host, ":22") || strings.HasSuffix(host, ":443") || strings.HasSuffix(host, ":80") {
-		host = strings.Split(host, ":")[0]
+
+	if parsed.Scheme == "ssh" || port == "22" || port == "443" || port == "80" {
+		host = hostname
 	}
 
-	pathParts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	cleanPath := strings.Trim(parsed.Path, "/")
+	if strings.Contains(parsed.Path, "..") || strings.Contains(parsed.RawPath, "..") {
+		return nil, fmt.Errorf("invalid repository url: path traversal in %q", trimmed)
+	}
+	pathParts := strings.Split(cleanPath, "/")
 	if len(pathParts) == 0 || pathParts[0] == "" {
 		return nil, fmt.Errorf("invalid repository url: missing path in %q", trimmed)
 	}
 
+	webHost := host
+	if strings.Contains(hostname, ":") {
+		if port != "" && port != "443" && port != "80" {
+			webHost = fmt.Sprintf("[%s]:%s", hostname, port)
+		} else {
+			webHost = fmt.Sprintf("[%s]", hostname)
+		}
+	}
+
 	if len(pathParts) == 1 {
 		owner := strings.TrimSuffix(pathParts[0], ".git")
+		if !isValidTargetIdentifier(owner) {
+			return nil, fmt.Errorf("invalid owner %q in %q", owner, trimmed)
+		}
 		return &TargetInfo{
 			RawURL: trimmed,
-			WebURL: fmt.Sprintf("https://%s/%s", host, owner),
+			WebURL: fmt.Sprintf("https://%s/%s", webHost, owner),
 			Host:   host,
 			Owner:  owner,
 			Repo:   "",
@@ -92,10 +149,13 @@ func ParseTargetURL(raw string) (*TargetInfo, error) {
 
 	owner := pathParts[0]
 	repo := strings.TrimSuffix(pathParts[1], ".git")
+	if !isValidTargetIdentifier(owner) || !isValidTargetIdentifier(repo) {
+		return nil, fmt.Errorf("invalid owner or repo in %q", trimmed)
+	}
 
 	return &TargetInfo{
 		RawURL: trimmed,
-		WebURL: fmt.Sprintf("https://%s/%s/%s", host, owner, repo),
+		WebURL: fmt.Sprintf("https://%s/%s/%s", webHost, owner, repo),
 		Host:   host,
 		Owner:  owner,
 		Repo:   repo,

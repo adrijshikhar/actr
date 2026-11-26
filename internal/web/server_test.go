@@ -2019,3 +2019,57 @@ func TestServer_CrossOriginProtection(t *testing.T) {
 		}
 	})
 }
+
+func TestServer_BlocksDNSRebindingAndCrossPortOriginCSRF(t *testing.T) {
+	srv := NewServer(ServerConfig{
+		Port:          0,
+		SecretManager: newMockSecretManager(),
+	})
+
+	// DNS rebinding Host attack
+	req := httptest.NewRequest(http.MethodPost, "/api/secrets", strings.NewReader(`{"key":"K","value":"V"}`))
+	req.Host = "evil.com:18490"
+	req.Header.Set("Origin", "http://evil.com:18490")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for DNS rebinding, got %d", rec.Code)
+	}
+
+	// Cross-port local Origin attack
+	req2 := httptest.NewRequest(http.MethodPost, "/api/secrets", strings.NewReader(`{"key":"K","value":"V"}`))
+	req2.Host = "127.0.0.1:18490"
+	req2.Header.Set("Origin", "http://127.0.0.1:3000")
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	srv.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for cross-port origin, got %d", rec2.Code)
+	}
+}
+
+func TestServer_StopSynchronization(t *testing.T) {
+	srv := NewServer(ServerConfig{
+		Port: 0,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_ = srv.Stop()
+	}()
+	go func() {
+		defer wg.Done()
+		_ = srv.Stop()
+	}()
+	wg.Wait()
+}
+

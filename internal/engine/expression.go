@@ -968,6 +968,7 @@ func evalHashFiles(patterns []string, ctx map[string]any) string {
 	}
 
 	matchedSet := make(map[string]struct{})
+	//nolint:nilerr // In WalkDir, returning nil skips unreadable entries and continues traversal
 	_ = filepath.WalkDir(absWorkspace, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil || d.IsDir() {
 			return nil

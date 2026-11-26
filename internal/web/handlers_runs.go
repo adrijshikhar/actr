@@ -1,8 +1,11 @@
 package web
 
 import (
+	"database/sql"
+	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/adrijshikhar/actr/internal/history"
 )
@@ -85,7 +88,15 @@ func (s *Server) handleRunDetail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	run, err := s.cfg.RunStore.GetRun(r.Context(), id)
-	if err != nil || run == nil {
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || errors.Is(err, history.ErrRunNotFound) || strings.Contains(strings.ToLower(err.Error()), "not found") {
+			writeJSONError(w, http.StatusNotFound, "run not found")
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "failed to get run")
+		return
+	}
+	if run == nil {
 		writeJSONError(w, http.StatusNotFound, "run not found")
 		return
 	}
@@ -118,7 +129,15 @@ func (s *Server) handleRunLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	run, err := s.cfg.RunStore.GetRun(r.Context(), id)
-	if err != nil || run == nil {
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || errors.Is(err, history.ErrRunNotFound) || strings.Contains(strings.ToLower(err.Error()), "not found") {
+			writeJSONError(w, http.StatusNotFound, "run not found")
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "failed to get run")
+		return
+	}
+	if run == nil {
 		writeJSONError(w, http.StatusNotFound, "run not found")
 		return
 	}
@@ -129,14 +148,18 @@ func (s *Server) handleRunLogs(w http.ResponseWriter, r *http.Request) {
 	if stepID != "" {
 		lines, err := s.cfg.RunStore.GetStepLogs(r.Context(), id, stepID)
 		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			writeJSONError(w, http.StatusInternalServerError, "failed to get step logs")
 			return
 		}
 		rawLogs = lines
 	} else {
 		// Aggregate logs across all steps
 		steps, err := s.cfg.RunStore.GetRunSteps(r.Context(), id)
-		if err != nil || len(steps) == 0 {
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "failed to get run steps")
+			return
+		}
+		if len(steps) == 0 {
 			steps = run.Steps
 		}
 
@@ -145,7 +168,11 @@ func (s *Server) handleRunLogs(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			lines, err := s.cfg.RunStore.GetStepLogs(r.Context(), id, st.ID)
-			if err == nil && len(lines) > 0 {
+			if err != nil {
+				writeJSONError(w, http.StatusInternalServerError, "failed to get step logs")
+				return
+			}
+			if len(lines) > 0 {
 				rawLogs = append(rawLogs, lines...)
 			}
 		}

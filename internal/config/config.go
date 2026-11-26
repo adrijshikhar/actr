@@ -208,7 +208,7 @@ func DefaultConfigDir() string {
 
 type DockerDriverConfig struct {
 	Socket        string            `json:"socket,omitempty" yaml:"socket,omitempty"`
-	AutoPull      bool              `json:"auto_pull,omitempty" yaml:"auto_pull,omitempty"`
+	AutoPull      *bool             `json:"auto_pull,omitempty" yaml:"auto_pull,omitempty"`
 	ImageMappings map[string]string `json:"image_mappings,omitempty" yaml:"image_mappings,omitempty"`
 }
 

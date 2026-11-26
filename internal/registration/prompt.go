@@ -2,6 +2,7 @@ package registration
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -31,7 +32,7 @@ func Prompt(reader *bufio.Reader, writer io.Writer, promptText, defaultValue str
 	}
 
 	line, err := reader.ReadString('\n')
-	if err != nil && err != io.EOF {
+	if err != nil && !errors.Is(err, io.EOF) {
 		return "", err
 	}
 
@@ -60,10 +61,15 @@ func PromptConfirm(reader *bufio.Reader, writer io.Writer, promptText string, de
 		return false, err
 	}
 
-	ans := strings.ToLower(strings.TrimSpace(line))
-	if ans == "" {
+	trimmed := strings.TrimSpace(line)
+	if err == io.EOF && trimmed == "" {
+		return false, io.EOF
+	}
+	if trimmed == "" {
 		return defaultYes, nil
 	}
+
+	ans := strings.ToLower(trimmed)
 	if ans == "y" || ans == "yes" {
 		return true, nil
 	}
@@ -71,13 +77,13 @@ func PromptConfirm(reader *bufio.Reader, writer io.Writer, promptText string, de
 }
 
 // PromptPassword displays a prompt message and reads sensitive input (e.g. registration token)
-// without echoing to the terminal. When attached to a terminal, term.ReadPassword is used;
-// otherwise, it falls back to reader.ReadString('\n').
+// without echoing to the terminal. When attached to a terminal and reader is nil,
+// term.ReadPassword is used; otherwise, it falls back to reading from reader.
 func PromptPassword(reader *bufio.Reader, writer io.Writer, promptText string) (string, error) {
 	if _, err := fmt.Fprintf(writer, "%s: ", promptText); err != nil {
 		return "", err
 	}
-	if IsTerminal(os.Stdin.Fd()) {
+	if reader == nil && IsTerminal(os.Stdin.Fd()) {
 		passBytes, err := readPasswordFunc(int(os.Stdin.Fd()))
 		_, _ = fmt.Fprintln(writer)
 		if err != nil {
@@ -85,8 +91,11 @@ func PromptPassword(reader *bufio.Reader, writer io.Writer, promptText string) (
 		}
 		return strings.TrimSpace(string(passBytes)), nil
 	}
+	if reader == nil {
+		reader = bufio.NewReader(os.Stdin)
+	}
 	line, err := reader.ReadString('\n')
-	if err != nil && err != io.EOF {
+	if err != nil && !errors.Is(err, io.EOF) {
 		return "", err
 	}
 	return strings.TrimSpace(line), nil

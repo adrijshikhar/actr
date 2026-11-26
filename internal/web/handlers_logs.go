@@ -48,6 +48,8 @@ func (s *Server) handleRunLogsStream(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-s.stopCh:
+			return
 		case ev, ok := <-events:
 			if !ok {
 				return

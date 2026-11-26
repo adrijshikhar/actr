@@ -86,14 +86,15 @@ func newMonitorCmd() *cobra.Command {
 			if demoFlag {
 				tmpSock := filepath.Join(os.TempDir(), fmt.Sprintf("actr-demo-%d.sock", os.Getpid()))
 				ctx, cancel := context.WithCancel(context.Background())
-				defer cancel()
 
 				var err error
 				srv, err = demo.StartServerWithStore(ctx, tmpSock, store)
 				if err != nil {
+					cancel()
 					return fmt.Errorf("start demo server: %w", err)
 				}
 				defer func() {
+					cancel()
 					_ = srv.Stop()
 					_ = os.Remove(tmpSock)
 				}()
@@ -104,7 +105,8 @@ func newMonitorCmd() *cobra.Command {
 
 			isDaemonRunning := false
 			if _, err := os.Stat(sockPath); err == nil {
-				conn, dialErr := net.DialTimeout("unix", sockPath, 200*time.Millisecond)
+				d := net.Dialer{Timeout: 200 * time.Millisecond}
+				conn, dialErr := d.DialContext(cmd.Context(), "unix", sockPath)
 				if dialErr == nil {
 					_ = conn.Close()
 					isDaemonRunning = true

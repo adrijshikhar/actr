@@ -153,7 +153,11 @@ func (tw *TelemetryWidget) Update(sample *monitor.TelemetrySample) {
 		return
 	}
 	tw.sample = sample
-	if sample != nil && sample.PID > 0 {
+	if sample == nil {
+		tw.history = nil
+		return
+	}
+	if sample.PID > 0 {
 		tw.history = append(tw.history, MetricPoint{
 			CPU:           sample.StepCPU,
 			RSSBytes:      sample.StepRSSBytes,
@@ -975,6 +979,8 @@ func (tw *TelemetryWidget) viewHistorical(width int) string {
 		pill = completedSuccessPillStyle.Render("● COMPLETED (SUCCESS)")
 	case monitor.StatusFailed:
 		pill = completedFailedPillStyle.Render("● COMPLETED (FAILED)")
+	case monitor.StatusInterrupted:
+		pill = offlinePillStyle.Render("● INTERRUPTED")
 	case monitor.StatusRunning:
 		pill = activePillStyle.Render("● RUNNING")
 	default:
@@ -1357,6 +1363,9 @@ func generateHistoricalProfile(peak float64, count int, profileType string) []fl
 	if count <= 0 {
 		count = 30
 	}
+	if count <= 1 {
+		return []float64{peak}
+	}
 	if peak <= 0 {
 		return make([]float64, count)
 	}
@@ -1488,6 +1497,8 @@ func (tw *TelemetryWidget) viewHistoricalCompact(width int) string {
 		pill = completedSuccessPillStyle.Render("● COMPLETED")
 	case monitor.StatusFailed:
 		pill = completedFailedPillStyle.Render("● FAILED")
+	case monitor.StatusInterrupted:
+		pill = offlinePillStyle.Render("● INTERRUPTED")
 	default:
 		pill = idlePillStyle.Render("● IDLE")
 	}

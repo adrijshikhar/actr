@@ -258,7 +258,10 @@ func acquireOAuthTokenWithExpiry(ctx context.Context, client *http.Client, authU
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("execute token request: %w", err)
 	}
-	defer drainAndClose(resp.Body)
+	defer func() {
+		drainAndClose(resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/url"
 	"os/exec"
 	"strings"
 )
@@ -38,9 +39,9 @@ func FetchRegistrationTokenGH(ctx context.Context, target *TargetInfo, ghRunner 
 
 	var apiPath string
 	if target.Scope == ScopeOrg {
-		apiPath = fmt.Sprintf("/orgs/%s/actions/runners/registration-token", target.Owner)
+		apiPath = fmt.Sprintf("/orgs/%s/actions/runners/registration-token", url.PathEscape(target.Owner))
 	} else {
-		apiPath = fmt.Sprintf("/repos/%s/%s/actions/runners/registration-token", target.Owner, target.Repo)
+		apiPath = fmt.Sprintf("/repos/%s/%s/actions/runners/registration-token", url.PathEscape(target.Owner), url.PathEscape(target.Repo))
 	}
 
 	args := []string{"api", "--hostname", target.Host, "--method", "POST", apiPath, "--jq", ".token"}

@@ -2,9 +2,12 @@ package web
 
 import (
 	"net/http"
+	"sync"
 
 	"github.com/adrijshikhar/actr/internal/service"
 )
+
+var serviceMu sync.Mutex
 
 type serviceStatusResponse struct {
 	Status string `json:"status"`
@@ -44,6 +47,9 @@ func (s *Server) handleServiceStart(w http.ResponseWriter, r *http.Request) {
 	if !s.requireLocalOrigin(w, r) {
 		return
 	}
+	serviceMu.Lock()
+	defer serviceMu.Unlock()
+
 	var err error
 	if s.cfg.DaemonController != nil {
 		err = s.cfg.DaemonController.Start()
@@ -52,7 +58,7 @@ func (s *Server) handleServiceStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -67,6 +73,9 @@ func (s *Server) handleServiceStop(w http.ResponseWriter, r *http.Request) {
 	if !s.requireLocalOrigin(w, r) {
 		return
 	}
+	serviceMu.Lock()
+	defer serviceMu.Unlock()
+
 	var err error
 	if s.cfg.DaemonController != nil {
 		err = s.cfg.DaemonController.Stop()
@@ -75,7 +84,7 @@ func (s *Server) handleServiceStop(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 

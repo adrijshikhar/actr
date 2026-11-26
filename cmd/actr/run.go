@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -11,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,13 +31,19 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var runRegisterCmdFunc = func(cmd *cobra.Command) error {
+var runRegisterCmdFunc = func(cmd *cobra.Command, cfgDir ...string) error {
 	regCmd := newRegisterCmd()
 	if cmd.Context() != nil {
 		regCmd.SetContext(cmd.Context())
 	}
-	if f := cmd.Flag("config-dir"); f != nil && f.Value.String() != "" {
-		_ = regCmd.Flags().Set("config-dir", f.Value.String())
+	dir := ""
+	if len(cfgDir) > 0 && cfgDir[0] != "" {
+		dir = cfgDir[0]
+	} else if f := cmd.Flag("config-dir"); f != nil && f.Value.String() != "" {
+		dir = f.Value.String()
+	}
+	if dir != "" {
+		_ = regCmd.Flags().Set("config-dir", dir)
 	}
 	_ = regCmd.Flags().Set("prompt-service", "false")
 	regCmd.SetIn(cmd.InOrStdin())
@@ -48,8 +56,11 @@ func resolveConfigDir(dir string, explicitlySet bool) string {
 	if explicitlySet && dir != "" {
 		return dir
 	}
+	if env := os.Getenv("ACTR_CONFIG_DIR"); env != "" {
+		return env
+	}
 	if env := os.Getenv("ACT_RUNNER_CONFIG_DIR"); env != "" {
-		return config.DefaultConfigDir()
+		return env
 	}
 	if _, err := os.Stat(".runner"); err == nil {
 		return "."
@@ -174,6 +185,19 @@ func newRunCmd() *cobra.Command {
 
 			cfgDir := resolveConfigDir(configDirFlag, cmd.Flags().Changed("config-dir"))
 
+			if err := os.MkdirAll(cfgDir, 0700); err != nil {
+				return fmt.Errorf("create config directory %s: %w", cfgDir, err)
+			}
+			lockPath := filepath.Join(cfgDir, "daemon.lock")
+			dLock, err := acquireFileLock(lockPath)
+			if err != nil {
+				if errors.Is(err, ErrAlreadyLocked) {
+					return fmt.Errorf("daemon is already running in %s (daemon.lock is held)", cfgDir)
+				}
+				return fmt.Errorf("acquire daemon lock: %w", err)
+			}
+			defer func() { _ = dLock.Release() }()
+
 			// Purge legacy JSON runs directory if present
 			if err := purgeLegacyJSONRuns(filepath.Join(cfgDir, "runs")); err != nil {
 				logger.Warn("failed to purge legacy runs directory", "error", err)
@@ -294,14 +318,16 @@ func newRunCmd() *cobra.Command {
 				}
 
 				// Wire supervisor reload on monitor POST /reload
-				sup.MonitorServer().WithReloadFunc(func() error {
-					logger.Info("Reloading supervisor configuration", "path", multiRepoConfigPath)
-					newCfg, err := config.LoadSupervisorConfig(multiRepoConfigPath)
-					if err != nil {
-						return err
-					}
-					return sup.Reload(newCfg)
-				})
+				if srv := sup.MonitorServer(); srv != nil {
+					srv.WithReloadFunc(func() error {
+						logger.Info("Reloading supervisor configuration", "path", multiRepoConfigPath)
+						newCfg, err := config.LoadSupervisorConfig(multiRepoConfigPath)
+						if err != nil {
+							return err
+						}
+						return sup.Reload(newCfg)
+					})
+				}
 
 				// SIGHUP listener for daemon configuration reload
 				supCtx, supCancel := context.WithCancel(ctx)
@@ -311,7 +337,10 @@ func newRunCmd() *cobra.Command {
 				signal.Notify(sigCh, syscall.SIGHUP)
 				defer signal.Stop(sigCh)
 
+				var sighupWg sync.WaitGroup
+				sighupWg.Add(1)
 				go func() {
+					defer sighupWg.Done()
 					for {
 						select {
 						case <-supCtx.Done():
@@ -331,6 +360,7 @@ func newRunCmd() *cobra.Command {
 						}
 					}
 				}()
+				defer sighupWg.Wait()
 
 				return sup.Start(ctx)
 			}
@@ -351,7 +381,7 @@ func newRunCmd() *cobra.Command {
 					if !registerNow {
 						return fmt.Errorf("runner is not configured; run 'actr register' first")
 					}
-					if err := runRegisterCmdFunc(cmd); err != nil {
+					if err := runRegisterCmdFunc(cmd, cfgDir); err != nil {
 						return err
 					}
 				} else {
@@ -391,8 +421,8 @@ func newRunCmd() *cobra.Command {
 			autoPull := true
 			if yamlCfg != nil {
 				dockerSocket = yamlCfg.Driver.Docker.Socket
-				if yamlCfg.Driver.Docker.AutoPull {
-					autoPull = true
+				if yamlCfg.Driver.Docker.AutoPull != nil {
+					autoPull = *yamlCfg.Driver.Docker.AutoPull
 				}
 			}
 
@@ -422,14 +452,15 @@ func newRunCmd() *cobra.Command {
 				brokerURL = cfg.ServerURLV2
 			}
 
+			httpClient := HTTPClientFromContext(ctx)
 			brokerClient := BrokerClientFromContext(ctx)
 			if brokerClient == nil {
-				brokerClient = protocol.NewBrokerClient(nil, brokerURL, creds.AuthorizationURL, creds.ClientID, privKey)
+				brokerClient = protocol.NewBrokerClient(httpClient, brokerURL, creds.AuthorizationURL, creds.ClientID, privKey)
 			}
 
 			runServiceClient := RunServiceClientFromContext(ctx)
 			if runServiceClient == nil {
-				runServiceClient = protocol.NewRunServiceClient(nil)
+				runServiceClient = protocol.NewRunServiceClient(httpClient)
 			}
 
 			coord := CoordinatorFromContext(ctx)
@@ -463,7 +494,9 @@ func newRunCmd() *cobra.Command {
 				if yamlCfg != nil {
 					vCfg = &yamlCfg.Vault
 				}
-				if vaultProv, err := vault.NewProviderFromConfig(vCfg, cfgDir); err == nil && vaultProv != nil {
+				if vaultProv, err := vault.NewProviderFromConfig(vCfg, cfgDir); err != nil {
+					logger.Error("Failed to initialize vault provider from config", "error", err)
+				} else if vaultProv != nil {
 					coordEngine = coordEngine.WithVault(vaultProv)
 				}
 				coord = coordEngine
@@ -482,7 +515,9 @@ func newRunCmd() *cobra.Command {
 					if yamlCfg != nil {
 						vCfg = &yamlCfg.Vault
 					}
-					if vaultProv, err := vault.NewProviderFromConfig(vCfg, cfgDir); err == nil && vaultProv != nil {
+					if vaultProv, err := vault.NewProviderFromConfig(vCfg, cfgDir); err != nil {
+						logger.Error("Failed to initialize vault provider from config", "error", err)
+					} else if vaultProv != nil {
 						c.WithVault(vaultProv)
 					}
 				} else {

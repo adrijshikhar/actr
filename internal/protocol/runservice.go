@@ -1035,7 +1035,10 @@ func (c *RunServiceClient) AcquireJob(ctx context.Context, runServiceURL, runner
 	if err != nil {
 		return nil, fmt.Errorf("execute acquire request: %w", err)
 	}
-	defer drainAndClose(resp.Body)
+	defer func() {
+		drainAndClose(resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 	if err != nil {
@@ -1111,7 +1114,10 @@ func (c *RunServiceClient) RenewJob(ctx context.Context, runServiceURL, planID, 
 	if err != nil {
 		return time.Time{}, fmt.Errorf("execute renew request: %w", err)
 	}
-	defer drainAndClose(resp.Body)
+	defer func() {
+		drainAndClose(resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
@@ -1238,7 +1244,10 @@ func (c *RunServiceClient) CompleteJob(ctx context.Context, runServiceURL, token
 	if err != nil {
 		return fmt.Errorf("execute complete request: %w", err)
 	}
-	defer drainAndClose(resp.Body)
+	defer func() {
+		drainAndClose(resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))

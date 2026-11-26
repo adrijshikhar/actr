@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -52,6 +51,9 @@ func newSecretsCommand() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			key := args[0]
+			if strings.TrimSpace(key) == "" || strings.ContainsAny(key, "= \t\r\n\x00") {
+				return fmt.Errorf("invalid secret key %q: key must not be empty or contain whitespace/equals", key)
+			}
 			var val string
 
 			if cmd.Flags().Changed("value") {
@@ -71,12 +73,11 @@ func newSecretsCommand() *cobra.Command {
 					}
 					val = string(pass)
 				} else {
-					reader := bufio.NewReader(in)
-					line, err := reader.ReadString('\n')
-					if err != nil && err != io.EOF {
+					data, err := io.ReadAll(io.LimitReader(in, 1<<20))
+					if err != nil {
 						return fmt.Errorf("read secret value: %w", err)
 					}
-					val = strings.TrimRight(line, "\r\n")
+					val = strings.TrimRight(string(data), "\r\n")
 				}
 			}
 

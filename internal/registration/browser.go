@@ -1,6 +1,7 @@
 package registration
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/url"
@@ -27,20 +28,24 @@ func validateBrowserURL(rawURL string) (string, error) {
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return "", fmt.Errorf("invalid browser target URL: scheme must be http or https, got %q", parsed.Scheme)
 	}
+	if parsed.Host == "" {
+		return "", fmt.Errorf("invalid browser target URL: host must not be empty")
+	}
 	return trimmed, nil
 }
 
 func browserCommand(goos, rawURL string) (*exec.Cmd, error) {
+	ctx := context.Background()
 	switch goos {
 	case "darwin":
-		return exec.Command("open", rawURL), nil
+		return exec.CommandContext(ctx, "open", rawURL), nil
 	case "linux":
 		if os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
 			return nil, ErrHeadlessEnvironment
 		}
-		return exec.Command("xdg-open", rawURL), nil
+		return exec.CommandContext(ctx, "xdg-open", rawURL), nil
 	case "windows":
-		return exec.Command("rundll32", "url.dll,FileProtocolHandler", rawURL), nil
+		return exec.CommandContext(ctx, "rundll32", "url.dll,FileProtocolHandler", rawURL), nil
 	default:
 		return nil, fmt.Errorf("unsupported platform for browser launch: %s", goos)
 	}

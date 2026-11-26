@@ -91,6 +91,8 @@ func (s *Server) handleMetricsStream(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-s.stopCh:
+			return
 		case <-ticker.C:
 			if !sendSample() {
 				return

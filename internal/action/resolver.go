@@ -271,7 +271,7 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 		}
 
 		hdr, err := tr.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -470,7 +470,7 @@ func (r *ActionResolver) Resolve(ctx context.Context, ref *protocol.StepReferenc
 		if d.Type()&fs.ModeSymlink != 0 {
 			realTarget, err := filepath.EvalSymlinks(entryPath)
 			if err != nil {
-				return fmt.Errorf("%w: symlink %s resolves outside destination: %v", ErrPathTraversal, entryPath, err)
+				return fmt.Errorf("%w: symlink %s resolves outside destination: %w", ErrPathTraversal, entryPath, err)
 			}
 			cleanReal := filepath.Clean(realTarget)
 			if !strings.HasPrefix(cleanReal, cleanDest+string(filepath.Separator)) && cleanReal != cleanDest {

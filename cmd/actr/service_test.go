@@ -157,7 +157,7 @@ func TestServiceStart_UnregisteredInteractivePromptAccept(t *testing.T) {
 	t.Setenv("ACT_RUNNER_CONFIG_DIR", tempDir)
 
 	registerCalled := false
-	runRegisterCmdFunc = func(cmd *cobra.Command) error {
+	runRegisterCmdFunc = func(cmd *cobra.Command, cfgDir ...string) error {
 		registerCalled = true
 		return os.WriteFile(filepath.Join(tempDir, ".runner"), []byte("{}"), 0600)
 	}

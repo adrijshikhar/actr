@@ -1,10 +1,12 @@
 package diagnostics
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 )
 
 type CheckResult struct {
@@ -39,7 +41,9 @@ func checkGit() CheckResult {
 	if err != nil {
 		return CheckResult{Name: "Git", Passed: false, Message: "git not found in PATH"}
 	}
-	out, err := exec.Command(path, "--version").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, path, "--version").Output()
 	if err != nil {
 		return CheckResult{Name: "Git", Passed: false, Message: fmt.Sprintf("git execution failed: %v", err)}
 	}
@@ -51,7 +55,9 @@ func checkNode() CheckResult {
 	if err != nil {
 		return CheckResult{Name: "Node.js (for JS actions)", Passed: false, Message: "node not found in PATH (install via sdkman/nvm/brew for JS actions)"}
 	}
-	out, err := exec.Command(path, "--version").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, path, "--version").Output()
 	if err != nil {
 		return CheckResult{Name: "Node.js (for JS actions)", Passed: false, Message: fmt.Sprintf("node execution failed: %v", err)}
 	}

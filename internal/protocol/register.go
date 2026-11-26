@@ -265,7 +265,10 @@ func RegisterRunner(
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("execute runner auth request: %w", err)
 	}
-	defer drainAndClose(resp1.Body)
+	defer func() {
+		drainAndClose(resp1.Body)
+		_ = resp1.Body.Close()
+	}()
 
 	body1, err := io.ReadAll(io.LimitReader(resp1.Body, 1<<20))
 	if err != nil {
@@ -347,7 +350,10 @@ func RegisterRunner(
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("execute agent registration request: %w", err)
 	}
-	defer drainAndClose(resp2.Body)
+	defer func() {
+		drainAndClose(resp2.Body)
+		_ = resp2.Body.Close()
+	}()
 
 	body2, err := io.ReadAll(io.LimitReader(resp2.Body, 1<<20))
 	if err != nil {

@@ -2949,3 +2949,73 @@ func TestDashboard_HistoricalJobMetricsAndExpansion(t *testing.T) {
 	assert.Contains(t, expandedView, "Memory Profile")
 }
 
+func TestDashboard_IsolatesStepLogsAcrossJobsSharingStepID(t *testing.T) {
+	m := NewDashboardModel("/tmp/nonexistent.sock")
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	// Job 1 and Job 2 both have step "step_1"
+	snap := &monitor.Snapshot{
+		ActiveJobs: []*monitor.JobInfo{
+			{
+				ID:   "job-1",
+				Name: "Job 1",
+				Steps: []*monitor.StepInfo{
+					{ID: "step_1", Name: "Build Step", Status: monitor.StatusRunning},
+				},
+			},
+			{
+				ID:   "job-2",
+				Name: "Job 2",
+				Steps: []*monitor.StepInfo{
+					{ID: "step_1", Name: "Build Step", Status: monitor.StatusRunning},
+				},
+			},
+		},
+	}
+	_, _ = m.Update(SnapshotMsg(snap))
+
+	// Send step logs for job-1
+	_, _ = m.Update(EventMsg(monitor.Event{
+		Type:    monitor.EventStepLog,
+		JobID:   "job-1",
+		StepID:  "step_1",
+		LogLine: "Job 1 Line 1",
+	}))
+
+	// Send step logs for job-2
+	_, _ = m.Update(EventMsg(monitor.Event{
+		Type:    monitor.EventStepLog,
+		JobID:   "job-2",
+		StepID:  "step_1",
+		LogLine: "Job 2 Line 1",
+	}))
+
+	// Verify both log streams are stored under composite keys without aliasing
+	job1Logs := m.stepLogs["job-1/step_1"]
+	job2Logs := m.stepLogs["job-2/step_1"]
+
+	require.Len(t, job1Logs, 1)
+	assert.Equal(t, "Job 1 Line 1", job1Logs[0])
+
+	require.Len(t, job2Logs, 1)
+	assert.Equal(t, "Job 2 Line 1", job2Logs[0])
+}
+
+func TestStripMouseArtifacts_PreservesDurationTokens(t *testing.T) {
+	// Preserves time durations like "10m build", "5m", "15m remaining"
+	input := "completed in 10m build task"
+	stripped := stripMouseArtifacts(input)
+	assert.Equal(t, "completed in 10m build task", stripped)
+
+	// Strips actual mouse escape artifacts
+	sgrArtifact := "search \x1b[<35;12;24Mquery"
+	strippedArtifact := stripMouseArtifacts(sgrArtifact)
+	assert.Equal(t, "search query", strippedArtifact)
+
+	// Strips split brackets
+	splitArtifact := "prefix [<suffix"
+	strippedSplit := stripMouseArtifacts(splitArtifact)
+	assert.Equal(t, "prefix suffix", strippedSplit)
+}
+
+

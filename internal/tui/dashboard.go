@@ -113,8 +113,10 @@ type DashboardModel struct {
 	ready        bool
 	ctx          context.Context
 	cancel       context.CancelFunc
+	streamCancel context.CancelFunc
 	activeStepID string
 	stepLogs     map[string][]string
+	stepLogKeys  []string
 	lastErr      error
 
 	autoFocusRunningStep bool
@@ -543,6 +545,23 @@ func (m *DashboardModel) SetHistoricalRunSummary(jobID string, summary *Historic
 	m.historicalSummaries[jobID] = summary
 }
 
+func (m *DashboardModel) storeStepLogs(key string, logs []string) {
+	if len(logs) > maxStepLogLines {
+		dst := make([]string, maxStepLogLines)
+		copy(dst, logs[len(logs)-maxStepLogLines:])
+		logs = dst
+	}
+	if _, exists := m.stepLogs[key]; !exists {
+		if len(m.stepLogKeys) >= 100 {
+			oldest := m.stepLogKeys[0]
+			m.stepLogKeys = m.stepLogKeys[1:]
+			delete(m.stepLogs, oldest)
+		}
+		m.stepLogKeys = append(m.stepLogKeys, key)
+	}
+	m.stepLogs[key] = logs
+}
+
 // Init sets up context cancellation and fetches initial state (live snapshot or offline polling).
 func (m *DashboardModel) Init() tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -555,8 +574,15 @@ func (m *DashboardModel) Init() tea.Cmd {
 		})
 	}
 
+	if m.streamCancel != nil {
+		m.streamCancel()
+		m.streamCancel = nil
+	}
+
 	if m.client != nil {
-		m.events, m.errs = m.client.StreamEvents(ctx)
+		streamCtx, streamCancel := context.WithCancel(ctx)
+		m.streamCancel = streamCancel
+		m.events, m.errs = m.client.StreamEvents(streamCtx)
 	}
 
 	client := m.client
@@ -621,7 +647,7 @@ func fetchHistoricalLogsCmd(client *monitor.Client, runID, stepID string) tea.Cm
 	}
 }
 
-var mouseArtifactPattern = regexp.MustCompile(`(?i)(?:\x1b\[|<|\[<)?[0-9]+(?:;[0-9]+)*[Mm]|\b[0-9]+[Mm]\b|\[<`)
+var mouseArtifactPattern = regexp.MustCompile(`(?:\x1b\[<?|<|\[<)[0-9]+(?:;[0-9]+)*[Mm]|\b[0-9]+M\b|\[<`)
 
 // stripMouseArtifacts removes split SGR mouse tracking escape sequence fragments
 // from user input buffers.
@@ -846,6 +872,11 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "esc":
+			if m.isZoomed {
+				m.isZoomed = false
+				m.updateSizes()
+				return m, nil
+			}
 			m.focus = FocusTree
 			if m.searchQuery != "" || len(m.searchMatches) > 0 {
 				m.logSearching = false
@@ -897,14 +928,14 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.tree.Down()
 			return m, m.updateActiveStepLogs()
 		case "enter", " ":
-			m.focus = FocusTree
-			if !m.isZoomed {
+			if m.focus == FocusTree && !m.isZoomed {
 				m.tree.Toggle()
 				if sel := m.tree.SelectedNode(); sel != nil && sel.NodeType == NodeRepo {
 					m.seenRepoExpansion[sel.ID] = sel.Expanded
 				}
 				return m, m.updateActiveStepLogs()
 			}
+			return m, nil
 		case "h", "left":
 			m.focus = FocusTree
 			if !m.isZoomed {
@@ -1098,6 +1129,10 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			if !m.isZoomed && msg.X < sidebarWidth {
 				// Click in Sidebar Tree
+				if m.logSearching {
+					m.logSearching = false
+					m.logSearchInput.Blur()
+				}
 				m.focus = FocusTree
 
 				treeTopOffset := 1
@@ -1161,6 +1196,10 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			// Click in Viewport
+			if m.treeSearching {
+				m.treeSearching = false
+				m.treeSearchInput.Blur()
+			}
 			m.focus = FocusViewport
 
 			if msg.Y >= viewportTop && msg.Y < viewportBottom {
@@ -1196,7 +1235,13 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			ctx = context.Background()
 		}
 		if (wasOffline || m.events == nil) && m.client != nil {
-			m.events, m.errs = m.client.StreamEvents(ctx)
+			if m.streamCancel != nil {
+				m.streamCancel()
+				m.streamCancel = nil
+			}
+			streamCtx, streamCancel := context.WithCancel(ctx)
+			m.streamCancel = streamCancel
+			m.events, m.errs = m.client.StreamEvents(streamCtx)
 		}
 		var waitCmd tea.Cmd
 		if ctx.Err() == nil {
@@ -1226,7 +1271,20 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, waitCmd
 
+	case ClipboardResultMsg:
+		if msg.Err != nil {
+			return m, m.setToast("✖ Failed to copy to clipboard")
+		}
+		if msg.IsSelection {
+			return m, m.setToast("✓ Copied selection to clipboard")
+		}
+		return m, m.setToast(fmt.Sprintf("✓ Copied %d lines to clipboard", msg.Lines))
+
 	case streamClosedMsg:
+		if m.streamCancel != nil {
+			m.streamCancel()
+			m.streamCancel = nil
+		}
 		m.lastErr = fmt.Errorf("stream closed")
 		m.events = nil
 		m.errs = nil
@@ -1244,6 +1302,10 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case streamErrMsg:
+		if m.streamCancel != nil {
+			m.streamCancel()
+			m.streamCancel = nil
+		}
 		m.lastErr = msg.err
 		m.events = nil
 		m.errs = nil
@@ -1261,6 +1323,10 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case ErrMsg:
+		if m.streamCancel != nil {
+			m.streamCancel()
+			m.streamCancel = nil
+		}
 		m.lastErr = error(msg)
 		m.events = nil
 		m.errs = nil
@@ -1278,6 +1344,10 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case ReconnectMsg:
+		if m.streamCancel != nil {
+			m.streamCancel()
+			m.streamCancel = nil
+		}
 		ctx := m.ctx
 		if ctx == nil {
 			ctx = context.Background()
@@ -1299,15 +1369,10 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case historicalLogsLoadedMsg:
 		if msg.err == nil && len(msg.logs) > 0 {
-			logs := msg.logs
-			if len(logs) > maxStepLogLines {
-				logs = logs[len(logs)-maxStepLogLines:]
-			}
-			m.stepLogs[msg.runID+"/"+msg.stepID] = logs
-			m.stepLogs[msg.stepID] = logs
+			m.storeStepLogs(msg.runID+"/"+msg.stepID, msg.logs)
 			sel := m.tree.SelectedNode()
 			if sel != nil && sel.ID == msg.stepID && (sel.Parent == nil || sel.Parent.ID == msg.runID) {
-				m.renderAndSetLogs(logs)
+				m.renderAndSetLogs(m.stepLogs[msg.runID+"/"+msg.stepID])
 				if m.autoFollow {
 					m.viewport.GotoBottom()
 				}
@@ -1471,10 +1536,7 @@ func (m *DashboardModel) applySnapshot(snap *monitor.Snapshot) tea.Cmd {
 		m.telemetry.SetSupervisorStatus(snap.SupervisorStatus)
 	}
 	for stepKey, lines := range snap.StepLogs {
-		if len(lines) > maxStepLogLines {
-			lines = lines[len(lines)-maxStepLogLines:]
-		}
-		m.stepLogs[stepKey] = lines
+		m.storeStepLogs(stepKey, lines)
 	}
 	m.rebuildTreeFromSnapshot(snap)
 	if m.autoFocusRunningStep && !m.autoFocused {
@@ -2328,15 +2390,17 @@ func (m *DashboardModel) handleEvent(ev monitor.Event) tea.Cmd {
 				key = ev.JobID + "/" + ev.StepID
 			}
 			logs := append(m.stepLogs[key], ev.LogLine)
-			if len(logs) > maxStepLogLines {
-				logs = logs[len(logs)-maxStepLogLines:]
+			m.storeStepLogs(key, logs)
+
+			isSelected := false
+			if sel := m.tree.SelectedNode(); sel != nil {
+				pj := sel.FindParentJob()
+				if sel.ID == ev.StepID && (pj == nil || ev.JobID == "" || pj.ID == ev.JobID) {
+					isSelected = true
+				}
 			}
-			m.stepLogs[key] = logs
-			if key != ev.StepID {
-				m.stepLogs[ev.StepID] = logs
-			}
-			if ev.StepID == m.activeStepID || key == m.activeStepID {
-				m.renderAndSetLogs(logs)
+			if isSelected || key == m.activeStepID {
+				m.renderAndSetLogs(m.stepLogs[key])
 				if m.autoFollow {
 					m.viewport.GotoBottom()
 				}
@@ -2835,12 +2899,8 @@ func (m *DashboardModel) updateActiveStepLogs() tea.Cmd {
 			if m.isOffline && m.historyStore != nil {
 				fetched, _ := m.historyStore.GetStepLogs(jobID, stepID)
 				if len(fetched) > 0 {
-					if len(fetched) > maxStepLogLines {
-						fetched = fetched[len(fetched)-maxStepLogLines:]
-					}
-					m.stepLogs[jobID+"/"+stepID] = fetched
-					m.stepLogs[stepID] = fetched
-					m.renderAndSetLogs(fetched)
+					m.storeStepLogs(jobID+"/"+stepID, fetched)
+					m.renderAndSetLogs(m.stepLogs[jobID+"/"+stepID])
 					if m.autoFollow {
 						m.viewport.GotoBottom()
 					}

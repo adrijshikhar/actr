@@ -130,6 +130,15 @@ func TestPromptConfirm(t *testing.T) {
 		assert.False(t, ok)
 	})
 
+	t.Run("empty input on EOF returns error", func(t *testing.T) {
+		in := bufio.NewReader(strings.NewReader(""))
+		var out bytes.Buffer
+
+		ok, err := PromptConfirm(in, &out, "Continue?", true)
+		assert.ErrorIs(t, err, io.EOF)
+		assert.False(t, ok)
+	})
+
 	t.Run("reader error other than EOF", func(t *testing.T) {
 		errReader := &failingReader{err: io.ErrClosedPipe}
 		in := bufio.NewReader(errReader)

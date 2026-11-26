@@ -242,11 +242,12 @@ func (n *TreeNode) Matches(query string) bool {
 
 	// 3. Match status token
 	statusAliases := map[monitor.StepStatus][]string{
-		monitor.StatusFailed:  {"failed", "fail", "error", "err"},
-		monitor.StatusSuccess: {"success", "pass", "ok", "done"},
-		monitor.StatusRunning: {"running", "run", "active"},
-		monitor.StatusSkipped: {"skipped", "skip"},
-		monitor.StatusQueued:  {"queued", "queue"},
+		monitor.StatusFailed:      {"failed", "fail", "error", "err"},
+		monitor.StatusSuccess:     {"success", "pass", "ok", "done"},
+		monitor.StatusRunning:     {"running", "run", "active"},
+		monitor.StatusSkipped:     {"skipped", "skip"},
+		monitor.StatusQueued:      {"queued", "queue"},
+		monitor.StatusInterrupted: {"interrupted", "interrupt", "cancelled", "cancel", "stopped", "aborted"},
 	}
 	if aliases, ok := statusAliases[n.Status]; ok {
 		for _, a := range aliases {
@@ -742,6 +743,9 @@ func (tw *TreeWidget) View(width int) string {
 			case monitor.StatusSkipped:
 				baseStyle = yellowStyle
 				symbol = "⊘ "
+			case monitor.StatusInterrupted:
+				baseStyle = yellowStyle
+				symbol = "▲ "
 			default:
 				baseStyle = dimStyle
 				symbol = "○ "

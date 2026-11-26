@@ -463,3 +463,25 @@ func TestSecretsCLI_Help(t *testing.T) {
 	assert.Contains(t, out, "delete")
 	assert.Contains(t, out, "--config-dir")
 }
+
+func TestSecretsCmd_ReadsFullMultilinePipedSecret(t *testing.T) {
+	origResolver := vaultProviderResolver
+	t.Cleanup(func() { vaultProviderResolver = origResolver })
+
+	mv := &mockVault{secrets: make(map[string]string)}
+	vaultProviderResolver = func(cmd *cobra.Command) (vault.Provider, error) {
+		return mv, nil
+	}
+
+	multilineSecret := "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0...\nline 3\nline 4\n-----END RSA PRIVATE KEY-----\n"
+
+	var outBuf, errBuf bytes.Buffer
+	cmd := newRootCmd(&outBuf, &errBuf)
+	cmd.SetIn(strings.NewReader(multilineSecret))
+	cmd.SetArgs([]string{"secrets", "set", "SSH_KEY"})
+
+	err := cmd.Execute()
+	require.NoError(t, err)
+	assert.Equal(t, strings.TrimRight(multilineSecret, "\r\n"), mv.secrets["SSH_KEY"])
+	assert.Contains(t, mv.secrets["SSH_KEY"], "\nline 3\nline 4\n")
+}

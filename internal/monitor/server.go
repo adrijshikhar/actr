@@ -451,14 +451,19 @@ func (s *Server) Start() error {
 	}
 
 	// Guard against unlinking an active daemon's socket
-	if conn, err := net.DialTimeout("unix", s.sockPath, 200*time.Millisecond); err == nil {
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	var d net.Dialer
+	if conn, err := d.DialContext(dialCtx, "unix", s.sockPath); err == nil {
+		dialCancel()
 		_ = conn.Close()
 		return fmt.Errorf("socket %s is already in use by another running daemon", s.sockPath)
 	}
+	dialCancel()
 
 	_ = os.Remove(s.sockPath)
 
-	l, err := net.Listen("unix", s.sockPath)
+	var lc net.ListenConfig
+	l, err := lc.Listen(context.Background(), "unix", s.sockPath)
 	if err != nil {
 		return fmt.Errorf("listen unix socket %s: %w", s.sockPath, err)
 	}

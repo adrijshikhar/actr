@@ -113,7 +113,12 @@ func newRegisterCmd() *cobra.Command {
 			reader := bufio.NewReader(cmd.InOrStdin())
 
 			// Overwrite guard: check if targetDir is known early (single-tenant or explicit --repo-alias)
-			isMultiRepoDir := config.IsMultiRepoConfig(filepath.Join(configDir, "config.yaml"))
+			if repoAlias != "" {
+				if err := config.ValidateRepoAlias(repoAlias); err != nil {
+					return fmt.Errorf("invalid repository alias %q: %w", repoAlias, err)
+				}
+			}
+			isMultiRepoDir := config.IsMultiRepoConfig(filepath.Join(configDir, "config.yaml")) || config.IsMultiRepoConfig(filepath.Join(configDir, "config.yml"))
 			var checkedTargetDir string
 			if repoAlias != "" {
 				checkedTargetDir = filepath.Join(configDir, "repos", repoAlias)
@@ -185,11 +190,12 @@ func newRegisterCmd() *cobra.Command {
 			// Parse target for token fetching and browser settings
 			if url != "" {
 				parsedTarget, err := registration.ParseTargetURL(url)
-				if err == nil {
-					target = parsedTarget
-					if strings.HasPrefix(url, "git@") || strings.HasPrefix(url, "ssh://") {
-						url = target.WebURL
-					}
+				if err != nil {
+					return fmt.Errorf("invalid repository url: %w", err)
+				}
+				target = parsedTarget
+				if strings.HasPrefix(url, "git@") || strings.HasPrefix(url, "ssh://") {
+					url = target.WebURL
 				}
 			}
 
@@ -284,8 +290,12 @@ func newRegisterCmd() *cobra.Command {
 							_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Please open in your browser: %s\nPaste registration token below:\n", settingsURL)
 						}
 					}
+					var pwdReader *bufio.Reader
+					if cmd.InOrStdin() != os.Stdin || !registration.IsTerminal(os.Stdin.Fd()) {
+						pwdReader = reader
+					}
 					promptedToken, err := registration.PromptPassword(
-						reader,
+						pwdReader,
 						cmd.OutOrStdout(),
 						"Enter runner registration token",
 					)

@@ -254,3 +254,21 @@ func TestDetectGitRemote(t *testing.T) {
 		assert.Equal(t, ScopeRepo, target.Scope)
 	})
 }
+
+func TestParseTargetURL_HandlesIPv6AndRejectsFlagAndTraversalPayloads(t *testing.T) {
+	info, err := ParseTargetURL("https://[::1]:443/org/repo")
+	require.NoError(t, err)
+	assert.Equal(t, "::1", info.Host)
+
+	_, err = ParseTargetURL("git@--output=/tmp/x:owner/../../orgs/victim")
+	require.Error(t, err)
+
+	_, err = ParseTargetURL("javascript://evil.com/a/b")
+	require.Error(t, err)
+
+	_, err = ParseTargetURL("https://github.com/--flag/repo")
+	require.Error(t, err)
+
+	_, err = ParseTargetURL("https://github.com/owner/..%2f..%2fvictim")
+	require.Error(t, err)
+}
