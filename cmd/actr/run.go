@@ -23,6 +23,7 @@ import (
 	"github.com/adrijshikhar/actr/internal/history"
 	"github.com/adrijshikhar/actr/internal/logger"
 	"github.com/adrijshikhar/actr/internal/monitor"
+	"github.com/adrijshikhar/actr/internal/power"
 	"github.com/adrijshikhar/actr/internal/protocol"
 	"github.com/adrijshikhar/actr/internal/registration"
 	"github.com/adrijshikhar/actr/internal/supervisor"
@@ -455,13 +456,19 @@ func newRunCmd() *cobra.Command {
 			httpClient := HTTPClientFromContext(ctx)
 			brokerClient := BrokerClientFromContext(ctx)
 			if brokerClient == nil {
-				brokerClient = protocol.NewBrokerClient(httpClient, brokerURL, creds.AuthorizationURL, creds.ClientID, privKey)
+				brokerClient = protocol.NewBrokerClient(httpClient, brokerURL, creds.AuthorizationURL, creds.ClientID, privKey).
+					WithSessionStatePath(filepath.Join(cfgDir, ".session"))
 			}
 
 			runServiceClient := RunServiceClientFromContext(ctx)
 			if runServiceClient == nil {
 				runServiceClient = protocol.NewRunServiceClient(httpClient)
 			}
+
+			powerMgr := power.NewManager()
+			defer func() {
+				_ = powerMgr.Close()
+			}()
 
 			coord := CoordinatorFromContext(ctx)
 			if coord == nil {
@@ -480,6 +487,7 @@ func newRunCmd() *cobra.Command {
 					WithRunnerName(cfg.AgentName).
 					WithRepoAlias(alias).
 					WithRepositoryURL(cfg.GitHubURL).
+					WithPowerManager(powerMgr).
 					WithOutput(cmd.OutOrStdout(), cmd.ErrOrStderr())
 				if dockerDrv != nil {
 					coordEngine = coordEngine.WithDockerDriver(dockerDrv)
@@ -511,6 +519,7 @@ func newRunCmd() *cobra.Command {
 					if otelMgr != nil {
 						c.WithTracer(otelMgr)
 					}
+					c.WithPowerManager(powerMgr)
 					var vCfg *config.VaultYAMLConfig
 					if yamlCfg != nil {
 						vCfg = &yamlCfg.Vault
@@ -626,7 +635,7 @@ func newRunCmd() *cobra.Command {
 						logger.Info("shutting down runner daemon")
 						return nil
 					}
-					if strings.Contains(err.Error(), "RunnerSessionInvalid") || strings.Contains(err.Error(), "Runner session is invalid") {
+					if protocol.IsSessionInvalidError(err) {
 						logger.Warn("broker session invalidated; recreating broker session", "agentName", cfg.AgentName)
 						if sessErr := brokerClient.CreateSession(ctx, cfg.AgentName, cfg.AgentID, cfg.PoolID); sessErr != nil {
 							logger.Error("failed to recreate broker session", "error", sessErr)
@@ -689,55 +698,25 @@ func newRunCmd() *cobra.Command {
 					}
 				}
 
-				jobSpec, err := runServiceClient.AcquireJob(ctx, runServiceURL, reqRef.RunnerRequestID, reqRef.BillingOwnerID, token)
-				if err != nil {
-					logger.Error("failed to acquire job", "error", err)
-					if onceFlag {
-						return fmt.Errorf("acquire job: %w", err)
-					}
+				executed, jobErr := executeSingleTenantJob(
+					ctx,
+					powerMgr,
+					runServiceClient,
+					coord,
+					runServiceURL,
+					reqRef,
+					token,
+					onceFlag,
+				)
+				if jobErr != nil {
+					return jobErr
+				}
+				if !executed {
 					continue
 				}
-
-				logger.Info("acquired job", "jobId", jobSpec.JobID, "jobName", jobSpec.JobName)
-
-				jobToken := token
-				if jobSpec.JobToken != "" {
-					jobToken = jobSpec.JobToken
-				} else if jt, ok := jobSpec.Variables["system.accessToken"]; ok && jt != "" {
-					jobToken = jt
-				} else if jt, ok := jobSpec.Variables["ACTIONS_RUNTIME_TOKEN"]; ok && jt != "" {
-					jobToken = jt
-				}
-
-				completeReq, execErr := coord.ExecuteJob(ctx, jobSpec, runServiceURL, jobToken)
-				if execErr != nil {
-					logger.Error("job execution encountered error", "error", execErr)
-				}
-
-				if completeReq == nil && jobSpec != nil {
-					completeReq = &protocol.CompleteJobRequest{
-						PlanID:      jobSpec.PlanID,
-						JobID:       jobSpec.JobID,
-						Conclusion:  "failure",
-						Outputs:     map[string]string{},
-						StepResults: []protocol.StepResult{},
-					}
-				}
-
-				if completeReq != nil {
-					completeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-					if completeErr := runServiceClient.CompleteJob(completeCtx, runServiceURL, jobToken, completeReq); completeErr != nil {
-						logger.Error("failed to report job completion", "error", completeErr)
-						if execErr == nil {
-							execErr = fmt.Errorf("complete job: %w", completeErr)
-						}
-					}
-					cancel()
-				}
-
 				if onceFlag {
 					logger.Info("once flag set; exiting after single job execution")
-					return execErr
+					return nil
 				}
 			}
 		},
@@ -759,6 +738,68 @@ func newRunCmd() *cobra.Command {
 	_ = cmd.MarkFlagDirname("runs-dir")
 
 	return cmd
+}
+
+func executeSingleTenantJob(
+	ctx context.Context,
+	powerMgr *power.Manager,
+	runServiceClient RunServiceClient,
+	coord JobCoordinator,
+	runServiceURL string,
+	reqRef protocol.JobRequestReference,
+	token string,
+	onceFlag bool,
+) (bool, error) {
+	releaseSleep := powerMgr.Acquire()
+	defer releaseSleep()
+
+	jobSpec, err := runServiceClient.AcquireJob(ctx, runServiceURL, reqRef.RunnerRequestID, reqRef.BillingOwnerID, token)
+	if err != nil {
+		logger.Error("failed to acquire job", "error", err)
+		if onceFlag {
+			return false, fmt.Errorf("acquire job: %w", err)
+		}
+		return false, nil
+	}
+
+	logger.Info("acquired job", "jobId", jobSpec.JobID, "jobName", jobSpec.JobName)
+
+	jobToken := token
+	if jobSpec.JobToken != "" {
+		jobToken = jobSpec.JobToken
+	} else if jt, ok := jobSpec.Variables["system.accessToken"]; ok && jt != "" {
+		jobToken = jt
+	} else if jt, ok := jobSpec.Variables["ACTIONS_RUNTIME_TOKEN"]; ok && jt != "" {
+		jobToken = jt
+	}
+
+	completeReq, execErr := coord.ExecuteJob(ctx, jobSpec, runServiceURL, jobToken)
+	if execErr != nil {
+		logger.Error("job execution encountered error", "error", execErr)
+	}
+
+	if completeReq == nil && jobSpec != nil {
+		completeReq = &protocol.CompleteJobRequest{
+			PlanID:      jobSpec.PlanID,
+			JobID:       jobSpec.JobID,
+			Conclusion:  "failure",
+			Outputs:     map[string]string{},
+			StepResults: []protocol.StepResult{},
+		}
+	}
+
+	if completeReq != nil {
+		completeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		if completeErr := runServiceClient.CompleteJob(completeCtx, runServiceURL, jobToken, completeReq); completeErr != nil {
+			logger.Error("failed to report job completion", "error", completeErr)
+			if execErr == nil {
+				execErr = fmt.Errorf("complete job: %w", completeErr)
+			}
+		}
+		cancel()
+	}
+
+	return true, execErr
 }
 
 func resolveLimits(cmd *cobra.Command, yamlCfg *config.RunnerYAMLConfig, ctxLimits *config.LimitsConfig, cpuFlag, memoryFlag string, pidsFlag int) (*config.LimitsConfig, error) {

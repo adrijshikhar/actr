@@ -11,9 +11,14 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1182,4 +1187,151 @@ func TestBrokerClient_PropagatesRefreshErr(t *testing.T) {
 	err = bc.AcknowledgeMessage(context.Background(), "req-1")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "refresh oauth token")
+}
+
+func TestBrokerClient_CreateSession_DeletesPersistedStaleSessionOn409(t *testing.T) {
+	key, err := GenerateRSAKeyPair(2048)
+	require.NoError(t, err)
+
+	tmpDir := t.TempDir()
+	sessionFile := filepath.Join(tmpDir, ".session")
+	require.NoError(t, os.WriteFile(sessionFile, []byte("stale-sess-999"), 0600))
+
+	authSrv := setupMockOAuthServer(t)
+	defer authSrv.Close()
+
+	var deletedID string
+	var postCount atomic.Int32
+	brokerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			n := postCount.Add(1)
+			if n == 1 && deletedID == "" {
+				http.Error(w, "session conflict", http.StatusConflict)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"sessionId": "fresh-sess-123"})
+		case http.MethodDelete:
+			deletedID = r.URL.Query().Get("sessionId")
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer brokerSrv.Close()
+
+	bc := NewBrokerClient(brokerSrv.Client(), brokerSrv.URL, authSrv.URL, "cid", key).
+		WithSessionStatePath(sessionFile)
+	bc.conflictRetryBase = 5 * time.Millisecond
+
+	require.NoError(t, bc.CreateSession(context.Background(), "agent", 1, 1))
+	assert.Equal(t, "stale-sess-999", deletedID)
+	assert.Equal(t, "fresh-sess-123", bc.SessionID())
+
+	// Verify persisted file now holds the new session ID
+	data, err := os.ReadFile(sessionFile)
+	require.NoError(t, err)
+	assert.Equal(t, "fresh-sess-123", string(data))
+
+	// DeleteSession clears both memory and persisted state file
+	require.NoError(t, bc.DeleteSession(context.Background()))
+	assert.Equal(t, "fresh-sess-123", deletedID)
+	_, err = os.Stat(sessionFile)
+	assert.True(t, os.IsNotExist(err))
+}
+
+func TestBrokerClient_CreateSession_409ExponentialBackoffAnd401Refresh(t *testing.T) {
+	key, err := GenerateRSAKeyPair(2048)
+	require.NoError(t, err)
+
+	var authCalls atomic.Int32
+	authSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := authCalls.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": fmt.Sprintf("tok-%d", n),
+			"expires_in":   60,
+		})
+	}))
+	defer authSrv.Close()
+
+	var postCalls atomic.Int32
+	brokerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := postCalls.Add(1)
+		switch n {
+		case 1:
+			http.Error(w, "conflict 1", http.StatusConflict)
+		case 2:
+			http.Error(w, "token rejected", http.StatusUnauthorized)
+		case 3:
+			assert.Equal(t, "Bearer tok-2", r.Header.Get("Authorization"))
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"sessionId": "recovered-sess"})
+		default:
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+		}
+	}))
+	defer brokerSrv.Close()
+
+	bc := NewBrokerClient(brokerSrv.Client(), brokerSrv.URL, authSrv.URL, "cid", key)
+	bc.conflictRetryBase = 5 * time.Millisecond
+	bc.conflictMaxRetries = 4
+
+	require.NoError(t, bc.CreateSession(context.Background(), "agent", 1, 1))
+	assert.Equal(t, int32(3), postCalls.Load())
+	assert.Equal(t, int32(2), authCalls.Load())
+	assert.Equal(t, "recovered-sess", bc.SessionID())
+}
+
+func TestProtocol_ErrorClassifiers(t *testing.T) {
+	assert.False(t, IsSessionInvalidError(nil))
+	assert.True(t, IsSessionInvalidError(errors.New("RunnerSessionInvalid: expired")))
+	assert.True(t, IsSessionInvalidError(errors.New("no active session")))
+	assert.True(t, IsSessionInvalidError(&HTTPStatusError{Action: "get message", StatusCode: http.StatusNotFound}))
+	assert.True(t, IsSessionInvalidError(&HTTPStatusError{Action: "get message", StatusCode: http.StatusGone}))
+	assert.False(t, IsSessionInvalidError(&HTTPStatusError{Action: "get message", StatusCode: http.StatusInternalServerError}))
+
+	assert.False(t, IsJobCancelledOrGoneError(nil))
+	assert.True(t, IsJobCancelledOrGoneError(&HTTPStatusError{Action: "renew job", StatusCode: http.StatusNotFound}))
+	assert.True(t, IsJobCancelledOrGoneError(&HTTPStatusError{Action: "renew job", StatusCode: http.StatusGone}))
+	assert.True(t, IsJobCancelledOrGoneError(&HTTPStatusError{Action: "renew job", StatusCode: http.StatusConflict}))
+	assert.True(t, IsJobCancelledOrGoneError(errors.New("job cancelled on server")))
+	assert.False(t, IsJobCancelledOrGoneError(&HTTPStatusError{Action: "renew job", StatusCode: http.StatusBadGateway}))
+
+	assert.False(t, IsUnauthorizedError(nil))
+	assert.True(t, IsUnauthorizedError(&HTTPStatusError{Action: "renew job", StatusCode: http.StatusUnauthorized}))
+	assert.False(t, IsUnauthorizedError(&HTTPStatusError{Action: "renew job", StatusCode: http.StatusForbidden}))
+}
+
+func TestBrokerClient_CheckSleepWallGap_FlushesIdleConnections(t *testing.T) {
+	var connCount atomic.Int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			connCount.Add(1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	bc := NewBrokerClient(srv.Client(), srv.URL, "", "cid", nil)
+	bc.mu.Lock()
+	bc.sessionID = "sess-wake"
+	bc.mu.Unlock()
+
+	// Normal consecutive polls reuse the same keep-alive connection
+	_, err := bc.GetMessage(context.Background(), "3.0.0", "macOS", "ARM64")
+	require.NoError(t, err)
+	_, err = bc.GetMessage(context.Background(), "3.0.0", "macOS", "ARM64")
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), connCount.Load())
+
+	// Simulate wall-clock jump > sleepWallGapThresholdSec (e.g. host slept)
+	bc.lastPollWallUnix.Store(time.Now().Unix() - sleepWallGapThresholdSec - 30)
+
+	_, err = bc.GetMessage(context.Background(), "3.0.0", "macOS", "ARM64")
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), connCount.Load())
 }

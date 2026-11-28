@@ -117,6 +117,10 @@ func TestRunCommand_MissingCredentials(t *testing.T) {
 func TestRunCommand_GracefulShutdown(t *testing.T) {
 	var sessionCreated, sessionDeleted atomic.Bool
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var pollOnce sync.Once
+
 	rawAESKey := make([]byte, 32)
 	if _, err := rand.Read(rawAESKey); err != nil {
 		t.Fatalf("rand read: %v", err)
@@ -138,7 +142,8 @@ func TestRunCommand_GracefulShutdown(t *testing.T) {
 			sessionDeleted.Store(true)
 			w.WriteHeader(http.StatusOK)
 		case r.URL.Path == "/message":
-			// Block until request context is canceled
+			// Cancel daemon context once long-poll begins to guarantee session creation and startup finished.
+			pollOnce.Do(cancel)
 			<-r.Context().Done()
 			w.WriteHeader(http.StatusNoContent)
 		default:
@@ -154,9 +159,9 @@ func TestRunCommand_GracefulShutdown(t *testing.T) {
 	}
 	encKeyStr = base64.StdEncoding.EncodeToString(encAESKey)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	// Cancel after 200ms to test graceful shutdown
-	time.AfterFunc(200*time.Millisecond, cancel)
+	// Safety net so test cannot hang if startup fails before polling.
+	safetyTimer := time.AfterFunc(10*time.Second, cancel)
+	defer safetyTimer.Stop()
 
 	var stdout, stderr bytes.Buffer
 	code := dispatchWithContext(ctx, []string{"run", "--config-dir", configDir}, &stdout, &stderr)

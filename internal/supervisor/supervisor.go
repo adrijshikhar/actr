@@ -10,6 +10,7 @@ import (
 	"github.com/adrijshikhar/actr/internal/config"
 	"github.com/adrijshikhar/actr/internal/logger"
 	"github.com/adrijshikhar/actr/internal/monitor"
+	"github.com/adrijshikhar/actr/internal/power"
 	"github.com/adrijshikhar/actr/internal/telemetry"
 )
 
@@ -23,6 +24,7 @@ type Supervisor struct {
 	resMgr        *ResourceManager
 	monServer     *monitor.Server
 	tracer        *telemetry.Manager
+	powerMgr      *power.Manager
 	workers       map[string]*RepoWorker
 	pollingCtx    context.Context
 	pollingCancel context.CancelFunc
@@ -49,12 +51,16 @@ func NewSupervisor(cfg *config.SupervisorConfig, sockPath string) (*Supervisor, 
 		monServer = monitor.NewServer(sockPath, "actr • multi-repo")
 	}
 
+	powerMgr := power.NewManager()
+
 	workers := make(map[string]*RepoWorker, len(cfg.Repos))
 	for alias, repoCfg := range cfg.Repos {
 		w, err := NewRepoWorker(alias, repoCfg, resMgr, monServer)
 		if err != nil {
+			_ = powerMgr.Close()
 			return nil, fmt.Errorf("create worker for %q: %w", alias, err)
 		}
+		w.WithPowerManager(powerMgr)
 		workers[alias] = w
 	}
 
@@ -63,6 +69,7 @@ func NewSupervisor(cfg *config.SupervisorConfig, sockPath string) (*Supervisor, 
 		sockPath:  sockPath,
 		resMgr:    resMgr,
 		monServer: monServer,
+		powerMgr:  powerMgr,
 		workers:   workers,
 	}
 	sup.updateMonitorStatus()
@@ -208,9 +215,13 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	// 4. Stop monitor server
 	s.mu.RLock()
 	monServer := s.monServer
+	powerMgr := s.powerMgr
 	s.mu.RUnlock()
 	if monServer != nil {
 		_ = monServer.Stop()
+	}
+	if powerMgr != nil {
+		_ = powerMgr.Close()
 	}
 
 	s.mu.Lock()
@@ -259,6 +270,9 @@ func (s *Supervisor) Reload(newCfg *config.SupervisorConfig) error {
 			}
 			if s.tracer != nil {
 				w.WithTracer(s.tracer)
+			}
+			if s.powerMgr != nil {
+				w.WithPowerManager(s.powerMgr)
 			}
 			replacementWorkers[alias] = w
 		}

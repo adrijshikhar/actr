@@ -22,6 +22,7 @@ import (
 	"github.com/adrijshikhar/actr/internal/config"
 	"github.com/adrijshikhar/actr/internal/driver"
 	"github.com/adrijshikhar/actr/internal/monitor"
+	"github.com/adrijshikhar/actr/internal/power"
 	"github.com/adrijshikhar/actr/internal/protocol"
 	"github.com/adrijshikhar/actr/internal/telemetry"
 	"github.com/adrijshikhar/actr/internal/vault"
@@ -54,6 +55,7 @@ type Coordinator struct {
 	actionResolver    action.Resolver
 	nodeDetector      action.NodeDetector
 	vault             vault.Provider
+	powerMgr          *power.Manager
 	mu                sync.RWMutex
 }
 
@@ -135,6 +137,14 @@ func (c *Coordinator) WithVault(v vault.Provider) *Coordinator {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.vault = v
+	return c
+}
+
+// WithPowerManager configures the sleep assertion manager used to keep the host awake during job execution.
+func (c *Coordinator) WithPowerManager(pm *power.Manager) *Coordinator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.powerMgr = pm
 	return c
 }
 
@@ -409,12 +419,22 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	colorEnabled := c.colorEnabled
 	runnerName := c.runnerName
 	renewInterval := c.renewInterval
+	powerMgr := c.powerMgr
 	c.mu.RUnlock()
 
+	if powerMgr != nil {
+		releaseSleep := powerMgr.Acquire()
+		defer releaseSleep()
+	}
+
+	var cancelExec context.CancelFunc
+	ctx, cancelExec = context.WithCancel(ctx)
+	defer cancelExec()
+
 	if limits != nil && limits.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, limits.Timeout)
-		defer cancel()
+		var timeoutCancel context.CancelFunc
+		ctx, timeoutCancel = context.WithTimeout(ctx, limits.Timeout)
+		defer timeoutCancel()
 	}
 
 	jobID := job.JobID
@@ -821,6 +841,15 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 	cumulativeEnv["GITHUB_WORKSPACE"] = jobWorkspace
 	cumulativeEnv["CI"] = "true"
 	cumulativeEnv["GITHUB_ACTIONS"] = "true"
+	if cumulativeEnv["GIT_TERMINAL_PROMPT"] == "" {
+		cumulativeEnv["GIT_TERMINAL_PROMPT"] = "0"
+	}
+	if cumulativeEnv["GCM_INTERACTIVE"] == "" {
+		cumulativeEnv["GCM_INTERACTIVE"] = "never"
+	}
+	if cumulativeEnv["DEBIAN_FRONTEND"] == "" {
+		cumulativeEnv["DEBIAN_FRONTEND"] = "noninteractive"
+	}
 	if job.JobName != "" {
 		cumulativeEnv["GITHUB_JOB"] = job.JobName
 	} else if job.JobID != "" {
@@ -890,14 +919,34 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 			defer renewWg.Done()
 			ticker := time.NewTicker(renewInterval)
 			defer ticker.Stop()
+			consecutiveUnauthorized := 0
 			for {
 				select {
 				case <-renewCtx.Done():
 					return
 				case <-ticker.C:
 					reqCtx, reqCancel := context.WithTimeout(renewCtx, 30*time.Second)
-					_, _ = c.runClient.RenewJob(reqCtx, runServiceURL, job.PlanID, job.JobID, token)
+					_, renewErr := c.runClient.RenewJob(reqCtx, runServiceURL, job.PlanID, job.JobID, token)
 					reqCancel()
+					if renewErr == nil {
+						consecutiveUnauthorized = 0
+						continue
+					}
+					if protocol.IsJobCancelledOrGoneError(renewErr) {
+						c.NotifyJobStepLog(jobID, "", fmt.Sprintf("::warning::Job lease lost or cancelled on server (%v); cancelling execution", renewErr))
+						cancelExec()
+						return
+					}
+					if protocol.IsUnauthorizedError(renewErr) {
+						consecutiveUnauthorized++
+						if consecutiveUnauthorized >= 3 {
+							c.NotifyJobStepLog(jobID, "", fmt.Sprintf("::warning::Job lease authorization rejected repeatedly (%v); cancelling execution", renewErr))
+							cancelExec()
+							return
+						}
+					} else {
+						consecutiveUnauthorized = 0
+					}
 				}
 			}
 		}()

@@ -86,6 +86,10 @@ func GenerateDarwinPlist(binPath, workDir string) string {
     <string>%s/daemon.log</string>
     <key>StandardErrorPath</key>
     <string>%s/daemon.log</string>
+    <key>ProcessType</key>
+    <string>Standard</string>
+    <key>Nice</key>
+    <integer>0</integer>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>

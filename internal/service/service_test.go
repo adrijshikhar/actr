@@ -11,6 +11,12 @@ func TestServiceManifestGeneration(t *testing.T) {
 	if !strings.Contains(manifest, "com.github.actr") || !strings.Contains(manifest, "/usr/local/bin/actr") || !strings.Contains(manifest, "--config-dir") {
 		t.Fatalf("invalid launchd plist: %s", manifest)
 	}
+	if !strings.Contains(manifest, "<key>ProcessType</key>\n    <string>Standard</string>") {
+		t.Fatalf("expected ProcessType Standard in launchd plist: %s", manifest)
+	}
+	if !strings.Contains(manifest, "<key>Nice</key>\n    <integer>0</integer>") {
+		t.Fatalf("expected Nice 0 in launchd plist: %s", manifest)
+	}
 
 	unit := GenerateLinuxUnit("/usr/local/bin/actr", "/home/user/.actr")
 	if !strings.Contains(unit, "[Service]") || !strings.Contains(unit, "/usr/local/bin/actr") || !strings.Contains(unit, "--config-dir") {

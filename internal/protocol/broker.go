@@ -13,13 +13,78 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-const maxDrainBytes = 4096
+const (
+	maxDrainBytes            = 4096
+	defaultConflictRetryBase = 2 * time.Second
+	defaultConflictRetryCap  = 10 * time.Second
+	defaultConflictMaxTries  = 9
+	sleepWallGapThresholdSec = 120
+)
+
+// HTTPStatusError represents a non-2xx HTTP response returned by a backend service.
+type HTTPStatusError struct {
+	Action     string
+	StatusCode int
+	Body       string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("%s returned status %d: %s", e.Action, e.StatusCode, e.Body)
+}
+
+// IsSessionInvalidError reports whether err indicates the broker session is missing or expired.
+func IsSessionInvalidError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var httpErr *HTTPStatusError
+	if errors.As(err, &httpErr) {
+		if httpErr.StatusCode == http.StatusNotFound || httpErr.StatusCode == http.StatusGone {
+			return true
+		}
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "RunnerSessionInvalid") ||
+		strings.Contains(msg, "Runner session is invalid") ||
+		strings.Contains(msg, "no active session")
+}
+
+// IsJobCancelledOrGoneError reports whether err from RenewJob indicates the job is permanently
+// gone or cancelled on the GitHub Actions server (e.g. timed out while asleep).
+func IsJobCancelledOrGoneError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var httpErr *HTTPStatusError
+	if errors.As(err, &httpErr) {
+		switch httpErr.StatusCode {
+		case http.StatusNotFound, http.StatusGone, http.StatusConflict:
+			return true
+		}
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "cancelled") ||
+		strings.Contains(lower, "canceled") ||
+		strings.Contains(lower, "expired")
+}
+
+// IsUnauthorizedError reports whether err represents an HTTP 401 Unauthorized response.
+func IsUnauthorizedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var httpErr *HTTPStatusError
+	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusUnauthorized
+}
 
 func newDefaultHTTPClient(totalTimeout time.Duration) *http.Client {
 	if totalTimeout <= 0 {
@@ -226,18 +291,23 @@ func (m *BrokerMessage) UnmarshalJSON(data []byte) error {
 
 // BrokerClient manages sessions and long-polling message retrieval with the GitHub Actions Broker.
 type BrokerClient struct {
-	mu             sync.RWMutex
-	refreshMu      sync.Mutex
-	client         *http.Client
-	brokerURL      string
-	authURL        string
-	clientID       string
-	privateKey     *rsa.PrivateKey
-	sessionKey     []byte
-	sessionID      string
-	token          string
-	tokenExpiresAt time.Time
-	poolID         int64
+	mu                 sync.RWMutex
+	refreshMu          sync.Mutex
+	sessionFileMu      sync.Mutex
+	client             *http.Client
+	brokerURL          string
+	authURL            string
+	clientID           string
+	privateKey         *rsa.PrivateKey
+	sessionKey         []byte
+	sessionID          string
+	sessionStatePath   string
+	token              string
+	tokenExpiresAt     time.Time
+	poolID             int64
+	lastPollWallUnix   atomic.Int64
+	conflictRetryBase  time.Duration
+	conflictMaxRetries int
 }
 
 // NewBrokerClient creates a new BrokerClient instance.
@@ -246,11 +316,70 @@ func NewBrokerClient(client *http.Client, brokerURL, authURL, clientID string, k
 		client = newDefaultHTTPClient(90 * time.Second)
 	}
 	return &BrokerClient{
-		client:     client,
-		brokerURL:  strings.TrimRight(brokerURL, "/"),
-		authURL:    strings.TrimRight(authURL, "/"),
-		clientID:   clientID,
-		privateKey: key,
+		client:             client,
+		brokerURL:          strings.TrimRight(brokerURL, "/"),
+		authURL:            strings.TrimRight(authURL, "/"),
+		clientID:           clientID,
+		privateKey:         key,
+		conflictRetryBase:  defaultConflictRetryBase,
+		conflictMaxRetries: defaultConflictMaxTries,
+	}
+}
+
+// WithSessionStatePath configures a file path used to persist the active broker session ID
+// so stale sessions left behind by abrupt daemon termination can be deleted on restart.
+func (b *BrokerClient) WithSessionStatePath(path string) *BrokerClient {
+	b.sessionFileMu.Lock()
+	b.sessionStatePath = path
+	b.sessionFileMu.Unlock()
+	return b
+}
+
+func (b *BrokerClient) persistSessionID(sessionID string) {
+	b.sessionFileMu.Lock()
+	defer b.sessionFileMu.Unlock()
+	if b.sessionStatePath == "" || sessionID == "" {
+		return
+	}
+	if dir := filepath.Dir(b.sessionStatePath); dir != "" && dir != "." {
+		_ = os.MkdirAll(dir, 0700)
+	}
+	_ = os.WriteFile(b.sessionStatePath, []byte(sessionID), 0600)
+}
+
+func (b *BrokerClient) loadPersistedSessionID() string {
+	b.sessionFileMu.Lock()
+	defer b.sessionFileMu.Unlock()
+	if b.sessionStatePath == "" {
+		return ""
+	}
+	data, err := os.ReadFile(b.sessionStatePath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func (b *BrokerClient) clearPersistedSessionID() {
+	b.sessionFileMu.Lock()
+	defer b.sessionFileMu.Unlock()
+	if b.sessionStatePath == "" {
+		return
+	}
+	_ = os.Remove(b.sessionStatePath)
+}
+
+func (b *BrokerClient) closeIdleConnectionsOnSleepOrErr(err error, ctx context.Context) {
+	if b.client != nil && err != nil && (ctx == nil || ctx.Err() == nil) {
+		b.client.CloseIdleConnections()
+	}
+}
+
+func (b *BrokerClient) checkSleepWallGap() {
+	nowUnix := time.Now().Unix()
+	prev := b.lastPollWallUnix.Swap(nowUnix)
+	if b.client != nil && prev > 0 && nowUnix-prev > sleepWallGapThresholdSec {
+		b.client.CloseIdleConnections()
 	}
 }
 
@@ -337,52 +466,105 @@ func (b *BrokerClient) CreateSession(ctx context.Context, agentName string, agen
 	var statusCode int
 	var respBody []byte
 
-	doAttempt := func() (int, []byte, error) {
+	doAttempt := func() (int, []byte, string, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(jsonBytes))
 		if err != nil {
-			return 0, nil, fmt.Errorf("create session request: %w", err)
+			return 0, nil, "", fmt.Errorf("create session request: %w", err)
 		}
-		if tok := b.Token(); tok != "" {
-			req.Header.Set("Authorization", "Bearer "+tok)
+		usedToken := b.Token()
+		if usedToken != "" {
+			req.Header.Set("Authorization", "Bearer "+usedToken)
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json")
 
 		resp, err := b.client.Do(req) //nolint:bodyclose // drainAndClose drains and closes resp.Body
 		if err != nil {
-			return 0, nil, fmt.Errorf("execute session request: %w", err)
+			b.closeIdleConnectionsOnSleepOrErr(err, ctx)
+			return 0, nil, usedToken, fmt.Errorf("execute session request: %w", err)
 		}
 		defer drainAndClose(resp.Body)
 
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		if err != nil {
-			return resp.StatusCode, nil, fmt.Errorf("read session response: %w", err)
+			return resp.StatusCode, nil, usedToken, fmt.Errorf("read session response: %w", err)
 		}
-
-		if resp.StatusCode == http.StatusConflict {
-			return resp.StatusCode, body, nil
-		}
-		return resp.StatusCode, body, nil
+		return resp.StatusCode, body, usedToken, nil
 	}
 
-	for attempt := 0; attempt < 20; attempt++ {
-		statusCode, respBody, err = doAttempt()
+	b.mu.RLock()
+	retryBase := b.conflictRetryBase
+	maxRetries := b.conflictMaxRetries
+	b.mu.RUnlock()
+	if retryBase <= 0 {
+		retryBase = defaultConflictRetryBase
+	}
+	if maxRetries <= 0 {
+		maxRetries = defaultConflictMaxTries
+	}
+
+	attemptedStaleDelete := false
+	refreshedAuth := false
+	conflictRetries := 0
+
+	for {
+		var usedToken string
+		statusCode, respBody, usedToken, err = doAttempt()
 		if err != nil {
 			return err
 		}
-		if statusCode == http.StatusConflict && attempt < 19 {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(3 * time.Second):
+
+		if statusCode == http.StatusUnauthorized && !refreshedAuth && b.authURL != "" && b.privateKey != nil {
+			refreshedAuth = true
+			if refreshErr := b.refreshIfNeeded(ctx, usedToken); refreshErr != nil {
+				return fmt.Errorf("create session returned status %d (refresh token failed: %w)", statusCode, refreshErr)
 			}
 			continue
+		}
+
+		if statusCode == http.StatusConflict {
+			if !attemptedStaleDelete {
+				attemptedStaleDelete = true
+				if staleID := b.loadPersistedSessionID(); staleID != "" {
+					b.clearPersistedSessionID()
+					if delErr := b.deleteSessionByID(ctx, staleID); delErr == nil {
+						continue
+					}
+				}
+			}
+
+			if conflictRetries < maxRetries {
+				delay := retryBase
+				for i := 0; i < conflictRetries && delay < defaultConflictRetryCap; i++ {
+					if delay > defaultConflictRetryCap/2 {
+						delay = defaultConflictRetryCap
+						break
+					}
+					delay *= 2
+				}
+				if delay > defaultConflictRetryCap {
+					delay = defaultConflictRetryCap
+				}
+				conflictRetries++
+				timer := time.NewTimer(delay)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return ctx.Err()
+				case <-timer.C:
+				}
+				continue
+			}
 		}
 		break
 	}
 
 	if statusCode != http.StatusOK && statusCode != http.StatusCreated {
-		return fmt.Errorf("create session returned status %d: %s", statusCode, string(respBody))
+		return &HTTPStatusError{
+			Action:     "create session",
+			StatusCode: statusCode,
+			Body:       string(respBody),
+		}
 	}
 
 	var sessionResp struct {
@@ -419,6 +601,7 @@ func (b *BrokerClient) CreateSession(ctx context.Context, agentName string, agen
 	b.sessionID = sessionResp.SessionID
 	b.poolID = poolID
 	b.mu.Unlock()
+	b.persistSessionID(sessionResp.SessionID)
 	return nil
 }
 
@@ -484,6 +667,7 @@ func (b *BrokerClient) fetchMessage(ctx context.Context, reqURL string) (*Broker
 
 	resp, err := b.client.Do(req) //nolint:bodyclose // drainAndClose drains and closes resp.Body
 	if err != nil {
+		b.closeIdleConnectionsOnSleepOrErr(err, ctx)
 		return nil, 0, usedToken, fmt.Errorf("execute message request: %w", err)
 	}
 	defer drainAndClose(resp.Body)
@@ -498,7 +682,11 @@ func (b *BrokerClient) fetchMessage(ctx context.Context, reqURL string) (*Broker
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, resp.StatusCode, usedToken, fmt.Errorf("get message returned status %d: %s", resp.StatusCode, string(bodyBytes))
+		return nil, resp.StatusCode, usedToken, &HTTPStatusError{
+			Action:     "get message",
+			StatusCode: resp.StatusCode,
+			Body:       string(bodyBytes),
+		}
 	}
 
 	if len(bytes.TrimSpace(bodyBytes)) == 0 {
@@ -573,6 +761,9 @@ func (b *BrokerClient) GetMessage(ctx context.Context, runnerVersion, os, arch s
 	q.Set("disableUpdate", "false")
 	reqURL.RawQuery = q.Encode()
 
+	// Flush stale keep-alive sockets if the host slept between polls (monotonic timers freeze on macOS sleep)
+	b.checkSleepWallGap()
+
 	if err := b.maybeRefreshExpiredToken(ctx); err != nil {
 		return nil, err
 	}
@@ -636,13 +827,18 @@ func (b *BrokerClient) AcknowledgeMessage(ctx context.Context, runnerRequestID s
 
 		resp, err := b.client.Do(req) //nolint:bodyclose // drainAndClose drains and closes resp.Body
 		if err != nil {
+			b.closeIdleConnectionsOnSleepOrErr(err, ctx)
 			return 0, usedToken, fmt.Errorf("execute acknowledge request: %w", err)
 		}
 		defer drainAndClose(resp.Body)
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-			return resp.StatusCode, usedToken, fmt.Errorf("acknowledge message returned status %d: %s", resp.StatusCode, string(body))
+			return resp.StatusCode, usedToken, &HTTPStatusError{
+				Action:     "acknowledge message",
+				StatusCode: resp.StatusCode,
+				Body:       string(body),
+			}
 		}
 		return resp.StatusCode, usedToken, nil
 	}
@@ -661,12 +857,7 @@ func (b *BrokerClient) AcknowledgeMessage(ctx context.Context, runnerRequestID s
 	return err
 }
 
-// DeleteSession terminates the active session with the broker and cleans up local session state.
-func (b *BrokerClient) DeleteSession(ctx context.Context) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	sessionID := b.SessionID()
+func (b *BrokerClient) deleteSessionByID(ctx context.Context, sessionID string) error {
 	if sessionID == "" {
 		return nil
 	}
@@ -698,13 +889,18 @@ func (b *BrokerClient) DeleteSession(ctx context.Context) error {
 
 		resp, err := b.client.Do(req) //nolint:bodyclose // drainAndClose drains and closes resp.Body
 		if err != nil {
+			b.closeIdleConnectionsOnSleepOrErr(err, ctx)
 			return 0, usedToken, fmt.Errorf("execute delete session request: %w", err)
 		}
 		defer drainAndClose(resp.Body)
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-			return resp.StatusCode, usedToken, fmt.Errorf("delete session returned status %d: %s", resp.StatusCode, string(body))
+			return resp.StatusCode, usedToken, &HTTPStatusError{
+				Action:     "delete session",
+				StatusCode: resp.StatusCode,
+				Body:       string(body),
+			}
 		}
 		return resp.StatusCode, usedToken, nil
 	}
@@ -718,7 +914,24 @@ func (b *BrokerClient) DeleteSession(ctx context.Context) error {
 		}
 		_, _, err = doDelete()
 	}
-	if err != nil {
+	return err
+}
+
+// DeleteSession terminates the active session with the broker and cleans up local session state.
+func (b *BrokerClient) DeleteSession(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sessionID := b.SessionID()
+	if sessionID == "" {
+		b.clearPersistedSessionID()
+		return nil
+	}
+	if err := b.deleteSessionByID(ctx, sessionID); err != nil {
+		var httpErr *HTTPStatusError
+		if errors.As(err, &httpErr) && (httpErr.StatusCode == http.StatusNotFound || httpErr.StatusCode == http.StatusGone) {
+			b.clearPersistedSessionID()
+		}
 		return err
 	}
 
@@ -727,5 +940,6 @@ func (b *BrokerClient) DeleteSession(ctx context.Context) error {
 	b.sessionKey = nil
 	b.poolID = 0
 	b.mu.Unlock()
+	b.clearPersistedSessionID()
 	return nil
 }
