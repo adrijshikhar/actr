@@ -698,70 +698,25 @@ func newRunCmd() *cobra.Command {
 					}
 				}
 
-				shouldContinue, loopErr := func() (bool, error) {
-					releaseSleep := powerMgr.Acquire()
-					defer releaseSleep()
-
-					jobSpec, err := runServiceClient.AcquireJob(ctx, runServiceURL, reqRef.RunnerRequestID, reqRef.BillingOwnerID, token)
-					if err != nil {
-						logger.Error("failed to acquire job", "error", err)
-						if onceFlag {
-							return false, fmt.Errorf("acquire job: %w", err)
-						}
-						return true, nil
-					}
-
-					logger.Info("acquired job", "jobId", jobSpec.JobID, "jobName", jobSpec.JobName)
-
-					jobToken := token
-					if jobSpec.JobToken != "" {
-						jobToken = jobSpec.JobToken
-					} else if jt, ok := jobSpec.Variables["system.accessToken"]; ok && jt != "" {
-						jobToken = jt
-					} else if jt, ok := jobSpec.Variables["ACTIONS_RUNTIME_TOKEN"]; ok && jt != "" {
-						jobToken = jt
-					}
-
-					completeReq, execErr := coord.ExecuteJob(ctx, jobSpec, runServiceURL, jobToken)
-					if execErr != nil {
-						logger.Error("job execution encountered error", "error", execErr)
-					}
-
-					if completeReq == nil && jobSpec != nil {
-						completeReq = &protocol.CompleteJobRequest{
-							PlanID:      jobSpec.PlanID,
-							JobID:       jobSpec.JobID,
-							Conclusion:  "failure",
-							Outputs:     map[string]string{},
-							StepResults: []protocol.StepResult{},
-						}
-					}
-
-					if completeReq != nil {
-						completeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-						if completeErr := runServiceClient.CompleteJob(completeCtx, runServiceURL, jobToken, completeReq); completeErr != nil {
-							logger.Error("failed to report job completion", "error", completeErr)
-							if execErr == nil {
-								execErr = fmt.Errorf("complete job: %w", completeErr)
-							}
-						}
-						cancel()
-					}
-
-					if onceFlag {
-						logger.Info("once flag set; exiting after single job execution")
-						return false, execErr
-					}
-					return false, nil
-				}()
-				if loopErr != nil {
-					return loopErr
+				executed, jobErr := executeSingleTenantJob(
+					ctx,
+					powerMgr,
+					runServiceClient,
+					coord,
+					runServiceURL,
+					reqRef,
+					token,
+					onceFlag,
+				)
+				if jobErr != nil {
+					return jobErr
 				}
-				if onceFlag && !shouldContinue {
-					return nil
-				}
-				if shouldContinue {
+				if !executed {
 					continue
+				}
+				if onceFlag {
+					logger.Info("once flag set; exiting after single job execution")
+					return nil
 				}
 			}
 		},
@@ -783,6 +738,68 @@ func newRunCmd() *cobra.Command {
 	_ = cmd.MarkFlagDirname("runs-dir")
 
 	return cmd
+}
+
+func executeSingleTenantJob(
+	ctx context.Context,
+	powerMgr *power.Manager,
+	runServiceClient RunServiceClient,
+	coord JobCoordinator,
+	runServiceURL string,
+	reqRef protocol.JobRequestReference,
+	token string,
+	onceFlag bool,
+) (bool, error) {
+	releaseSleep := powerMgr.Acquire()
+	defer releaseSleep()
+
+	jobSpec, err := runServiceClient.AcquireJob(ctx, runServiceURL, reqRef.RunnerRequestID, reqRef.BillingOwnerID, token)
+	if err != nil {
+		logger.Error("failed to acquire job", "error", err)
+		if onceFlag {
+			return false, fmt.Errorf("acquire job: %w", err)
+		}
+		return false, nil
+	}
+
+	logger.Info("acquired job", "jobId", jobSpec.JobID, "jobName", jobSpec.JobName)
+
+	jobToken := token
+	if jobSpec.JobToken != "" {
+		jobToken = jobSpec.JobToken
+	} else if jt, ok := jobSpec.Variables["system.accessToken"]; ok && jt != "" {
+		jobToken = jt
+	} else if jt, ok := jobSpec.Variables["ACTIONS_RUNTIME_TOKEN"]; ok && jt != "" {
+		jobToken = jt
+	}
+
+	completeReq, execErr := coord.ExecuteJob(ctx, jobSpec, runServiceURL, jobToken)
+	if execErr != nil {
+		logger.Error("job execution encountered error", "error", execErr)
+	}
+
+	if completeReq == nil && jobSpec != nil {
+		completeReq = &protocol.CompleteJobRequest{
+			PlanID:      jobSpec.PlanID,
+			JobID:       jobSpec.JobID,
+			Conclusion:  "failure",
+			Outputs:     map[string]string{},
+			StepResults: []protocol.StepResult{},
+		}
+	}
+
+	if completeReq != nil {
+		completeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		if completeErr := runServiceClient.CompleteJob(completeCtx, runServiceURL, jobToken, completeReq); completeErr != nil {
+			logger.Error("failed to report job completion", "error", completeErr)
+			if execErr == nil {
+				execErr = fmt.Errorf("complete job: %w", completeErr)
+			}
+		}
+		cancel()
+	}
+
+	return true, execErr
 }
 
 func resolveLimits(cmd *cobra.Command, yamlCfg *config.RunnerYAMLConfig, ctxLimits *config.LimitsConfig, cpuFlag, memoryFlag string, pidsFlag int) (*config.LimitsConfig, error) {

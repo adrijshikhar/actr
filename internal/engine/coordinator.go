@@ -937,8 +937,7 @@ func (c *Coordinator) ExecuteJob(ctx context.Context, job *protocol.JobSpecifica
 						cancelExec()
 						return
 					}
-					var httpErr *protocol.HTTPStatusError
-					if errors.As(renewErr, &httpErr) && httpErr.StatusCode == 401 {
+					if protocol.IsUnauthorizedError(renewErr) {
 						consecutiveUnauthorized++
 						if consecutiveUnauthorized >= 3 {
 							c.NotifyJobStepLog(jobID, "", fmt.Sprintf("::warning::Job lease authorization rejected repeatedly (%v); cancelling execution", renewErr))

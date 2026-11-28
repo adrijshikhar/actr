@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1296,4 +1297,41 @@ func TestProtocol_ErrorClassifiers(t *testing.T) {
 	assert.True(t, IsJobCancelledOrGoneError(&HTTPStatusError{Action: "renew job", StatusCode: http.StatusConflict}))
 	assert.True(t, IsJobCancelledOrGoneError(errors.New("job cancelled on server")))
 	assert.False(t, IsJobCancelledOrGoneError(&HTTPStatusError{Action: "renew job", StatusCode: http.StatusBadGateway}))
+
+	assert.False(t, IsUnauthorizedError(nil))
+	assert.True(t, IsUnauthorizedError(&HTTPStatusError{Action: "renew job", StatusCode: http.StatusUnauthorized}))
+	assert.False(t, IsUnauthorizedError(&HTTPStatusError{Action: "renew job", StatusCode: http.StatusForbidden}))
+}
+
+func TestBrokerClient_CheckSleepWallGap_FlushesIdleConnections(t *testing.T) {
+	var connCount atomic.Int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			connCount.Add(1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	bc := NewBrokerClient(srv.Client(), srv.URL, "", "cid", nil)
+	bc.mu.Lock()
+	bc.sessionID = "sess-wake"
+	bc.mu.Unlock()
+
+	// Normal consecutive polls reuse the same keep-alive connection
+	_, err := bc.GetMessage(context.Background(), "3.0.0", "macOS", "ARM64")
+	require.NoError(t, err)
+	_, err = bc.GetMessage(context.Background(), "3.0.0", "macOS", "ARM64")
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), connCount.Load())
+
+	// Simulate wall-clock jump > sleepWallGapThresholdSec (e.g. host slept)
+	bc.lastPollWallUnix.Store(time.Now().Unix() - sleepWallGapThresholdSec - 30)
+
+	_, err = bc.GetMessage(context.Background(), "3.0.0", "macOS", "ARM64")
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), connCount.Load())
 }

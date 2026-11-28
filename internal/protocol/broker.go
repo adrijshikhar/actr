@@ -77,6 +77,15 @@ func IsJobCancelledOrGoneError(err error) bool {
 		strings.Contains(lower, "expired")
 }
 
+// IsUnauthorizedError reports whether err represents an HTTP 401 Unauthorized response.
+func IsUnauthorizedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var httpErr *HTTPStatusError
+	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusUnauthorized
+}
+
 func newDefaultHTTPClient(totalTimeout time.Duration) *http.Client {
 	if totalTimeout <= 0 {
 		totalTimeout = 30 * time.Second
@@ -284,6 +293,7 @@ func (m *BrokerMessage) UnmarshalJSON(data []byte) error {
 type BrokerClient struct {
 	mu                 sync.RWMutex
 	refreshMu          sync.Mutex
+	sessionFileMu      sync.Mutex
 	client             *http.Client
 	brokerURL          string
 	authURL            string
@@ -319,33 +329,31 @@ func NewBrokerClient(client *http.Client, brokerURL, authURL, clientID string, k
 // WithSessionStatePath configures a file path used to persist the active broker session ID
 // so stale sessions left behind by abrupt daemon termination can be deleted on restart.
 func (b *BrokerClient) WithSessionStatePath(path string) *BrokerClient {
-	b.mu.Lock()
+	b.sessionFileMu.Lock()
 	b.sessionStatePath = path
-	b.mu.Unlock()
+	b.sessionFileMu.Unlock()
 	return b
 }
 
 func (b *BrokerClient) persistSessionID(sessionID string) {
-	b.mu.RLock()
-	p := b.sessionStatePath
-	b.mu.RUnlock()
-	if p == "" || sessionID == "" {
+	b.sessionFileMu.Lock()
+	defer b.sessionFileMu.Unlock()
+	if b.sessionStatePath == "" || sessionID == "" {
 		return
 	}
-	if dir := filepath.Dir(p); dir != "" && dir != "." {
+	if dir := filepath.Dir(b.sessionStatePath); dir != "" && dir != "." {
 		_ = os.MkdirAll(dir, 0700)
 	}
-	_ = os.WriteFile(p, []byte(sessionID), 0600)
+	_ = os.WriteFile(b.sessionStatePath, []byte(sessionID), 0600)
 }
 
 func (b *BrokerClient) loadPersistedSessionID() string {
-	b.mu.RLock()
-	p := b.sessionStatePath
-	b.mu.RUnlock()
-	if p == "" {
+	b.sessionFileMu.Lock()
+	defer b.sessionFileMu.Unlock()
+	if b.sessionStatePath == "" {
 		return ""
 	}
-	data, err := os.ReadFile(p)
+	data, err := os.ReadFile(b.sessionStatePath)
 	if err != nil {
 		return ""
 	}
@@ -353,17 +361,16 @@ func (b *BrokerClient) loadPersistedSessionID() string {
 }
 
 func (b *BrokerClient) clearPersistedSessionID() {
-	b.mu.RLock()
-	p := b.sessionStatePath
-	b.mu.RUnlock()
-	if p == "" {
+	b.sessionFileMu.Lock()
+	defer b.sessionFileMu.Unlock()
+	if b.sessionStatePath == "" {
 		return
 	}
-	_ = os.Remove(p)
+	_ = os.Remove(b.sessionStatePath)
 }
 
 func (b *BrokerClient) closeIdleConnectionsOnSleepOrErr(err error, ctx context.Context) {
-	if err != nil && (ctx == nil || ctx.Err() == nil) {
+	if b.client != nil && err != nil && (ctx == nil || ctx.Err() == nil) {
 		b.client.CloseIdleConnections()
 	}
 }
@@ -371,7 +378,7 @@ func (b *BrokerClient) closeIdleConnectionsOnSleepOrErr(err error, ctx context.C
 func (b *BrokerClient) checkSleepWallGap() {
 	nowUnix := time.Now().Unix()
 	prev := b.lastPollWallUnix.Swap(nowUnix)
-	if prev > 0 && nowUnix-prev > sleepWallGapThresholdSec {
+	if b.client != nil && prev > 0 && nowUnix-prev > sleepWallGapThresholdSec {
 		b.client.CloseIdleConnections()
 	}
 }
@@ -527,8 +534,15 @@ func (b *BrokerClient) CreateSession(ctx context.Context, agentName string, agen
 			}
 
 			if conflictRetries < maxRetries {
-				delay := retryBase << conflictRetries
-				if retryBase > 0 && delay > defaultConflictRetryCap {
+				delay := retryBase
+				for i := 0; i < conflictRetries && delay < defaultConflictRetryCap; i++ {
+					if delay > defaultConflictRetryCap/2 {
+						delay = defaultConflictRetryCap
+						break
+					}
+					delay *= 2
+				}
+				if delay > defaultConflictRetryCap {
 					delay = defaultConflictRetryCap
 				}
 				conflictRetries++

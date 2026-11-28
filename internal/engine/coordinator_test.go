@@ -3682,3 +3682,50 @@ func TestCoordinator_RenewJobCancelsOnGoneOrCancelled(t *testing.T) {
 		t.Fatal("expected RenewJob 410 Gone to cancel active step execution context")
 	}
 }
+
+func TestCoordinator_RenewJobConsecutiveUnauthorizedCancels(t *testing.T) {
+	var calls atomic.Int32
+	renewSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Error(w, "bad credentials", http.StatusUnauthorized)
+	}))
+	defer renewSrv.Close()
+
+	runClient := protocol.NewRunServiceClient(renewSrv.Client())
+
+	stepCtxCanceled := make(chan struct{})
+	d := &mockDriver{
+		executeFunc: func(ctx context.Context, step *driver.StepSpec, stdout, stderr io.Writer) (*driver.StepResult, error) {
+			select {
+			case <-ctx.Done():
+				close(stepCtxCanceled)
+				return &driver.StepResult{ExitCode: 1, Error: ctx.Err()}, ctx.Err()
+			case <-time.After(3 * time.Second):
+				return &driver.StepResult{ExitCode: 0}, nil
+			}
+		},
+	}
+
+	c := NewCoordinator(d, runClient, t.TempDir()).
+		WithRenewInterval(15*time.Millisecond).
+		WithStepLogger(false).
+		WithOutput(io.Discard, io.Discard)
+
+	job := &protocol.JobSpecification{
+		PlanID: "plan-1",
+		JobID:  "job-unauth",
+		Steps: []protocol.JobStep{
+			{ID: "step-1", Script: "sleep 10"},
+		},
+	}
+
+	res, err := c.ExecuteJob(context.Background(), job, renewSrv.URL, "tok")
+	require.NoError(t, err)
+	assert.Equal(t, "cancelled", res.Conclusion)
+	assert.GreaterOrEqual(t, calls.Load(), int32(3))
+	select {
+	case <-stepCtxCanceled:
+	case <-time.After(1 * time.Second):
+		t.Fatal("expected 3 consecutive 401 RenewJob responses to cancel active step")
+	}
+}

@@ -1033,7 +1033,7 @@ func (c *RunServiceClient) AcquireJob(ctx context.Context, runServiceURL, runner
 
 	resp, err := c.client.Do(req) //nolint:bodyclose // drainAndClose drains and closes resp.Body
 	if err != nil {
-		if ctx.Err() == nil {
+		if c.client != nil && ctx.Err() == nil {
 			c.client.CloseIdleConnections()
 		}
 		return nil, fmt.Errorf("execute acquire request: %w", err)
@@ -1116,7 +1116,7 @@ func (c *RunServiceClient) RenewJob(ctx context.Context, runServiceURL, planID, 
 
 	resp, err := c.client.Do(req) //nolint:bodyclose // drainAndClose drains and closes resp.Body
 	if err != nil {
-		if ctx.Err() == nil {
+		if c.client != nil && ctx.Err() == nil {
 			c.client.CloseIdleConnections()
 		}
 		return time.Time{}, fmt.Errorf("execute renew request: %w", err)
@@ -1250,7 +1250,7 @@ func (c *RunServiceClient) CompleteJob(ctx context.Context, runServiceURL, token
 
 	resp, err := c.client.Do(httpReq) //nolint:bodyclose // drainAndClose drains and closes resp.Body
 	if err != nil {
-		if ctx.Err() == nil {
+		if c.client != nil && ctx.Err() == nil {
 			c.client.CloseIdleConnections()
 		}
 		return fmt.Errorf("execute complete request: %w", err)
