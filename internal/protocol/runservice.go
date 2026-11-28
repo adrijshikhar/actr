@@ -1033,6 +1033,9 @@ func (c *RunServiceClient) AcquireJob(ctx context.Context, runServiceURL, runner
 
 	resp, err := c.client.Do(req) //nolint:bodyclose // drainAndClose drains and closes resp.Body
 	if err != nil {
+		if ctx.Err() == nil {
+			c.client.CloseIdleConnections()
+		}
 		return nil, fmt.Errorf("execute acquire request: %w", err)
 	}
 	defer drainAndClose(resp.Body)
@@ -1043,7 +1046,11 @@ func (c *RunServiceClient) AcquireJob(ctx context.Context, runServiceURL, runner
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("acquire job returned status %d: %s", resp.StatusCode, string(bodyBytes))
+		return nil, &HTTPStatusError{
+			Action:     "acquire job",
+			StatusCode: resp.StatusCode,
+			Body:       string(bodyBytes),
+		}
 	}
 
 	return ParseAcquiredJob(bodyBytes)
@@ -1109,6 +1116,9 @@ func (c *RunServiceClient) RenewJob(ctx context.Context, runServiceURL, planID, 
 
 	resp, err := c.client.Do(req) //nolint:bodyclose // drainAndClose drains and closes resp.Body
 	if err != nil {
+		if ctx.Err() == nil {
+			c.client.CloseIdleConnections()
+		}
 		return time.Time{}, fmt.Errorf("execute renew request: %w", err)
 	}
 	defer drainAndClose(resp.Body)
@@ -1119,7 +1129,11 @@ func (c *RunServiceClient) RenewJob(ctx context.Context, runServiceURL, planID, 
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return time.Time{}, fmt.Errorf("renew job returned status %d: %s", resp.StatusCode, string(bodyBytes))
+		return time.Time{}, &HTTPStatusError{
+			Action:     "renew job",
+			StatusCode: resp.StatusCode,
+			Body:       string(bodyBytes),
+		}
 	}
 
 	var renewResp struct {
@@ -1236,13 +1250,20 @@ func (c *RunServiceClient) CompleteJob(ctx context.Context, runServiceURL, token
 
 	resp, err := c.client.Do(httpReq) //nolint:bodyclose // drainAndClose drains and closes resp.Body
 	if err != nil {
+		if ctx.Err() == nil {
+			c.client.CloseIdleConnections()
+		}
 		return fmt.Errorf("execute complete request: %w", err)
 	}
 	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return fmt.Errorf("complete job returned status %d: %s", resp.StatusCode, string(bodyBytes))
+		return &HTTPStatusError{
+			Action:     "complete job",
+			StatusCode: resp.StatusCode,
+			Body:       string(bodyBytes),
+		}
 	}
 
 	return nil

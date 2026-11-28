@@ -3609,3 +3609,76 @@ func TestExpressionEvaluator_BuiltinsAndOperators(t *testing.T) {
 	require.NoError(t, os.Symlink(outsideSecret, filepath.Join(ws, "leaked.txt")))
 	assert.Equal(t, "", evaluateExpression("hashFiles('leaked.txt')", ctx))
 }
+
+func TestCoordinator_NonInteractiveDefaultsAndOverride(t *testing.T) {
+	d := &mockDriver{}
+	c := NewCoordinator(d, nil, t.TempDir()).WithStepLogger(false).WithOutput(io.Discard, io.Discard)
+
+	job := &protocol.JobSpecification{
+		PlanID: "p1",
+		JobID:  "j-env",
+		Environment: map[string]string{
+			"DEBIAN_FRONTEND": "dialog",
+		},
+		Steps: []protocol.JobStep{
+			{ID: "step-1", Script: "echo hi"},
+		},
+	}
+
+	res, err := c.ExecuteJob(context.Background(), job, "", "")
+	require.NoError(t, err)
+	require.Equal(t, "success", res.Conclusion)
+	require.Len(t, d.stepsRun, 1)
+
+	env := d.stepsRun[0].Environment
+	assert.Equal(t, "true", env["CI"])
+	assert.Equal(t, "true", env["GITHUB_ACTIONS"])
+	assert.Equal(t, "0", env["GIT_TERMINAL_PROMPT"])
+	assert.Equal(t, "never", env["GCM_INTERACTIVE"])
+	// Workflow job.Environment can override default
+	assert.Equal(t, "dialog", env["DEBIAN_FRONTEND"])
+}
+
+func TestCoordinator_RenewJobCancelsOnGoneOrCancelled(t *testing.T) {
+	renewSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "job lease expired or cancelled", http.StatusGone)
+	}))
+	defer renewSrv.Close()
+
+	runClient := protocol.NewRunServiceClient(renewSrv.Client())
+
+	stepCtxCanceled := make(chan struct{})
+	d := &mockDriver{
+		executeFunc: func(ctx context.Context, step *driver.StepSpec, stdout, stderr io.Writer) (*driver.StepResult, error) {
+			select {
+			case <-ctx.Done():
+				close(stepCtxCanceled)
+				return &driver.StepResult{ExitCode: 1, Error: ctx.Err()}, ctx.Err()
+			case <-time.After(3 * time.Second):
+				return &driver.StepResult{ExitCode: 0}, nil
+			}
+		},
+	}
+
+	c := NewCoordinator(d, runClient, t.TempDir()).
+		WithRenewInterval(20*time.Millisecond).
+		WithStepLogger(false).
+		WithOutput(io.Discard, io.Discard)
+
+	job := &protocol.JobSpecification{
+		PlanID: "plan-1",
+		JobID:  "job-gone",
+		Steps: []protocol.JobStep{
+			{ID: "step-1", Script: "sleep 10"},
+		},
+	}
+
+	res, err := c.ExecuteJob(context.Background(), job, renewSrv.URL, "tok")
+	require.NoError(t, err)
+	assert.Equal(t, "cancelled", res.Conclusion)
+	select {
+	case <-stepCtxCanceled:
+	case <-time.After(1 * time.Second):
+		t.Fatal("expected RenewJob 410 Gone to cancel active step execution context")
+	}
+}

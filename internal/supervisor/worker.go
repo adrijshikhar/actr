@@ -20,6 +20,7 @@ import (
 	"github.com/adrijshikhar/actr/internal/engine"
 	"github.com/adrijshikhar/actr/internal/logger"
 	"github.com/adrijshikhar/actr/internal/monitor"
+	"github.com/adrijshikhar/actr/internal/power"
 	"github.com/adrijshikhar/actr/internal/protocol"
 	"github.com/adrijshikhar/actr/internal/telemetry"
 	"github.com/adrijshikhar/actr/internal/vault"
@@ -56,6 +57,7 @@ type RepoWorker struct {
 	runServiceClient RunServiceClientInterface
 	coordinator      JobExecutor
 	tracer           *telemetry.Manager
+	powerMgr         *power.Manager
 	repoSem          chan struct{}
 	executingJobs    atomic.Int32
 	workFolder       string
@@ -123,7 +125,11 @@ func NewRepoWorker(alias string, repoCfg config.RepoConfig, resMgr *ResourceMana
 					} else if privKey, err := protocol.ParseRSAPrivateKey(&rsaParams); err != nil {
 						logger.Warn("failed to parse RSA private key", "repo", alias, "error", err)
 					} else {
-						w.brokerClient = protocol.NewBrokerClient(nil, brokerURL, creds.AuthorizationURL, creds.ClientID, privKey)
+						bc := protocol.NewBrokerClient(nil, brokerURL, creds.AuthorizationURL, creds.ClientID, privKey)
+						if repoCfg.ConfigDir != "" {
+							bc.WithSessionStatePath(filepath.Join(repoCfg.ConfigDir, ".session"))
+						}
+						w.brokerClient = bc
 					}
 				}
 			}
@@ -207,6 +213,17 @@ func (w *RepoWorker) WithTracer(tm *telemetry.Manager) *RepoWorker {
 	w.tracer = tm
 	if c, ok := w.coordinator.(*engine.Coordinator); ok && tm != nil {
 		c.WithTracer(tm)
+	}
+	return w
+}
+
+// WithPowerManager configures the shared sleep assertion manager on the worker and its coordinator.
+func (w *RepoWorker) WithPowerManager(pm *power.Manager) *RepoWorker {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.powerMgr = pm
+	if c, ok := w.coordinator.(*engine.Coordinator); ok && pm != nil {
+		c.WithPowerManager(pm)
 	}
 	return w
 }
@@ -415,9 +432,7 @@ func (w *RepoWorker) runLoop(ctx context.Context, pollingCtx context.Context) {
 				return
 			}
 			_, _, agentName, agentID, poolID = w.getConnectionInfo()
-			if agentName != "" && (strings.Contains(err.Error(), "RunnerSessionInvalid") ||
-				strings.Contains(err.Error(), "Runner session is invalid") ||
-				strings.Contains(err.Error(), "no active session")) {
+			if agentName != "" && protocol.IsSessionInvalidError(err) {
 				logger.Warn("broker session invalid; recreating broker session", "repo", w.repoAlias)
 				if sessErr := broker.CreateSession(pollingCtx, agentName, agentID, poolID); sessErr != nil {
 					logger.Warn("failed to recreate broker session", "repo", w.repoAlias, "error", sessErr)
@@ -486,6 +501,14 @@ func (w *RepoWorker) runLoop(ctx context.Context, pollingCtx context.Context) {
 // dispatchJob acknowledges the broker message, claims the job from Run Service, runs execution
 // through coordinator, and delivers completion with context.WithoutCancel.
 func (w *RepoWorker) dispatchJob(ctx context.Context, ref protocol.JobRequestReference) (execErr error) {
+	w.mu.Lock()
+	pm := w.powerMgr
+	w.mu.Unlock()
+	if pm != nil {
+		releaseSleep := pm.Acquire()
+		defer releaseSleep()
+	}
+
 	broker := w.getBrokerClient()
 	if broker != nil {
 		if err := broker.AcknowledgeMessage(ctx, ref.RunnerRequestID); err != nil {

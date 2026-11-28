@@ -88,7 +88,7 @@ func Status() (string, error) {
 	return "installed/stopped", nil
 }
 
-// Start loads the launchd agent.
+// Start unloads any stale loaded definition and loads the launchd agent.
 func Start() error {
 	plistPath, err := plistPathFunc()
 	if err != nil {
@@ -97,6 +97,11 @@ func Start() error {
 	if _, err := os.Stat(plistPath); errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("service plist not found at %s (run install first)", plistPath)
 	}
+
+	// Best-effort unload so an updated plist (e.g. ProcessType changes) replaces any cached agent definition.
+	unloadCtx, unloadCancel := context.WithTimeout(context.Background(), defaultCommandTimeout)
+	_ = execCommand(unloadCtx, "launchctl", "unload", plistPath).Run()
+	unloadCancel()
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultCommandTimeout)
 	defer cancel()
